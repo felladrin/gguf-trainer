@@ -1,0 +1,66 @@
+// GPU training loop: the async twin of ../train/trainer.ts.
+//
+// The loop body is identical to trainLM — same window sampling, same rng call
+// order (so a given seed produces the same batch sequence on both backends),
+// same loss averaging. The one difference is structural: WebGPU readback is
+// async-only, so reading the loss values and parameter gradients requires an
+// `await gpu.sync()` between the backward passes and the optimizer step. That
+// is why this lives in backend/ instead of complicating the reference trainer.
+//
+// Parameters stay authoritative on the host: the optimizer steps host arrays,
+// and uploadParams() pushes them to the GPU at the top of each step.
+
+import { backward, crossEntropy } from "../model/autograd.ts";
+import type { Tensor } from "../model/autograd.ts";
+import type { Qwen3Model } from "../model/qwen3.ts";
+import type { TrainOpts } from "../train/trainer.ts";
+import type { WebGPUBackend } from "./webgpu.ts";
+
+export async function trainLMGpu(
+  model: Qwen3Model,
+  gpu: WebGPUBackend,
+  opts: TrainOpts,
+): Promise<{ step: number; loss: number }[]> {
+  const opt = opts.optimizer;
+  const rng = opts.rng ?? Math.random;
+  const logEvery = opts.logEvery ?? 20;
+  const maxStart = opts.tokens.length - opts.seqLen - 1;
+  if (maxStart <= 0) throw new Error("Not enough tokens for one training window");
+
+  const params = model.params();
+  const history: { step: number; loss: number }[] = [];
+
+  gpu.install();
+  try {
+    for (let step = 0; step < opts.steps; step++) {
+      opt.zeroGrad();
+      gpu.uploadParams(params); // host params changed in the previous opt.step()
+
+      const losses: Tensor[] = [];
+      for (let b = 0; b < opts.batchPerStep; b++) {
+        const start = Math.floor(rng() * maxStart);
+        const inputIds = opts.tokens.slice(start, start + opts.seqLen);
+        const targetIds = opts.tokens.slice(start + 1, start + opts.seqLen + 1);
+        const loss = crossEntropy(model.forward(inputIds), targetIds);
+        backward(loss, 1 / opts.batchPerStep); // average grads over the batch
+        losses.push(loss);
+      }
+
+      // One readback per step: loss scalars plus accumulated parameter grads.
+      await gpu.sync(losses);
+      opt.step();
+
+      let lossSum = 0;
+      for (const l of losses) lossSum += l.data[0];
+      const avg = lossSum / opts.batchPerStep;
+      if (step % logEvery === 0 || step === opts.steps - 1) {
+        history.push({ step, loss: avg });
+        opts.onLog?.(step, avg);
+      }
+    }
+  } finally {
+    gpu.uninstall();
+  }
+
+  return history;
+}
