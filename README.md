@@ -133,6 +133,13 @@ examples/      demo.ts / demo_gpu.ts (train -> export -> verify)
   `docs/DESIGN.md`).
 - GGUF output is **structurally** verified here; validate against `llama-cli` before trusting a
   specific build.
+- **Context length** is capped by a WebGPU buffer limit before it's capped by compute: the attention
+  kernel binds one `[heads,T,T]` buffer per layer. `initWebGPU()` requests the GPU adapter's own
+  maximum buffer size at startup (most adapters grant this — confirmed training at 8192 tokens on an
+  M1 Max), falling back quietly to WebGPU's conservative 128 MiB default on the rare adapter that
+  refuses it, which caps context length at roughly 2500-3000 tokens instead. Either way, cost still
+  grows ~quadratically with context length since attention isn't tiled yet (see `docs/HANDOFF.md`
+  for the numbers and the planned fix).
 
 ## Tests / verification
 

@@ -38,8 +38,14 @@ embeddings.
 4. **MuonClip / QK-logit control** — Moonshot's Muon variant clips attention logits to stop the
    "attention logit explosion" that shows up at scale; complements the QK-norm we already have. Add
    when scaling up.
-5. **Data quality > everything at small scale** — a curated corpus (e.g. TinyStories-grade) beats
-   architecture tweaks for models in the 1–50M range.
+5. **Data quality > everything at small scale** — a curated corpus beats architecture tweaks for
+   models in the 1–50M range. Concretely:
+   [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) (short synthetic stories,
+   deliberately limited vocabulary) gets coherent output out of models as small as **3M params**;
+   [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (1.3T tokens,
+   quality-filtered from FineWeb's 15T, the corpus behind the SmolLM family) is the step up once a
+   model needs to know things beyond storytelling. Start with the former to validate the pipeline at
+   real (non-toy) scale, move to a slice of the latter once it saturates.
 6. **ReLU² MLP / value-residuals / attention-window warmup** — speedrun tricks with real but smaller
    gains. Note: ReLU² would diverge from the Qwen3 schema (SwiGLU), so keep it optional/off by
    default to preserve llama.cpp loadability.
@@ -58,7 +64,8 @@ planned order:
 2. elementwise `add`, `mul`, `silu`. ✓
 3. `rmsnorm`, `rmsnorm_heads` (QK-norm) — workgroup reductions. ✓
 4. `rope`, causal `attention`, `cross_entropy`. ✓ (Attention materializes the causal probability
-   triangle rather than flash-tiling — correct first; tile when context grows past the hundreds.)
+   triangle as one storage buffer rather than flash-tiling — correct first. This caps trainable
+   context length well before compute does; see the measured numbers in `docs/HANDOFF.md`.)
 5. AdamW/Muon as kernels to keep params on-device — **next up, and no longer optional**: measured on
    M1 Max, CPU-side Muon Newton–Schulz costs 1276 ms/step vs 36 ms/step for the entire GPU
    forward+backward. Muon's Newton–Schulz is a handful of small GEMMs — cheap on GPU.
@@ -73,3 +80,5 @@ green before the backend was swapped in.
 - Practical Efficiency of Muon for Pretraining (Essential AI) — arxiv.org/pdf/2505.02222
 - nanoGPT speedrun technique log — github.com/alexjc/nanogpt-speedrun
 - Muon + DeepSpeed (PyTorch blog) — pytorch.org/blog/using-muon-optimizer-with-deepspeed/
+- TinyStories dataset — huggingface.co/datasets/roneneldan/TinyStories
+- FineWeb-Edu dataset — huggingface.co/datasets/HuggingFaceFW/fineweb-edu

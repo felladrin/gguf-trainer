@@ -1115,7 +1115,25 @@ export async function initWebGPU(): Promise<WebGPUBackend | null> {
   if (!nav?.gpu) return null;
   const adapter = await nav.gpu.requestAdapter();
   if (!adapter) return null;
-  const device = await adapter.requestDevice();
+  // Request the adapter's own maximum buffer limits instead of the WebGPU
+  // spec's conservative default (128 MiB per storage buffer binding). The
+  // attention kernels bind the whole [heads,T,T] causal-probability matrix as
+  // one buffer, so the default caps trainable context length at a few
+  // thousand tokens (see docs/HANDOFF.md "Tile causal attention"). Asking for
+  // exactly the adapter's reported ceiling can never exceed what it supports;
+  // fall back to the default-limits device on the rare adapter that still
+  // rejects it, so WebGPU availability itself never regresses.
+  let device: GpuDevice;
+  try {
+    device = await adapter.requestDevice({
+      requiredLimits: {
+        maxBufferSize: adapter.limits.maxBufferSize,
+        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      },
+    });
+  } catch {
+    device = await adapter.requestDevice();
+  }
   const name = adapter.info?.description || adapter.info?.vendor || "unknown adapter";
-  return new WebGPUBackend(device as GpuDevice, String(name));
+  return new WebGPUBackend(device, String(name));
 }
