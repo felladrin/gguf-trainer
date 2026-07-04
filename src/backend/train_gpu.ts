@@ -87,17 +87,18 @@ export interface TrainGpuResidentOpts {
 }
 
 /**
- * The device-resident twin of trainLMGpu for the GPU Muon optimizer
- * (muon_gpu.ts): Muon-group weights, momentum, and grads stay on the GPU, so
- * per step only the aux group is uploaded and only aux grads (plus the loss
- * scalars) are read back. rng call order is identical to trainLM/trainLMGpu —
- * a given seed produces the same batch sequence on every path.
+ * The device-resident twin of trainLMGpu for the GPU optimizer (muon_gpu.ts +
+ * adamw_gpu.ts): BOTH param groups — Muon on the hidden matmuls, AdamW on the
+ * aux group — keep their weights, moments, and grads on the GPU, so after
+ * warm-up only the loss scalars are read back (no per-step aux upload or grad
+ * readback). rng call order is identical to trainLM/trainLMGpu — a given seed
+ * produces the same batch sequence on every path.
  *
  * Two syncs per step, on purpose: the first flushes forward+backward and reads
- * losses + aux grads; the optimizer dispatches are recorded after it, while
- * grads are still intact (their deferred clears only run when the NEXT
- * backward begins), and flushed by the second sync. That also makes the
- * fwd/opt wall-time split honest.
+ * the loss scalars; the optimizer dispatches are recorded after it, while grads
+ * are still intact (their deferred clears only run when the NEXT backward
+ * begins), and flushed by the second sync. That also makes the fwd/opt
+ * wall-time split honest.
  */
 export async function trainLMGpuResident(
   model: Qwen3Model,
@@ -112,13 +113,19 @@ export async function trainLMGpuResident(
 
   const history: { step: number; loss: number }[] = [];
 
+  // MuonClip reads/rewrites qNorm/kNorm on the host, but they are device-resident
+  // now (AdamWGpu), so when clipping is on we read just those tiny norm tensors
+  // back in the optimizer-flush sync, clip on the host, and re-upload — no extra
+  // sync, and the round-trip is a few KB regardless of model size.
+  const normTensors: Tensor[] = [];
+  if (opts.qkClipTau) { for (const L of model.layers) normTensors.push(L.qNorm, L.kNorm); }
+
   gpu.install();
   try {
     for (let step = 0; step < opts.steps; step++) {
       const t0 = performance.now();
       if (opts.schedule) opt.setLrScale(opts.schedule(step));
-      opt.zeroGrad();
-      gpu.uploadParams(opt.auxParams); // Muon weights are device-resident: no upload
+      opt.zeroGrad(); // both groups device-resident: no per-step upload
 
       const losses: Tensor[] = [];
       for (let b = 0; b < opts.batchPerStep; b++) {
@@ -130,16 +137,16 @@ export async function trainLMGpuResident(
         losses.push(loss);
       }
 
-      await gpu.sync(losses); // loss scalars + aux grads; Muon grads stay on device
+      await gpu.sync(losses); // loss scalars only; both groups' grads stay on device
       const readback = gpu.lastSyncReadbackBytes;
       const t1 = performance.now();
 
       opt.recordStep();
-      await gpu.sync(); // flush the optimizer dispatches
-      opt.stepAux();
-      // qNorm/kNorm are aux/host params after stepAux; clip here and the next
-      // step's uploadParams(auxParams) pushes the capped norms to the device.
-      if (opts.qkClipTau) applyQKClip(model, opts.qkClipTau);
+      await gpu.sync(normTensors); // flush the optimizer; read norms iff clipping
+      if (opts.qkClipTau) {
+        applyQKClip(model, opts.qkClipTau);
+        gpu.uploadParams(normTensors); // capped norms land before the next forward
+      }
       opts.onStepTime?.(t1 - t0, performance.now() - t1, readback);
 
       let lossSum = 0;

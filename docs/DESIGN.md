@@ -86,10 +86,13 @@ planned order:
 4. `rope`, causal `attention`, `cross_entropy`. ✓ Attention uses a hybrid dispatch: materialized
    `[Hq,T,T]` path for T < 2048 (higher thread parallelism wins at small T), online-softmax flash
    path for T ≥ 2048 (O(Hq·T) memory, no buffer-size ceiling; 1.4–2.2× faster at T=2048–8192).
-5. GPU-resident Muon optimizer (`src/backend/muon_gpu.ts`). ✓ Newton–Schulz runs entirely on the GPU
-   via the existing tiled GEMM; momentum buffers and weights are device-resident. ~3 ms/step at 725K
-   params and ~2 ms/step at 5M params, vs 1276 ms / ~10 s on CPU. Measured on M1 Max; full numbers
-   in `docs/HANDOFF.md`.
+5. GPU-resident optimizers (`src/backend/muon_gpu.ts` + `adamw_gpu.ts`). ✓ Newton–Schulz runs
+   entirely on the GPU via the existing tiled GEMM; momentum buffers and weights are
+   device-resident. ~3 ms/step at 725K params and ~2 ms/step at 5M params, vs 1276 ms / ~10 s on
+   CPU. The aux group (embeddings, head, norms) is device-resident too — AdamW with its global
+   grad-norm clip runs as GPU dispatches, so after warm-up only the loss scalars are read back
+   (per-step readback fell from ~145 KiB to 8 bytes at tinyConfig; the embedding grad dominated and
+   grows with vocab·hidden). Measured on M1 Max; full numbers in `docs/HANDOFF.md`.
 
 **Validation gate (in place):** `tests/gradcheck.ts` finite-difference-checks every CPU op;
 `tests/gpu_parity.ts` checks every kernel's forward and gradient against the CPU backend. Both ran

@@ -44,12 +44,14 @@ host `data`/`grad` arrays are stale until `await gpu.sync()` — the one unavoid
 back (a 4-byte staging copy acts as the fence; see the fence comment in `webgpu.ts`).
 
 The **device-resident training loop** (`trainLMGpuResident` in `src/backend/train_gpu.ts`) uses two
-syncs per step: the first flushes forward+backward and reads loss scalars plus aux-group gradients;
-the optimizer dispatches are recorded after it (grads still intact — deferred clears fire at the
-next backward), and flushed by the second sync. Muon-group weights and momentum never leave the GPU
-during training; a final `syncWeightsToHost()` call restores host authority for sampling and GGUF
-export. Per-step host↔GPU traffic per step after warm-up: aux grads + losses only (~145 KiB at
-tinyConfig vs ~2833 KiB before).
+syncs per step: the first flushes forward+backward and reads the loss scalars; the optimizer
+dispatches are recorded after it (grads still intact — deferred clears fire at the next backward),
+and flushed by the second sync. BOTH param groups are device-resident — Muon on the hidden matmuls
+(`muon_gpu.ts`) and AdamW on the aux group (`adamw_gpu.ts`) — so weights, moments, and gradients
+never leave the GPU during training; a final `syncWeightsToHost()` call restores host authority for
+sampling and GGUF export. Per-step host↔GPU traffic after warm-up: the loss scalars only (8 bytes at
+tinyConfig, vs ~145 KiB when the aux group was host-side and ~2833 KiB originally). MuonClip, when
+enabled, adds a few-KB round-trip of just the qNorm/kNorm tensors (folded into the second sync).
 
 ## What was just completed (both primary tasks from the previous HANDOFF)
 
@@ -175,9 +177,18 @@ functional gate at T=3584 under spec-default limits.
    verbatim MuonClip: the observed-max version would mean instrumenting the parity-delicate
    attention kernels; the norm-based proxy is data-independent and tracks the observed max ~3.3–4.4×
    (T=128).
-4. **Aux-group GPU residency** — `AdamW` still runs host-side on every step for embeddings/norms; at
-   large scale the host↔GPU transfer for aux params becomes a secondary bottleneck. Lower priority
-   than the items above.
+4. **Aux-group GPU residency** — done. `src/backend/adamw_gpu.ts` `AdamWGpu` runs AdamW entirely on
+   the GPU for the aux group (embeddings, head, norms): weights and the m/v moment buffers are
+   device-resident, grads are kept on device (`keepGradOnDevice`), and the global grad-norm clip is
+   a two-stage on-device reduction across all aux params feeding one shared clip scale. Static
+   hyperparameters (betas, eps, weight decay, clip) are baked into WGSL; lr (WSD) and the two
+   bias-correction denominators (1-β^t) live in a 3-element device buffer rewritten each step.
+   `MuonGpu` now owns an `AdamWGpu` instead of the host `AdamW`, and `recordStep()` steps both
+   groups; `trainLMGpuResident` no longer uploads aux weights or reads aux grads. Result: per-step
+   readback fell from ~145 KiB to the 8-byte loss scalars at tinyConfig (the embedding grad
+   dominated, and it grows with vocab·hidden — this is the real win at scale). Gated by the existing
+   GPU-vs-CPU trajectory-parity tests, which now exercise GPU AdamW and still hold within BWD
+   tolerance.
 5. **GGUF checkpoint loader** — dequant already exists in `src/gguf/quantize.ts`; wire it back into
    a `Qwen3Model` for resume/round-trip. Two tiers, different difficulty:
    - **Resuming a GGUF this framework produced**: straightforward. Architecture and tokenizer
@@ -217,9 +228,9 @@ functional gate at T=3584 under spec-default limits.
 src/gguf/      f16, quantize (+dequant), gguf writer/reader
 src/tokenizer/ byte-level BPE
 src/model/     config, autograd (CPU op set + OpsBackend hook), qwen3 forward
-src/train/     optimizer iface, adamw, muon, trainer (CPU)
+src/train/     optimizer iface, adamw, muon, trainer (CPU), schedule (WSD), qk_clip (MuonClip)
 src/backend/   webgpu.ts (WGSL kernels, buffers, sync), train_gpu.ts,
-               muon_gpu.ts (GPU-resident Muon optimizer)
+               muon_gpu.ts + adamw_gpu.ts (GPU-resident optimizers)
 src/export/    model -> GGUF (the llama.cpp contract)
 tests/         gradcheck.ts (FD gradient gate), gpu_parity.ts (GPU-vs-CPU gate)
 examples/      demo.ts (CPU end-to-end), demo_gpu.ts (WebGPU end-to-end)

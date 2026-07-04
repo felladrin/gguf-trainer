@@ -33,8 +33,10 @@ import { Muon, newtonSchulz } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
 import { qkLogitScale } from "../src/train/qk_clip.ts";
+import { AdamW } from "../src/train/adam.ts";
 import { initWebGPU, WebGPUBackend } from "../src/backend/webgpu.ts";
 import { MuonGpu, newtonSchulzGpu } from "../src/backend/muon_gpu.ts";
+import { AdamWGpu } from "../src/backend/adamw_gpu.ts";
 import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
 
 // Same math, different summation order: f32 accumulation differences grow with
@@ -469,6 +471,7 @@ async function main() {
   //    HANDOFF-mandated whole-trajectory parity against the CPU Muon.
   await newtonSchulzParity(gpu);
   await muonMomentumPersistence(gpu);
+  await adamwGpuParity(gpu);
   await muonTrajectoryParity(gpu);
   await wsdScheduleParity(gpu);
   await qkClipTrajectoryParity(gpu);
@@ -561,6 +564,67 @@ async function muonMomentumPersistence(gpu: WebGPUBackend) {
   const ok = compare("muon2step.w", pg.data, pc.data, BWD);
   if (!ok) failures++;
   console.log(`  ${ok ? "ok " : "FAIL"} Muon momentum persistence across 2 optimizer steps`);
+}
+
+/**
+ * GPU AdamW (adamw_gpu.ts) vs CPU AdamW over 3 steps on a 2-D param and a 1-D
+ * param, with grads sized so the global grad-norm clip TRIGGERS on step 1
+ * (norm > clip, scale < 1) and relaxes below clip by step 3 — exercising both
+ * branches of the on-device reduction plus moment persistence and bias
+ * correction. Moments live in device state buffers; grads are seeded per step
+ * (seedGradFromHost stands in for a backward, overwriting the device grad).
+ * BWD tolerance: the clip reduction sums in tree order vs the CPU's sequential
+ * order, and 3 Adam steps compound that, but it stays well under 1e-3.
+ */
+async function adamwGpuParity(gpu: WebGPUBackend) {
+  const rng = mulberry32(0x4d4d);
+  const shapes = [[12, 8], [5]];
+  const opts = { lr: 5e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8, weightDecay: 0.01, clip: 1.0 };
+  // Grad magnitudes: step 0 large (norm >> clip), then shrinking past the clip.
+  const gradScale = [0.5, 0.05, 0.01];
+
+  const bases = shapes.map((s) => {
+    const n = s.reduce((a, b) => a * b, 1);
+    const b = new Float32Array(n);
+    for (let i = 0; i < n; i++) b[i] = randn(rng) * 0.3;
+    return b;
+  });
+  const grads = gradScale.map((gs) =>
+    shapes.map((s) => {
+      const n = s.reduce((a, b) => a * b, 1);
+      const g = new Float32Array(n);
+      for (let i = 0; i < n; i++) g[i] = randn(rng) * gs;
+      return g;
+    })
+  );
+
+  // CPU reference.
+  const cpuParams = shapes.map((s, i) => new Tensor(bases[i].slice(), s, true));
+  const cpuOpt = new AdamW(cpuParams, opts);
+  for (let step = 0; step < gradScale.length; step++) {
+    for (let i = 0; i < cpuParams.length; i++) cpuParams[i].grad.set(grads[step][i]);
+    cpuOpt.step();
+  }
+
+  // GPU.
+  const gpuParams = shapes.map((s, i) => new Tensor(bases[i].slice(), s, true));
+  const gpuOpt = new AdamWGpu(gpu, gpuParams, opts);
+  for (let step = 0; step < gradScale.length; step++) {
+    for (let i = 0; i < gpuParams.length; i++) {
+      gpuParams[i].grad.set(grads[step][i]);
+      gpu.seedGradFromHost(gpuParams[i]);
+    }
+    gpuOpt.recordStep();
+    await gpu.sync();
+  }
+  await gpuOpt.syncWeightsToHost();
+
+  let ok = true;
+  for (let i = 0; i < cpuParams.length; i++) {
+    ok = compare(`adamwGpu.p${i}`, gpuParams[i].data, cpuParams[i].data, BWD) && ok;
+  }
+  if (!ok) failures++;
+  console.log(`  ${ok ? "ok " : "FAIL"} GPU AdamW vs CPU (3 steps, grad-norm clip triggers)`);
 }
 
 /**

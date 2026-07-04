@@ -12,15 +12,15 @@
 // consumes gradients after backward completes and lands weight updates before
 // the next forward reads them, and both before the next step's deferred grad
 // clears (flushed when the next backward begins). The aux group (embeddings,
-// head, norms) keeps the host AdamW path from ../train/adam.ts unchanged,
-// including its global grad-norm clipping over aux params only.
+// head, norms) is now device-resident too via AdamWGpu (./adamw_gpu.ts), so
+// recordStep() steps both groups and nothing but loss scalars is read back.
 //
 // State buffers come from createStateBuffer(): outside the pool, so nothing
 // here is recycled at sync(), and momentum starts at guaranteed zero.
 
 import { Tensor } from "../model/autograd.ts";
-import { AdamW } from "../train/adam.ts";
 import type { AdamOpts } from "../train/adam.ts";
+import { AdamWGpu } from "./adamw_gpu.ts";
 import { bindF32, ceilDiv, f32lit } from "./webgpu.ts";
 import type { GpuBuffer, WebGPUBackend } from "./webgpu.ts";
 
@@ -282,11 +282,11 @@ export async function newtonSchulzGpu(
 // --- The optimizer ---------------------------------------------------------------
 
 export class MuonGpu {
-  /** Host-stepped params (embeddings, head, norms); the trainer uploads these. */
+  /** Aux group (embeddings, head, norms); device-resident under AdamWGpu. */
   readonly auxParams: Tensor[];
   private gpu: WebGPUBackend;
   private muonParams: Tensor[];
-  private aux: AdamW;
+  private aux: AdamWGpu;
   private ops: (() => void)[]; // one step's dispatches, prepared once
   private baseLr: number;
   private lrBuf: GpuBuffer; // 1-element, shared by every param's apply kernel
@@ -300,7 +300,7 @@ export class MuonGpu {
     this.gpu = gpu;
     this.muonParams = muonParams;
     this.auxParams = auxParams;
-    this.aux = new AdamW(auxParams, opts.aux);
+    this.aux = new AdamWGpu(gpu, auxParams, opts.aux);
     this.baseLr = opts.lr;
     // Learning rate lives in a device buffer, not a baked WGSL constant, so a
     // WSD schedule can update it each step without recompiling the pipelines.
@@ -337,36 +337,34 @@ export class MuonGpu {
   }
 
   /**
-   * Scale both groups' lr by `scale` × their base lr (WSD schedule). The Muon
-   * lr write lands before the next optimizer submit (queue ordering), so the
-   * apply kernels read the fresh value; the aux AdamW is host-side.
+   * Scale both groups' lr by `scale` × their base lr (WSD schedule). Both writes
+   * land before the next optimizer submit (queue ordering), so the Muon apply
+   * kernels and the aux AdamW read the fresh value.
    */
   setLrScale(scale: number) {
     this.gpu.writeStateBuffer(this.lrBuf, Float32Array.of(this.baseLr * scale));
     this.aux.setLrScale(scale);
   }
 
-  /** Aux host grads only: Muon-group grads live on device and the backend
-   * clears them before each backward pass. */
+  /** No-op: both groups are device-resident and the backend clears their grads
+   * before each backward pass. */
   zeroGrad() {
     this.aux.zeroGrad();
   }
 
   /**
-   * Record this step's Muon dispatches. Call after every backward() of the
-   * step (grads complete in queue order) and before the next forward.
+   * Record this step's optimizer dispatches — Muon on the hidden matmuls, AdamW
+   * on the aux group. Call after every backward() of the step (grads complete
+   * in queue order, deferred clears fire at the next backward) and before the
+   * next forward.
    */
   recordStep() {
     for (const op of this.ops) op();
+    this.aux.recordStep();
   }
 
-  /** Host AdamW over the aux group. Call after sync() has read aux grads back. */
-  stepAux() {
-    this.aux.step();
-  }
-
-  /** Copy device-resident Muon weights back to host arrays (sampling/export). */
+  /** Copy device-resident Muon + aux weights back to host (sampling/export). */
   async syncWeightsToHost(): Promise<void> {
-    await this.gpu.sync(this.muonParams);
+    await this.gpu.sync([...this.muonParams, ...this.auxParams]);
   }
 }

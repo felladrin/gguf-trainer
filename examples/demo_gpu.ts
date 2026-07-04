@@ -110,8 +110,9 @@ async function main() {
     throw new Error("GPU/CPU parity probe failed — do not train on this backend");
   }
 
-  // 4. Train on the GPU: device-resident Muon on hidden matmuls (weights,
-  //    momentum, and grads never leave the GPU), host AdamW on the rest.
+  // 4. Train on the GPU: both param groups are device-resident — Muon on the
+  //    hidden matmuls, AdamW on the aux group (embeddings, head, norms) — so
+  //    weights, moments, and grads never leave the GPU during training.
   const groups = model.paramGroups();
   const opt = new MuonGpu(gpu, groups.muon, groups.aux, {
     lr: 0.02,
@@ -119,7 +120,7 @@ async function main() {
     aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 },
   });
   console.log(
-    `\nGPU Muon on ${groups.muon.length} matrices; host AdamW on ${groups.aux.length} tensors\n`,
+    `\nGPU Muon on ${groups.muon.length} matrices; GPU AdamW on ${groups.aux.length} tensors\n`,
   );
 
   let firstLoss = 0;
@@ -170,7 +171,8 @@ async function main() {
   console.log(
     `Per-step split (steady state): fwd+bwd+sync ${(fwdMs / warm).toFixed(1)} ms, ` +
       `optimizer ${(optMs / warm).toFixed(1)} ms; ` +
-      `readback ${(readback / 1024).toFixed(1)} KiB/step (aux grads + losses only); ` +
+      `readback ${(readback / 1024).toFixed(1)} KiB/step (loss scalars only; ` +
+      `both param groups are device-resident); ` +
       `step 0 incl. pipeline compiles ${step0Ms.toFixed(0)} ms`,
   );
   if (!(lastLoss < firstLoss)) throw new Error("Loss did not decrease");
