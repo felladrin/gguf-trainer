@@ -7,6 +7,9 @@
     "demo:node": "node --experimental-strip-types examples/demo.ts",
     "demo:gpu": "deno run -A examples/demo_gpu.ts",
     "streaming": "deno run -A examples/train_streaming.ts",
+    "pretokenize": "deno run -A examples/pretokenize.ts corpus/tinystories-valid.txt examples/tinystories 8192 10",
+    "train:tinystories": "deno run -A examples/train_tinystories.ts",
+    "mup:check": "deno run -A examples/mup_coord_check.ts",
     "test": "deno run -A tests/gradcheck.ts && deno run tests/gpu_parity.ts",
     "test:node": "node --experimental-strip-types tests/gradcheck.ts && node --experimental-strip-types tests/gpu_parity.ts"
   },

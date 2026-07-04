@@ -40,7 +40,15 @@ embeddings.
    `tests/gradcheck.ts` (`muP coordinate check`) confirms it: across an 8× width sweep, standard
    init's readout logit RMS grows ~2.6× (≈√8) while muP init holds it to ~1.14×, and constant-lr
    training stays bounded across widths. Tune on a narrow proxy, then widen with muP init to
-   transfer. (Deeper multi-step coord checks belong to the real-data run, item 6.)
+   transfer. A multi-step check on the real corpus (`examples/mup_coord_check.ts`,
+   `deno task
+   mup:check`) confirms it end-to-end: across a 4× width sweep on TinyStories,
+   standard-init readout logit RMS grows 2.00× (≈√4) while muP holds it to 1.01×, and 120
+   constant-lr steps stay bounded at every width. The loss transfers about equally either way
+   (final-loss spread ~1.05× for both) — Muon's spectrally-normalized update already carries the
+   hidden-matmul LR across widths, so muP's distinct job is pinning the readout logit scale, which
+   the init sweep isolates. No width-LR scaling was needed (the transfer held), so `mup.ts` stays
+   init-only.
 3. **LR schedule: warmup → stable → linear cooldown** (WSD) — done. `src/train/schedule.ts`
    `wsdSchedule()` returns a per-step multiplier in [minScale, 1]; the trainer applies it via
    `setLrScale()` on both groups (Muon + aux AdamW) each step. `MuonGpu` holds `lr` in a 1-element
@@ -72,10 +80,16 @@ embeddings.
    [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (1.3T tokens,
    quality-filtered from FineWeb's 15T, the corpus behind the SmolLM family) is the step up once a
    model needs to know things beyond storytelling. Start with the former to validate the pipeline at
-   real (non-toy) scale, move to a slice of the latter once it saturates. Pipeline is ready:
-   `scaleConfig()` for 10–50M sizes, a disk-streaming token loader (`src/data/tokens.ts`, so the
-   corpus needn't fit in memory), and `examples/train_streaming.ts` as the entry point — point it at
-   a real text file and widen the config. The remaining work is the run itself, not code.
+   real (non-toy) scale, move to a slice of the latter once it saturates. Pipeline is ready and
+   wired to a real corpus: `scaleConfig()` for 10–50M sizes, a disk-streaming token loader
+   (`src/data/tokens.ts`, so the corpus needn't fit in memory), `examples/pretokenize.ts` to turn
+   any text file into a `.tokens` binary + reusable vocab (run against the TinyStories validation
+   slice: 5.4M tokens, vocab 8192), and `examples/train_tinystories.ts`
+   (`deno task
+   train:tinystories`) as the turnkey run — reuse the vocab, muP init, WSD,
+   GPU-resident Muon+AdamW, export+verify GGUF. Smoke-tested end-to-end (loss drops, parity exact,
+   GGUF loads in llama-cli); the remaining work is the multi-hour run itself, not code. FineWeb-Edu
+   drops into the same `pretokenize` → `train` path once TinyStories saturates.
 7. **ReLU² MLP / value-residuals / attention-window warmup** — speedrun tricks with real but smaller
    gains. Note: ReLU² would diverge from the Qwen3 schema (SwiGLU), so keep it optional/off by
    default to preserve llama.cpp loadability.

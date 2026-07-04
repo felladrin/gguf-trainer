@@ -156,10 +156,14 @@ functional gate at T=3584 under spec-default limits.
      init's readout logit RMS grows ~2.6× (≈√8) while muP init holds it to ~1.14×, and constant-lr
      training stays bounded across widths. Recipe: tune LR on a narrow proxy, then widen with
      `{ baseWidth }` set to the proxy width.
-   - **Deeper validation belongs to item 6.** Multi-step coordinate checks on real data (the classic
-     muP plot across training) are worth running once a real corpus is in. If a future change breaks
-     the constant-LR story (e.g. `ffnDim` not scaling with `hidden`, or an untied head), add an
-     explicit per-group LR scale in `mup.ts` and re-run the coord check.
+   - **Validated on real data.** `examples/mup_coord_check.ts` (`deno task mup:check`) runs the
+     multi-step check on the pretokenized TinyStories corpus: over a 4× width sweep, standard-init
+     readout logit RMS grows 2.00× (≈√4) while muP holds it to 1.01×, and 120 constant-LR steps stay
+     bounded at every width. Loss transfers about equally with or without muP (final-loss spread
+     ~1.05× either way) — Muon's spectrally-normalized update already carries the hidden-matmul LR,
+     so muP's measurable job is the logit scale. The constant-LR story held, so no per-group LR
+     scale was added. If a future change breaks it (e.g. `ffnDim` not scaling with `hidden`, or an
+     untied head), add an explicit per-group LR scale in `mup.ts` and re-run `deno task mup:check`.
    - The alternative (untie embeddings for a textbook readout) works and stays llama.cpp-compatible,
      but changes the model (more params, drops the tie convention Qwen3 small models use).
 2. **WSD learning-rate schedule** (warmup → stable → linear cooldown) — done.
@@ -212,24 +216,36 @@ functional gate at T=3584 under spec-default limits.
      still open. `configFromGGUF()` already reads config from metadata, but the tokenizer path only
      handles our own gpt2/BPE data; an external GGUF's vocab/merges/special-token scheme would need
      broader import support in `src/tokenizer/bpe.ts`.
-6. **Scale + real data** — infra done; the run itself is the remaining work (it's a multi-hour job,
-   not a code change). What's in place:
+6. **Scale + real data** — infra done and wired to a real corpus; only the multi-hour run itself
+   remains (a compute job, not a code change). What's in place:
    - **Larger configs.** `scaleConfig(vocabSize, hiddenSize, nLayers, maxSeq?, headDim?)` derives
      Qwen3-shaped attention/FFN dims (headDim 64, GQA 2:1, SwiGLU ffn 3× to a multiple of 32).
      Example: hidden 384 × 6 ≈ 14M, hidden 512 × 8 ≈ 33M (vocab 8k, tied).
    - **Disk-streaming corpus.** `src/data/tokens.ts`: `writeTokenFile()` pretokenizes to a compact
      binary (u16/u32 via `tokenBytes(vocab)`); `diskTokenSource()` streams windows off disk so peak
      memory is O(window), not O(corpus); `memTokenSource()` for small in-memory corpora. Both
-     trainers accept `number[] | TokenSource`. `examples/train_streaming.ts` (`deno task streaming`)
-     runs the whole path end-to-end (pretokenize → stream → train → sample) and is the entry point:
-     point `CORPUS` at a real text file via `readFileText`, widen `scaleConfig`, and switch to
-     `MuonGpu + trainLMGpuResident` for the GPU loop.
+     trainers accept `number[] | TokenSource`.
+   - **Real corpus, pretokenized.** `examples/pretokenize.ts` (`deno task pretokenize`) trains a BPE
+     vocab on a bounded sample, then encodes a whole text corpus document-by-document (split on
+     `<|endoftext|>`, joined by the single EOS id) into `<prefix>.tokens` +
+     `<prefix>.tokenizer.json` (the vocab, so the run reuses the exact tokenization). Run against
+     the TinyStories validation slice (22.5 MB → 5.4M tokens, vocab 8192, u16, ~11 MB on disk, ~30
+     s). The raw corpus lives in `corpus/` and the outputs in `examples/tinystories.*` — both
+     gitignored (derived/downloaded, not source).
+   - **Turnkey run.** `examples/train_tinystories.ts` (`deno task train:tinystories`) is the
+     real-run entry point: it reuses the pretokenized corpus + saved vocab, builds a `scaleConfig`'d
+     model with muP init, runs the CPU-vs-GPU parity gate, trains device-resident
+     (`MuonGpu +
+     trainLMGpuResident`) under a WSD schedule, samples, and exports+verifies an
+     F16 GGUF. Defaults are the real run (hidden 384 × 6 ≈ 14M, 3000 steps); positional args scale
+     it, e.g. `deno task train:tinystories 512 8 6000` (~33M). Smoke-tested small (hidden 256, 12
+     steps): loss 9.05 → 5.97, parity |Δ|=0, GGUF loads and generates in `llama-cli`.
    - **Recipe knobs ready:** WSD schedule (`wsdSchedule`), MuonClip (`qkClipTau`), muP init
      (`{ baseWidth }`) — tune LR on a narrow proxy, widen with muP init, keep the LR.
-   - **To do:** get a real corpus (TinyStories to validate coherence at 3–10M, then a FineWeb-Edu
-     slice), pretokenize it, and run for real. At small scale, data quality beats architecture
-     tweaks (see `docs/DESIGN.md`). Run a multi-step muP coordinate check on the real data while
-     you're at it.
+   - **To do:** run `train:tinystories` for real (multi-hour), tune the recipe, and step up to a
+     FineWeb-Edu slice once TinyStories saturates. At small scale, data quality beats architecture
+     tweaks (see `docs/DESIGN.md`). The multi-step muP coordinate check on real data is already done
+     (`deno task mup:check`, item 1 above).
 
 ## Hard limits and known nuances (not bugs)
 
@@ -262,7 +278,9 @@ src/backend/   webgpu.ts (WGSL kernels, buffers, sync), train_gpu.ts,
                muon_gpu.ts + adamw_gpu.ts (GPU-resident optimizers)
 src/export/    export_gguf (model -> GGUF, the llama.cpp contract), load_gguf (GGUF -> model)
 tests/         gradcheck.ts (FD gradient gate), gpu_parity.ts (GPU-vs-CPU gate)
-examples/      demo.ts (CPU end-to-end), demo_gpu.ts (WebGPU), train_streaming.ts (disk-streaming)
+examples/      demo.ts (CPU end-to-end), demo_gpu.ts (WebGPU), train_streaming.ts (disk-streaming),
+               pretokenize.ts (corpus -> .tokens + vocab), train_tinystories.ts (real GPU run),
+               mup_coord_check.ts (muP width sweep on the real corpus)
 docs/          DESIGN.md (rationale + technique research), HANDOFF.md (this file)
 ```
 
@@ -272,7 +290,10 @@ docs/          DESIGN.md (rationale + technique research), HANDOFF.md (this file
 deno task demo        # CPU end-to-end (Deno);  bun examples/demo.ts for Bun
 deno task demo:node   # CPU end-to-end (Node)
 deno task demo:gpu    # WebGPU end-to-end (Deno only today)
-deno task streaming   # disk-streaming corpus training (entry point for a real run)
+deno task streaming   # disk-streaming corpus training (synthetic corpus, any runtime)
+deno task pretokenize # corpus/tinystories-valid.txt -> examples/tinystories.tokens + vocab
+deno task train:tinystories  # real GPU run on the pretokenized corpus -> GGUF (Deno)
+deno task mup:check   # muP coordinate check: width sweep on the real corpus (Deno)
 deno task test        # gradcheck + GPU parity
 deno task test:node   # gradcheck on Node (parity prints SKIP: no WebGPU)
 ```
