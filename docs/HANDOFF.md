@@ -138,23 +138,26 @@ functional gate at T=3584 under spec-default limits.
 
 ## Secondary roadmap (after the primary tasks above, priority order)
 
-1. **muP parametrization** — tune hyperparameters on a tiny proxy model, transfer to full size
-   (touches init + per-tensor LR). The old `lr`-baking caveat is resolved: `MuonGpu` reads `lr` from
-   a device buffer now (see WSD), so per-tensor/per-step lr changes cost only a buffer write.
-   **Deferred to the real-data run (item 6)** on purpose: muP's payoff is LR transfer across widths,
-   which only pays off once multi-width tuning is actually happening, and the Muon-group LR rule
-   needs validating on real loss curves (see caveat below). Design worked out and contract-safe:
-   - **Readout scale vs the llama.cpp contract.** Textbook muP controls readout scale with a `1/d`
-     forward multiplier or a width-scaled readout init. Neither is available here: `token_embd` is
-     the readout (tied), and an unfolded forward multiplier makes `llama-cli` inference diverge from
-     training (can't fold into a tied weight). The contract-safe formulation: init `token_embd` std
-     ∝ `1/√hidden` — the post-embedding RMSNorm erases the input-side effect while the tied readout
-     logits stay O(1) — keep `1/√headDim` attention, add no forward multipliers. Hidden matmuls keep
-     `1/√fan_in` init; per-tensor LR scales ∝ `base_width/width` for width-dependent layers.
-   - **Muon-group LR caveat.** muP's `1/width` LR rule is derived for Adam/SGD. Muon's
-     orthogonalized update already carries a `sqrt(max(1, rows/cols))` spectral factor and scales
-     differently, so its width rule must be picked from a coordinate check (logit/activation RMS
-     flat across widths), not assumed. Validate empirically during item 6.
+1. **muP parametrization** — init part done (`src/model/mup.ts`), contract-safe. The old `lr`-baking
+   caveat is resolved: `MuonGpu` reads `lr` from a device buffer now (see WSD).
+   - **What shipped.** `Qwen3Model(cfg, rng, { baseWidth })` scales the embedding/head init std by
+     `√(baseWidth/hidden)` so the tied-readout logits stay O(1) across widths. The contract-safe
+     derivation: `token_embd` is the readout (tied), and the post-embedding RMSNorm divides out the
+     embedding's magnitude on the way IN, so we're free to set it for the output side — pinning
+     logit RMS to a width-independent value. Hidden matmuls keep `1/√fan_in`, attention keeps
+     `1/√headDim`, no forward multipliers — the forward pass and GGUF are byte-unchanged
+     (llama.cpp-safe).
+   - **LR transfer = muP init + keep the tuned LRs.** The aux group is width-insensitive (embeddings
+     O(1), norms 1-D), and Muon's update is spectrally normalized (orthogonal ×
+     `√(max(1,rows/cols))`), so — unlike Adam's `1/width` rule — Muon needs no width-LR scaling.
+     Confirmed by the coordinate check in `tests/gradcheck.ts`: over an 8× width sweep, standard
+     init's readout logit RMS grows ~2.6× (≈√8) while muP init holds it to ~1.14×, and constant-lr
+     training stays bounded across widths. Recipe: tune LR on a narrow proxy, then widen with
+     `{ baseWidth }` set to the proxy width.
+   - **Deeper validation belongs to item 6.** Multi-step coordinate checks on real data (the classic
+     muP plot across training) are worth running once a real corpus is in. If a future change breaks
+     the constant-LR story (e.g. `ffnDim` not scaling with `hidden`, or an untied head), add an
+     explicit per-group LR scale in `mup.ts` and re-run the coord check.
    - The alternative (untie embeddings for a textbook readout) works and stays llama.cpp-compatible,
      but changes the model (more params, drops the tie convention Qwen3 small models use).
 2. **WSD learning-rate schedule** (warmup → stable → linear cooldown) — done.
@@ -236,7 +239,7 @@ functional gate at T=3584 under spec-default limits.
 ```
 src/gguf/      f16, quantize (+dequant), gguf writer/reader
 src/tokenizer/ byte-level BPE (train + export/fromData round-trip)
-src/model/     config, autograd (CPU op set + OpsBackend hook), qwen3 forward
+src/model/     config, autograd (CPU op set + OpsBackend hook), qwen3 forward, mup (muP init)
 src/train/     optimizer iface, adamw, muon, trainer (CPU), schedule (WSD), qk_clip (MuonClip)
 src/backend/   webgpu.ts (WGSL kernels, buffers, sync), train_gpu.ts,
                muon_gpu.ts + adamw_gpu.ts (GPU-resident optimizers)

@@ -35,6 +35,8 @@ import { applyQKClip, qkLogitScale } from "../src/train/qk_clip.ts";
 import { buildGGUF } from "../src/export/export_gguf.ts";
 import { loadQwen3FromGGUF } from "../src/export/load_gguf.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
+import { Muon } from "../src/train/muon.ts";
+import { trainLM } from "../src/train/trainer.ts";
 
 // Storage is f32, so the finite difference carries ~1e-6 forward-rounding noise;
 // ε=1e-2 keeps both that noise (δ/2ε) and the O(ε²) truncation well under tol.
@@ -486,6 +488,80 @@ function main() {
     if (!ok) failures++;
     console.log(
       `  ${ok ? "ok " : "FAIL"} GGUF checkpoint round-trip (config+tokenizer+weights+forward)`,
+    );
+  }
+
+  // muP coordinate check: the standard muP diagnostic. Sweep width at fixed
+  // base width and measure the readout logit RMS at init. Standard init grows
+  // ~sqrt(width) (the blow-up that breaks LR transfer); muP init pins it flat.
+  // Then a few Muon+AdamW steps at CONSTANT lr must keep it bounded across
+  // widths (evidence Muon transfers without width-LR scaling — see mup.ts).
+  {
+    const baseWidth = 32, headDim = 8, vocab = 96;
+    const widths = [32, 64, 128, 256];
+    const cfgFor = (h: number): Qwen3Config => ({
+      vocabSize: vocab,
+      hiddenSize: h,
+      nLayers: 2,
+      nHeads: h / headDim,
+      nKVHeads: Math.max(1, h / headDim / 2),
+      headDim,
+      ffnDim: 4 * h,
+      ropeBase: 10000,
+      rmsEps: 1e-6,
+      maxSeq: 32,
+      tieEmbeddings: true,
+    });
+    const rms = (a: Float32Array) => {
+      let s = 0;
+      for (const v of a) s += v * v;
+      return Math.sqrt(s / a.length);
+    };
+    const ids = Array.from({ length: 16 }, (_, i) => (i * 7 + 3) % vocab);
+
+    const stdRms: number[] = [], mupRms: number[] = [];
+    for (const h of widths) {
+      const cfg = cfgFor(h);
+      stdRms.push(rms(new Qwen3Model(cfg, mulberry32(1)).forward(ids).data));
+      mupRms.push(rms(new Qwen3Model(cfg, mulberry32(1), { baseWidth }).forward(ids).data));
+    }
+    const ratio = (xs: number[]) => Math.max(...xs) / Math.min(...xs);
+    let ok = true;
+    // muP init flat across an 8x width range; standard init clearly grows.
+    if (ratio(mupRms) > 1.5) ok = false;
+    if (ratio(stdRms) < 2) ok = false;
+
+    // Post-step boundedness at constant lr with muP init (no width-driven
+    // blow-up). Two widths (4x apart) keep the CPU cost low; the init sweep
+    // above is the primary gate.
+    const rngTok = mulberry32(9);
+    const tokens = Array.from({ length: 400 }, () => Math.floor(rngTok() * vocab));
+    for (const h of [32, 128]) {
+      const cfg = cfgFor(h);
+      const model = new Qwen3Model(cfg, mulberry32(1), { baseWidth });
+      const g = model.paramGroups();
+      trainLM(model, {
+        tokens,
+        seqLen: 16,
+        steps: 4,
+        batchPerStep: 1,
+        optimizer: new Muon(g.muon, g.aux, {
+          lr: 0.02,
+          momentum: 0.95,
+          aux: { lr: 3e-3, clip: 1.0 },
+        }),
+        logEvery: 100,
+        rng: mulberry32(3),
+      });
+      const r = rms(model.forward(ids).data);
+      if (!(r > 0.01 && r < 2)) ok = false; // bounded, no explosion/collapse
+    }
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} muP coordinate check (init logit RMS: std ${
+        ratio(stdRms).toFixed(1)
+      }x ` +
+        `vs muP ${ratio(mupRms).toFixed(2)}x across 8x width)`,
     );
   }
 

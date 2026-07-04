@@ -17,6 +17,13 @@ import {
   Tensor,
 } from "./autograd.ts";
 import type { Qwen3Config } from "./config.ts";
+import { muPEmbedStd } from "./mup.ts";
+
+/** muP transfer settings: init embeddings/head relative to a base width. */
+export interface MuPOpts {
+  baseWidth: number; // the proxy width the hyperparameters were tuned at
+  baseEmbedStd?: number; // embedding init std at baseWidth (default 0.02)
+}
 
 interface Layer {
   attnNorm: Tensor;
@@ -39,17 +46,21 @@ export class Qwen3Model {
   output: Tensor | null; // null when embeddings are tied
   layers: Layer[] = [];
 
-  constructor(cfg: Qwen3Config, rng: () => number) {
+  constructor(cfg: Qwen3Config, rng: () => number, mup?: MuPOpts) {
     this.cfg = cfg;
     const h = cfg.hiddenSize;
     const qDim = cfg.nHeads * cfg.headDim;
     const kvDim = cfg.nKVHeads * cfg.headDim;
 
     // Standard transformer inits: embeddings ~N(0, 0.02); linear layers scaled
-    // by 1/sqrt(fan_in); norm weights start at 1.
-    this.tokenEmbd = param([cfg.vocabSize, h], 0.02, rng);
+    // by 1/sqrt(fan_in); norm weights start at 1. Under muP the embedding/head
+    // init shrinks as 1/sqrt(width) relative to the base width so the tied
+    // readout logits stay O(1) across widths (see mup.ts); hidden matmuls are
+    // already 1/sqrt(fan_in) and need no change.
+    const embStd = mup ? muPEmbedStd(mup.baseEmbedStd ?? 0.02, h, mup.baseWidth) : 0.02;
+    this.tokenEmbd = param([cfg.vocabSize, h], embStd, rng);
     this.outputNorm = ones([h]);
-    this.output = cfg.tieEmbeddings ? null : param([cfg.vocabSize, h], 0.02, rng);
+    this.output = cfg.tieEmbeddings ? null : param([cfg.vocabSize, h], embStd, rng);
 
     for (let l = 0; l < cfg.nLayers; l++) {
       this.layers.push({

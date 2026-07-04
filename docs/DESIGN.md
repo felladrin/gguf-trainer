@@ -30,10 +30,17 @@ for a small from-scratch Qwen3 on a WebGPU budget.
 embeddings.
 
 1. **Muon optimizer** — done. Biggest single win; ~2× compute efficiency.
-2. **muP (maximal-update parametrization)** — tune LR/init on a _tiny_ proxy model and transfer to
-   the full model without re-tuning. High value because hyperparameter search on WebGPU is
-   expensive. Touches init + per-tensor LR. The `lr`-baking obstacle is gone: `MuonGpu` now reads
-   `lr` from a device buffer (see WSD below), so per-step lr changes need no pipeline rebuild.
+2. **muP (maximal-update parametrization)** — init part done (`src/model/mup.ts`), contract-safe.
+   `Qwen3Model(cfg, rng, { baseWidth })` scales the embedding/head init by `sqrt(baseWidth/width)`
+   so the tied-readout logits stay O(1) across widths; hidden matmuls keep `1/sqrt(fan_in)` and
+   attention keeps `1/sqrt(headDim)` (both already width-correct and the llama.cpp contract), and
+   there are no forward multipliers — so the forward pass and GGUF are unchanged. LR transfer: the
+   aux group is width-insensitive and Muon's update is spectrally normalized, so the transfer recipe
+   is muP init + keep the tuned LRs (no width-LR scaling). The coordinate check in
+   `tests/gradcheck.ts` (`muP coordinate check`) confirms it: across an 8× width sweep, standard
+   init's readout logit RMS grows ~2.6× (≈√8) while muP init holds it to ~1.14×, and constant-lr
+   training stays bounded across widths. Tune on a narrow proxy, then widen with muP init to
+   transfer. (Deeper multi-step coord checks belong to the real-data run, item 6.)
 3. **LR schedule: warmup → stable → linear cooldown** (WSD) — done. `src/train/schedule.ts`
    `wsdSchedule()` returns a per-step multiplier in [minScale, 1]; the trainer applies it via
    `setLrScale()` on both groups (Muon + aux AdamW) each step. `MuonGpu` holds `lr` in a 1-element
