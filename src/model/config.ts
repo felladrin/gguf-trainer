@@ -33,6 +33,40 @@ export function tinyConfig(vocabSize: number): Qwen3Config {
   };
 }
 
+/**
+ * A config for real (non-toy) runs: derive the attention/FFN dims from a chosen
+ * width and depth with Qwen3-like ratios — headDim 64, GQA 2:1, SwiGLU ffn 3×
+ * rounded to a multiple of 32 (so q8_0/q4_0 export never falls back to f16 on
+ * the FFN's inner dim). `hiddenSize` must be a multiple of headDim×2 (integer,
+ * even head count for the 2:1 GQA split). Example sizes (vocab 8k, tied):
+ * hidden 384 × 6 layers ≈ 14M params; hidden 512 × 8 ≈ 33M.
+ */
+export function scaleConfig(
+  vocabSize: number,
+  hiddenSize: number,
+  nLayers: number,
+  maxSeq = 512,
+  headDim = 64,
+): Qwen3Config {
+  if (hiddenSize % (headDim * 2) !== 0) {
+    throw new Error(`hiddenSize ${hiddenSize} must be a multiple of headDim*2 (${headDim * 2})`);
+  }
+  const nHeads = hiddenSize / headDim;
+  return {
+    vocabSize,
+    hiddenSize,
+    nLayers,
+    nHeads,
+    nKVHeads: nHeads / 2,
+    headDim,
+    ffnDim: Math.round((hiddenSize * 3) / 32) * 32,
+    ropeBase: 10000,
+    rmsEps: 1e-6,
+    maxSeq,
+    tieEmbeddings: true,
+  };
+}
+
 /** Rough parameter count for reporting. */
 export function paramCount(c: Qwen3Config): number {
   const attnQ = c.nHeads * c.headDim * c.hiddenSize;

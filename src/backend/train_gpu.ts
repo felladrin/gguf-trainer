@@ -15,6 +15,8 @@ import type { Tensor } from "../model/autograd.ts";
 import type { Qwen3Model } from "../model/qwen3.ts";
 import type { TrainOpts } from "../train/trainer.ts";
 import { applyQKClip } from "../train/qk_clip.ts";
+import { toTokenSource } from "../data/tokens.ts";
+import type { TokenSource } from "../data/tokens.ts";
 import type { MuonGpu } from "./muon_gpu.ts";
 import type { WebGPUBackend } from "./webgpu.ts";
 
@@ -26,10 +28,11 @@ export async function trainLMGpu(
   const opt = opts.optimizer;
   const rng = opts.rng ?? Math.random;
   const logEvery = opts.logEvery ?? 20;
-  const maxStart = opts.tokens.length - opts.seqLen - 1;
+  const params = model.params();
+  const tokens = toTokenSource(opts.tokens);
+  const maxStart = tokens.length - opts.seqLen - 1;
   if (maxStart <= 0) throw new Error("Not enough tokens for one training window");
 
-  const params = model.params();
   const history: { step: number; loss: number }[] = [];
 
   gpu.install();
@@ -42,8 +45,8 @@ export async function trainLMGpu(
       const losses: Tensor[] = [];
       for (let b = 0; b < opts.batchPerStep; b++) {
         const start = Math.floor(rng() * maxStart);
-        const inputIds = opts.tokens.slice(start, start + opts.seqLen);
-        const targetIds = opts.tokens.slice(start + 1, start + opts.seqLen + 1);
+        const inputIds = tokens.window(start, opts.seqLen);
+        const targetIds = tokens.window(start + 1, opts.seqLen);
         const loss = crossEntropy(model.forward(inputIds), targetIds);
         backward(loss, 1 / opts.batchPerStep); // average grads over the batch
         losses.push(loss);
@@ -70,7 +73,7 @@ export async function trainLMGpu(
 }
 
 export interface TrainGpuResidentOpts {
-  tokens: number[];
+  tokens: number[] | TokenSource;
   seqLen: number;
   steps: number;
   batchPerStep: number;
@@ -108,7 +111,8 @@ export async function trainLMGpuResident(
   const opt = opts.optimizer;
   const rng = opts.rng ?? Math.random;
   const logEvery = opts.logEvery ?? 20;
-  const maxStart = opts.tokens.length - opts.seqLen - 1;
+  const tokens = toTokenSource(opts.tokens);
+  const maxStart = tokens.length - opts.seqLen - 1;
   if (maxStart <= 0) throw new Error("Not enough tokens for one training window");
 
   const history: { step: number; loss: number }[] = [];
@@ -130,8 +134,8 @@ export async function trainLMGpuResident(
       const losses: Tensor[] = [];
       for (let b = 0; b < opts.batchPerStep; b++) {
         const start = Math.floor(rng() * maxStart);
-        const inputIds = opts.tokens.slice(start, start + opts.seqLen);
-        const targetIds = opts.tokens.slice(start + 1, start + opts.seqLen + 1);
+        const inputIds = tokens.window(start, opts.seqLen);
+        const targetIds = tokens.window(start + 1, opts.seqLen);
         const loss = crossEntropy(model.forward(inputIds), targetIds);
         backward(loss, 1 / opts.batchPerStep); // average grads over the batch
         losses.push(loss);

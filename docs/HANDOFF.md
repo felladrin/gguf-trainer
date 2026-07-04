@@ -27,13 +27,15 @@ Both backends are complete and pass end-to-end:
     all three runtimes.
   - `tests/gpu_parity.ts` — GPU-vs-CPU forward and backward parity per op, finite differences run
     directly against GPU forwards, whole-model gradient parity, cross-micro-batch gradient
-    accumulation, GPU Muon trajectory parity vs CPU, and sync() fence verification. 36 cases total.
-    Skips cleanly where WebGPU is unavailable.
+    accumulation, GPU trajectory parity vs CPU for Muon, WSD, MuonClip, and AdamW (with its
+    grad-norm clip), and sync() fence verification. 33 cases total. Skips cleanly where WebGPU is
+    unavailable.
 
-Implemented overall: GGUF v3 writer/reader, F16/Q8_0/Q4_0 (de)quantizers, byte-level BPE tokenizer,
-reverse-mode CPU autograd, WGSL kernels for the whole op set, the Qwen3 forward pass (GQA,
-QK-RMSNorm, RoPE, SwiGLU, tied embeddings), AdamW + Muon optimizers (CPU), GPU-resident Muon
-optimizer, flash-style tiled causal attention, training loops for both backends.
+Implemented overall: GGUF v3 writer/reader (+ checkpoint loader), F16/Q8_0/Q4_0 (de)quantizers,
+byte-level BPE tokenizer (train + round-trip), reverse-mode CPU autograd, WGSL kernels for the whole
+op set, the Qwen3 forward pass (GQA, QK-RMSNorm, RoPE, SwiGLU, tied embeddings), AdamW + Muon
+optimizers on both CPU and GPU (device-resident), flash-style tiled causal attention, WSD schedule,
+MuonClip, muP init, a disk-streaming token loader, and training loops for both backends.
 
 ## How the WebGPU backend plugs in
 
@@ -210,10 +212,24 @@ functional gate at T=3584 under spec-default limits.
      still open. `configFromGGUF()` already reads config from metadata, but the tokenizer path only
      handles our own gpt2/BPE data; an external GGUF's vocab/merges/special-token scheme would need
      broader import support in `src/tokenizer/bpe.ts`.
-6. **Scale + real data** — larger `Qwen3Config`, curated corpus, longer runs. Reminder: at small
-   scale, data quality beats architecture tweaks. Dataset picks + links in `docs/DESIGN.md` ("Data
-   quality > everything at small scale"): TinyStories to validate the pipeline, FineWeb-Edu to scale
-   past storytelling.
+6. **Scale + real data** — infra done; the run itself is the remaining work (it's a multi-hour job,
+   not a code change). What's in place:
+   - **Larger configs.** `scaleConfig(vocabSize, hiddenSize, nLayers, maxSeq?, headDim?)` derives
+     Qwen3-shaped attention/FFN dims (headDim 64, GQA 2:1, SwiGLU ffn 3× to a multiple of 32).
+     Example: hidden 384 × 6 ≈ 14M, hidden 512 × 8 ≈ 33M (vocab 8k, tied).
+   - **Disk-streaming corpus.** `src/data/tokens.ts`: `writeTokenFile()` pretokenizes to a compact
+     binary (u16/u32 via `tokenBytes(vocab)`); `diskTokenSource()` streams windows off disk so peak
+     memory is O(window), not O(corpus); `memTokenSource()` for small in-memory corpora. Both
+     trainers accept `number[] | TokenSource`. `examples/train_streaming.ts` (`deno task streaming`)
+     runs the whole path end-to-end (pretokenize → stream → train → sample) and is the entry point:
+     point `CORPUS` at a real text file via `readFileText`, widen `scaleConfig`, and switch to
+     `MuonGpu + trainLMGpuResident` for the GPU loop.
+   - **Recipe knobs ready:** WSD schedule (`wsdSchedule`), MuonClip (`qkClipTau`), muP init
+     (`{ baseWidth }`) — tune LR on a narrow proxy, widen with muP init, keep the LR.
+   - **To do:** get a real corpus (TinyStories to validate coherence at 3–10M, then a FineWeb-Edu
+     slice), pretokenize it, and run for real. At small scale, data quality beats architecture
+     tweaks (see `docs/DESIGN.md`). Run a multi-step muP coordinate check on the real data while
+     you're at it.
 
 ## Hard limits and known nuances (not bugs)
 
@@ -239,13 +255,14 @@ functional gate at T=3584 under spec-default limits.
 ```
 src/gguf/      f16, quantize (+dequant), gguf writer/reader
 src/tokenizer/ byte-level BPE (train + export/fromData round-trip)
-src/model/     config, autograd (CPU op set + OpsBackend hook), qwen3 forward, mup (muP init)
+src/model/     config (+ scaleConfig), autograd (CPU op set + OpsBackend hook), qwen3 forward, mup
 src/train/     optimizer iface, adamw, muon, trainer (CPU), schedule (WSD), qk_clip (MuonClip)
+src/data/      tokens.ts (TokenSource: in-memory + disk-streaming corpus access)
 src/backend/   webgpu.ts (WGSL kernels, buffers, sync), train_gpu.ts,
                muon_gpu.ts + adamw_gpu.ts (GPU-resident optimizers)
 src/export/    export_gguf (model -> GGUF, the llama.cpp contract), load_gguf (GGUF -> model)
 tests/         gradcheck.ts (FD gradient gate), gpu_parity.ts (GPU-vs-CPU gate)
-examples/      demo.ts (CPU end-to-end), demo_gpu.ts (WebGPU end-to-end)
+examples/      demo.ts (CPU end-to-end), demo_gpu.ts (WebGPU), train_streaming.ts (disk-streaming)
 docs/          DESIGN.md (rationale + technique research), HANDOFF.md (this file)
 ```
 
@@ -255,6 +272,7 @@ docs/          DESIGN.md (rationale + technique research), HANDOFF.md (this file
 deno task demo        # CPU end-to-end (Deno);  bun examples/demo.ts for Bun
 deno task demo:node   # CPU end-to-end (Node)
 deno task demo:gpu    # WebGPU end-to-end (Deno only today)
+deno task streaming   # disk-streaming corpus training (entry point for a real run)
 deno task test        # gradcheck + GPU parity
 deno task test:node   # gradcheck on Node (parity prints SKIP: no WebGPU)
 ```

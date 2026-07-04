@@ -37,6 +37,7 @@ import { loadQwen3FromGGUF } from "../src/export/load_gguf.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { Muon } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
+import { diskTokenSource, memTokenSource, tokenBytes, writeTokenFile } from "../src/data/tokens.ts";
 
 // Storage is f32, so the finite difference carries ~1e-6 forward-rounding noise;
 // ε=1e-2 keeps both that noise (δ/2ε) and the O(ε²) truncation well under tol.
@@ -157,7 +158,7 @@ function fdCheck(name: string, inputs: Tensor[], fwd: () => Tensor, o: CheckOpts
   );
 }
 
-function main() {
+async function main() {
   console.log("=== finite-difference gradient checks (CPU reference ops) ===\n");
   const rng = mulberry32(1234);
 
@@ -565,6 +566,34 @@ function main() {
     );
   }
 
+  // Streaming token source: a disk-backed source must return byte-for-byte the
+  // same windows as an in-memory one, including at the corpus tail, for both the
+  // u16 and u32 widths. Round-trips through writeTokenFile -> diskTokenSource.
+  {
+    const os = await import("node:os");
+    const fs = await import("node:fs");
+    let ok = true;
+    for (const [vocab, bpt] of [[300, 2], [70000, 4]] as const) {
+      if (tokenBytes(vocab) !== bpt) ok = false;
+      const rngT = mulberry32(vocab);
+      const toks = Array.from({ length: 500 }, () => Math.floor(rngT() * vocab));
+      const path = `${os.tmpdir()}/gguf-trainer-tokens-${bpt}.bin`;
+      await writeTokenFile(path, toks, bpt);
+      const disk = await diskTokenSource(path, bpt);
+      const mem = memTokenSource(toks);
+      if (disk.length !== toks.length) ok = false;
+      // Several windows incl. one ending exactly at the tail.
+      for (const [start, len] of [[0, 16], [123, 40], [toks.length - 32, 32]] as const) {
+        const a = disk.window(start, len), b = mem.window(start, len);
+        for (let i = 0; i < len; i++) if (a[i] !== b[i]) ok = false;
+      }
+      disk.close();
+      fs.unlinkSync(path);
+    }
+    if (!ok) failures++;
+    console.log(`  ${ok ? "ok " : "FAIL"} streaming token source (disk vs memory, u16 + u32)`);
+  }
+
   console.log(
     failures === 0 ? "\n=== all gradient checks passed ===" : `\n=== ${failures} FAILURES ===`,
   );
@@ -575,4 +604,9 @@ function main() {
   }
 }
 
-main();
+main().catch((e) => {
+  console.error("GRADCHECK FAILED:", e);
+  // deno-lint-ignore no-explicit-any
+  const proc = (globalThis as any).process;
+  if (proc?.exit) proc.exit(1);
+});

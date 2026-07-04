@@ -6,9 +6,11 @@ import { backward, crossEntropy } from "../model/autograd.ts";
 import type { Qwen3Model } from "../model/qwen3.ts";
 import type { Optimizer } from "./optimizer.ts";
 import { applyQKClip } from "./qk_clip.ts";
+import { toTokenSource } from "../data/tokens.ts";
+import type { TokenSource } from "../data/tokens.ts";
 
 export interface TrainOpts {
-  tokens: number[]; // full training token stream
+  tokens: number[] | TokenSource; // full training token stream (in-memory or disk-backed)
   seqLen: number;
   steps: number;
   batchPerStep: number; // sequences accumulated per optimizer step
@@ -26,7 +28,8 @@ export function trainLM(model: Qwen3Model, opts: TrainOpts): { step: number; los
   const opt = opts.optimizer;
   const rng = opts.rng ?? Math.random;
   const logEvery = opts.logEvery ?? 20;
-  const maxStart = opts.tokens.length - opts.seqLen - 1;
+  const tokens = toTokenSource(opts.tokens);
+  const maxStart = tokens.length - opts.seqLen - 1;
   if (maxStart <= 0) throw new Error("Not enough tokens for one training window");
 
   const history: { step: number; loss: number }[] = [];
@@ -38,8 +41,8 @@ export function trainLM(model: Qwen3Model, opts: TrainOpts): { step: number; los
 
     for (let b = 0; b < opts.batchPerStep; b++) {
       const start = Math.floor(rng() * maxStart);
-      const inputIds = opts.tokens.slice(start, start + opts.seqLen);
-      const targetIds = opts.tokens.slice(start + 1, start + opts.seqLen + 1);
+      const inputIds = tokens.window(start, opts.seqLen);
+      const targetIds = tokens.window(start + 1, opts.seqLen);
 
       const logits = model.forward(inputIds);
       const loss = crossEntropy(logits, targetIds);

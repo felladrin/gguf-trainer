@@ -6,7 +6,8 @@
     "demo": "deno run -A examples/demo.ts",
     "demo:node": "node --experimental-strip-types examples/demo.ts",
     "demo:gpu": "deno run -A examples/demo_gpu.ts",
-    "test": "deno run tests/gradcheck.ts && deno run tests/gpu_parity.ts",
+    "streaming": "deno run -A examples/train_streaming.ts",
+    "test": "deno run -A tests/gradcheck.ts && deno run tests/gpu_parity.ts",
     "test:node": "node --experimental-strip-types tests/gradcheck.ts && node --experimental-strip-types tests/gpu_parity.ts"
   },
   "fmt": {

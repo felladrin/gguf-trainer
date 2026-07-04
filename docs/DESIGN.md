@@ -72,7 +72,10 @@ embeddings.
    [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (1.3T tokens,
    quality-filtered from FineWeb's 15T, the corpus behind the SmolLM family) is the step up once a
    model needs to know things beyond storytelling. Start with the former to validate the pipeline at
-   real (non-toy) scale, move to a slice of the latter once it saturates.
+   real (non-toy) scale, move to a slice of the latter once it saturates. Pipeline is ready:
+   `scaleConfig()` for 10–50M sizes, a disk-streaming token loader (`src/data/tokens.ts`, so the
+   corpus needn't fit in memory), and `examples/train_streaming.ts` as the entry point — point it at
+   a real text file and widen the config. The remaining work is the run itself, not code.
 7. **ReLU² MLP / value-residuals / attention-window warmup** — speedrun tricks with real but smaller
    gains. Note: ReLU² would diverge from the Qwen3 schema (SwiGLU), so keep it optional/off by
    default to preserve llama.cpp loadability.
