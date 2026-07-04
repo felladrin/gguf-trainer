@@ -139,6 +139,22 @@ functional gate at T=3584 under spec-default limits.
 1. **muP parametrization** — tune hyperparameters on a tiny proxy model, transfer to full size
    (touches init + per-tensor LR). The old `lr`-baking caveat is resolved: `MuonGpu` reads `lr` from
    a device buffer now (see WSD), so per-tensor/per-step lr changes cost only a buffer write.
+   **Deferred to the real-data run (item 6)** on purpose: muP's payoff is LR transfer across widths,
+   which only pays off once multi-width tuning is actually happening, and the Muon-group LR rule
+   needs validating on real loss curves (see caveat below). Design worked out and contract-safe:
+   - **Readout scale vs the llama.cpp contract.** Textbook muP controls readout scale with a `1/d`
+     forward multiplier or a width-scaled readout init. Neither is available here: `token_embd` is
+     the readout (tied), and an unfolded forward multiplier makes `llama-cli` inference diverge from
+     training (can't fold into a tied weight). The contract-safe formulation: init `token_embd` std
+     ∝ `1/√hidden` — the post-embedding RMSNorm erases the input-side effect while the tied readout
+     logits stay O(1) — keep `1/√headDim` attention, add no forward multipliers. Hidden matmuls keep
+     `1/√fan_in` init; per-tensor LR scales ∝ `base_width/width` for width-dependent layers.
+   - **Muon-group LR caveat.** muP's `1/width` LR rule is derived for Adam/SGD. Muon's
+     orthogonalized update already carries a `sqrt(max(1, rows/cols))` spectral factor and scales
+     differently, so its width rule must be picked from a coordinate check (logit/activation RMS
+     flat across widths), not assumed. Validate empirically during item 6.
+   - The alternative (untie embeddings for a textbook readout) works and stays llama.cpp-compatible,
+     but changes the model (more params, drops the tie convention Qwen3 small models use).
 2. **WSD learning-rate schedule** (warmup → stable → linear cooldown) — done.
    `src/train/schedule.ts` `wsdSchedule()` returns a per-step lr multiplier; `Muon`, `MuonGpu`, and
    `AdamW` gained `setLrScale()`, and all three training loops (`trainLM`, `trainLMGpu`,
