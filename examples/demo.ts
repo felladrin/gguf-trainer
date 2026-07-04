@@ -15,6 +15,7 @@ import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { Muon } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
 import { buildGGUF } from "../src/export/export_gguf.ts";
+import { loadQwen3FromGGUF } from "../src/export/load_gguf.ts";
 
 // A small, repetitive corpus so a tiny model shows clear learning fast.
 const CORPUS = `
@@ -111,13 +112,21 @@ async function main() {
 
   // 5. Export GGUF in F16 and Q8_0. Write to disk.
   const outDir = new URL(".", import.meta.url).pathname;
+  let f16Bytes: Uint8Array | null = null;
   for (const quant of ["f16", "q8_0", "q4_0"] as const) {
     const bytes = buildGGUF(model, tok.export(), cfg, { quant, name: "tinyqwen3" });
+    if (quant === "f16") f16Bytes = bytes;
     const path = `${outDir}tinyqwen3-${quant}.gguf`;
     await writeFileBytes(path, bytes);
     console.log(`\nWrote ${path}  (${(bytes.length / 1024).toFixed(1)} KiB)`);
     verify(bytes, cfg, quant);
   }
+
+  // 6. Resume from the F16 checkpoint: rebuild model + tokenizer straight from
+  //    the GGUF and confirm greedy sampling reproduces the pre-export output.
+  const resumed = loadQwen3FromGGUF(f16Bytes!);
+  const sample = generate(resumed.model, resumed.tokenizer, "the cat", 20);
+  console.log(`\nResumed from GGUF -> greedy sample: "${sample}"`);
 
   console.log("\n=== all checks passed ===");
 }

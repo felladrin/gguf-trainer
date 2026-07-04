@@ -32,6 +32,9 @@ import { Qwen3Model } from "../src/model/qwen3.ts";
 import type { Qwen3Config } from "../src/model/config.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
 import { applyQKClip, qkLogitScale } from "../src/train/qk_clip.ts";
+import { buildGGUF } from "../src/export/export_gguf.ts";
+import { loadQwen3FromGGUF } from "../src/export/load_gguf.ts";
+import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 
 // Storage is f32, so the finite difference carries ~1e-6 forward-rounding noise;
 // ε=1e-2 keeps both that noise (δ/2ε) and the O(ε²) truncation well under tol.
@@ -411,6 +414,79 @@ function main() {
     }
     if (!ok) failures++;
     console.log(`  ${ok ? "ok " : "FAIL"} MuonClip / QK-logit clip (proxy, cap-at-tau, symmetric)`);
+  }
+
+  // GGUF checkpoint round-trip: export a model+tokenizer, load it back with
+  // loadQwen3FromGGUF, and confirm config, tokenizer, weights, and the actual
+  // forward logits all survive. f32 is bit-exact; q8_0 is lossy so its weights
+  // (and logits) are checked within quant tolerance. Inner dims are multiples
+  // of 32 so q8_0 stores without the f16 fallback — exercising the loader's
+  // quantized dequant path.
+  {
+    const tok = new BPETokenizer();
+    tok.train("the cat sat on the mat. the dog ran to the cat and the ball.".repeat(6), 300);
+    const cfg: Qwen3Config = {
+      vocabSize: tok.vocabSize,
+      hiddenSize: 32,
+      nLayers: 2,
+      nHeads: 1,
+      nKVHeads: 1,
+      headDim: 32,
+      ffnDim: 64,
+      ropeBase: 10000,
+      rmsEps: 1e-6,
+      maxSeq: 32,
+      tieEmbeddings: true,
+    };
+    const model = new Qwen3Model(cfg, mulberry32(77));
+    const ids = tok.encode("the cat sat").slice(0, 6);
+    const refLogits = model.forward(ids).data.slice();
+    const refParams = model.params().map((p) => p.data.slice());
+
+    let ok = true;
+    for (const [quant, wtol, ltol] of [["f32", 0, 0], ["q8_0", 0.05, 0.05]] as const) {
+      const bytes = buildGGUF(model, tok.export(), cfg, { quant });
+      const { model: m2, cfg: cfg2, tokenizer: tok2 } = loadQwen3FromGGUF(bytes);
+
+      // Config round-trips: integer/bool fields exactly; rmsEps and ropeBase
+      // are stored as f32 metadata, so they match only to f32 precision.
+      const floatKeys = new Set<keyof Qwen3Config>(["rmsEps", "ropeBase"]);
+      for (const k of Object.keys(cfg) as (keyof Qwen3Config)[]) {
+        const a = cfg2[k], b = cfg[k];
+        const bad = floatKeys.has(k)
+          ? Math.abs(Number(a) - Number(b)) > 1e-6 * Math.abs(Number(b))
+          : a !== b;
+        if (bad) {
+          console.log(`    cfg mismatch ${k}: ${a} != ${b}`);
+          ok = false;
+        }
+      }
+      // Tokenizer round-trips (same ids, decode inverts).
+      const s = "the dog ran";
+      if (tok2.encode(s).join(",") !== tok.encode(s).join(",")) ok = false;
+      if (tok2.decode(tok2.encode(s)) !== s) ok = false;
+      // Weights within tolerance for the quant.
+      const p2 = m2.params();
+      for (let i = 0; i < refParams.length; i++) {
+        for (let j = 0; j < refParams[i].length; j++) {
+          const a = p2[i].data[j], b = refParams[i][j];
+          if (Math.abs(a - b) > wtol + wtol * Math.abs(b) + (quant === "f32" ? 0 : 1e-6)) {
+            ok = false;
+          }
+        }
+      }
+      // The forward pass reproduces (bit-exact for f32, within tol for q8_0).
+      const l2 = m2.forward(ids).data;
+      for (let i = 0; i < refLogits.length; i++) {
+        if (Math.abs(l2[i] - refLogits[i]) > ltol + ltol * Math.abs(refLogits[i]) + 1e-6) {
+          ok = false;
+        }
+      }
+    }
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} GGUF checkpoint round-trip (config+tokenizer+weights+forward)`,
+    );
   }
 
   console.log(

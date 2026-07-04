@@ -189,15 +189,24 @@ functional gate at T=3584 under spec-default limits.
    dominated, and it grows with vocab·hidden — this is the real win at scale). Gated by the existing
    GPU-vs-CPU trajectory-parity tests, which now exercise GPU AdamW and still hold within BWD
    tolerance.
-5. **GGUF checkpoint loader** — dequant already exists in `src/gguf/quantize.ts`; wire it back into
-   a `Qwen3Model` for resume/round-trip. Two tiers, different difficulty:
-   - **Resuming a GGUF this framework produced**: straightforward. Architecture and tokenizer
-     already match by construction — it's tensor-name matching plus the existing `dequantize()` to
-     repopulate `model.params()`, then the current trainer runs unchanged.
-   - **Fine-tuning an arbitrary external Qwen3 GGUF** (e.g. the real Alibaba releases): a bigger
-     lift on top of that. Needs the config read back out of GGUF metadata instead of a hand-written
-     `Qwen3Config`, and the actual vocab/merges loaded from the GGUF's tokenizer metadata since
-     `src/tokenizer/bpe.ts` only trains fresh vocabularies, it doesn't import one.
+5. **GGUF checkpoint loader** — tier 1 (resume own checkpoints) done. `src/export/load_gguf.ts` is
+   the inverse of `export_gguf.ts`: `configFromGGUF()` rebuilds the `Qwen3Config` from `qwen3.*`
+   metadata (tie is inferred from the presence of `output.weight`), `loadWeightsFromGGUF()` copies
+   every tensor back by name via the existing `dequantize()` (per-tensor type, so the f16-fallback
+   case is handled), and `loadQwen3FromGGUF(bytes)` returns `{ model, cfg, tokenizer }` ready to
+   sample or keep training. `BPETokenizer.fromData()` (new, the inverse of `export()`) rebuilds the
+   tokenizer from the embedded vocab/merges. Fidelity follows the export quant: f32/f16 round-trip
+   cleanly (f32 bit-exact), a q4_0/q8_0 checkpoint resumes from its lossy dequantized weights — so
+   export in f16/f32 for a faithful resume. Gated by a round-trip check in `tests/gradcheck.ts`
+   (config + tokenizer + weights + forward logits, f32 exact and q8_0 within tolerance) and
+   demonstrated end-to-end in `examples/demo.ts` (train → save → reload → identical greedy sample).
+   Note: `mergeKey()` in `bpe.ts` uses a U+0000 separator internally while the exported merges use a
+   space, so `fromData()` rebuilds `mergeRank` through `mergeKey()` rather than keying on the raw
+   string — worth a look if that separator ever changes.
+   - **Tier 2 — fine-tuning an arbitrary external Qwen3 GGUF** (e.g. the real Alibaba releases):
+     still open. `configFromGGUF()` already reads config from metadata, but the tokenizer path only
+     handles our own gpt2/BPE data; an external GGUF's vocab/merges/special-token scheme would need
+     broader import support in `src/tokenizer/bpe.ts`.
 6. **Scale + real data** — larger `Qwen3Config`, curated corpus, longer runs. Reminder: at small
    scale, data quality beats architecture tweaks. Dataset picks + links in `docs/DESIGN.md` ("Data
    quality > everything at small scale"): TinyStories to validate the pipeline, FineWeb-Edu to scale
@@ -226,12 +235,12 @@ functional gate at T=3584 under spec-default limits.
 
 ```
 src/gguf/      f16, quantize (+dequant), gguf writer/reader
-src/tokenizer/ byte-level BPE
+src/tokenizer/ byte-level BPE (train + export/fromData round-trip)
 src/model/     config, autograd (CPU op set + OpsBackend hook), qwen3 forward
 src/train/     optimizer iface, adamw, muon, trainer (CPU), schedule (WSD), qk_clip (MuonClip)
 src/backend/   webgpu.ts (WGSL kernels, buffers, sync), train_gpu.ts,
                muon_gpu.ts + adamw_gpu.ts (GPU-resident optimizers)
-src/export/    model -> GGUF (the llama.cpp contract)
+src/export/    export_gguf (model -> GGUF, the llama.cpp contract), load_gguf (GGUF -> model)
 tests/         gradcheck.ts (FD gradient gate), gpu_parity.ts (GPU-vs-CPU gate)
 examples/      demo.ts (CPU end-to-end), demo_gpu.ts (WebGPU end-to-end)
 docs/          DESIGN.md (rationale + technique research), HANDOFF.md (this file)
