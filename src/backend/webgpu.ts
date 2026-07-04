@@ -1277,6 +1277,17 @@ export class WebGPUBackend implements OpsBackend {
   }
 
   /**
+   * Overwrite a state buffer's contents from the host. Used for small
+   * scalars a kernel reads each step (e.g. a scheduled learning rate held in
+   * a 1-element buffer): the value updates in place, so the bind group cached
+   * by prepareDispatch stays valid. Like uploadParams, the write is ordered
+   * before any command buffer submitted after this call.
+   */
+  writeStateBuffer(buf: GpuBuffer, values: Float32Array) {
+    this.queue.writeBuffer(buf, 0, values);
+  }
+
+  /**
    * Resolve pipeline + bind group once and return a closure that records the
    * dispatch. Only valid for PERSISTENT buffers (a pooled transient may be
    * recycled under the cached bind group). An optimizer re-records identical

@@ -15,6 +15,8 @@ export interface TrainOpts {
   logEvery?: number;
   rng?: () => number;
   onLog?: (step: number, loss: number) => void;
+  /** WSD (or any) lr-multiplier by step; applied before each optimizer step. */
+  schedule?: (step: number) => number;
 }
 
 export function trainLM(model: Qwen3Model, opts: TrainOpts): { step: number; loss: number }[] {
@@ -27,6 +29,7 @@ export function trainLM(model: Qwen3Model, opts: TrainOpts): { step: number; los
   const history: { step: number; loss: number }[] = [];
 
   for (let step = 0; step < opts.steps; step++) {
+    if (opts.schedule) opt.setLrScale?.(opts.schedule(step));
     opt.zeroGrad();
     let lossSum = 0;
 

@@ -132,6 +132,11 @@ async function main() {
   let readback = 0;
   let stepIdx = 0;
   const steps = 40;
+  // A WSD lr schedule (src/train/schedule.ts) plugs in here via `schedule:
+  // wsdSchedule({...})`. Left off in this demo on purpose: at 40 toy steps the
+  // model is still descending steeply, so the cooldown only costs final loss —
+  // WSD's payoff is on longer runs where constant lr plateaus. The GPU dynamic-
+  // lr path is gated instead by wsdScheduleParity in tests/gpu_parity.ts.
   const t0 = Date.now();
   await trainLMGpuResident(model, gpu, {
     tokens,

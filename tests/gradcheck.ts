@@ -30,6 +30,7 @@ import {
 } from "../src/model/autograd.ts";
 import { Qwen3Model } from "../src/model/qwen3.ts";
 import type { Qwen3Config } from "../src/model/config.ts";
+import { wsdSchedule } from "../src/train/schedule.ts";
 
 // Storage is f32, so the finite difference carries ~1e-6 forward-rounding noise;
 // ε=1e-2 keeps both that noise (δ/2ε) and the O(ε²) truncation well under tol.
@@ -337,6 +338,26 @@ function main() {
     }
     if (!ok) failures++;
     console.log(`  ${ok ? "ok " : "FAIL"} backward(seed) scales leaf grads linearly`);
+  }
+
+  // WSD schedule shape (pure, runtime-agnostic): warmup ramp, stable plateau,
+  // linear cooldown to the floor. Guards the phase boundaries that the GPU/CPU
+  // trajectory parity in gpu_parity.ts then exercises end-to-end.
+  {
+    const s = wsdSchedule({ warmupSteps: 4, stableSteps: 3, cooldownSteps: 4, minScale: 0.1 });
+    const got = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(s);
+    // warmup (step+1)/4: .25 .5 .75 1 | stable: 1 1 1 | cooldown 1->0.1 over 4:
+    // 1-.9*(k/4) for k=1..4 => .775 .55 .325 .1 | past schedule: .1
+    const want = [0.25, 0.5, 0.75, 1, 1, 1, 1, 0.775, 0.55, 0.325, 0.1, 0.1];
+    let ok = got.length === want.length;
+    for (let i = 0; i < want.length; i++) if (Math.abs(got[i] - want[i]) > 1e-6) ok = false;
+    // Edge cases: no warmup starts at 1; no cooldown holds 1 then drops to floor.
+    const noWarm = wsdSchedule({ warmupSteps: 0, stableSteps: 2, cooldownSteps: 2 });
+    if (noWarm(0) !== 1) ok = false;
+    const noCool = wsdSchedule({ warmupSteps: 0, stableSteps: 2, cooldownSteps: 0, minScale: 0 });
+    if (noCool(1) !== 1 || noCool(2) !== 0) ok = false;
+    if (!ok) failures++;
+    console.log(`  ${ok ? "ok " : "FAIL"} WSD schedule shape (warmup/stable/cooldown)`);
   }
 
   console.log(

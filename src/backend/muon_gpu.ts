@@ -163,25 +163,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 /**
- * W ← W − factor·ortho, reading ortho straight out of X (transposing back on
+ * W ← W − LR·scale·ortho, reading ortho straight out of X (transposing back on
  * the fly when the NS ran flipped) — the CPU path's final transpose + update
- * fused into one pass. factor bakes lr·sqrt(max(1, rows/cols)).
+ * fused into one pass. The shape-static scale (sqrt(max(1, rows/cols))) is
+ * baked; the learning rate comes from a 1-element buffer so a WSD schedule can
+ * update it every step without rebuilding the pipeline (all Muon params share
+ * one LR buffer). Compare ../train/muon.ts step(): p -= lr·ortho·scale.
  */
-function srcApply(m: number, n: number, flip: boolean, factor: number): string {
+function srcApply(m: number, n: number, flip: boolean, scale: number): string {
   // When flipped X is [n,m], so ortho[row,col] = X[col,row] = XB[col*m + row].
   const load = flip ? "XB[col * NROWS + row]" : "XB[i]";
   return `
 ${bindF32(0, "WB", "read_write")}
 ${bindF32(1, "XB", "read")}
+${bindF32(2, "LRB", "read")}
 const N: u32 = ${m * n}u; const C: u32 = ${n}u; const NROWS: u32 = ${m}u;
-const FACTOR: f32 = ${f32lit(factor)};
+const SCALE: f32 = ${f32lit(scale)};
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= N) { return; }
   let row = i / C;
   let col = i % C;
-  WB[i] = WB[i] - FACTOR * ${load};
+  WB[i] = WB[i] - LRB[0] * SCALE * ${load};
 }`;
 }
 
@@ -262,9 +266,13 @@ export async function newtonSchulzGpu(
   const out = Tensor.zeros([m, n]);
   const ns = allocNs(gpu, m, n, gpu.buffersFor(src).data);
   for (const op of buildNewtonSchulz(gpu, ns, m, n, steps)) op();
+  // scale=1 (no rows/cols factor here — return raw orthogonalization to match
+  // the CPU newtonSchulz output), lr=-1 so W(=0) − lr·ortho = +ortho.
+  const lr = gpu.createStateBuffer(4);
+  gpu.writeStateBuffer(lr, Float32Array.of(-1));
   gpu.prepareDispatch(
-    srcApply(m, n, m > n, -1),
-    [gpu.buffersFor(out).data, ns.X],
+    srcApply(m, n, m > n, 1),
+    [gpu.buffersFor(out).data, ns.X, lr],
     ceilDiv(m * n, 256),
   )();
   await gpu.sync([out]);
@@ -280,6 +288,8 @@ export class MuonGpu {
   private muonParams: Tensor[];
   private aux: AdamW;
   private ops: (() => void)[]; // one step's dispatches, prepared once
+  private baseLr: number;
+  private lrBuf: GpuBuffer; // 1-element, shared by every param's apply kernel
 
   constructor(
     gpu: WebGPUBackend,
@@ -291,6 +301,11 @@ export class MuonGpu {
     this.muonParams = muonParams;
     this.auxParams = auxParams;
     this.aux = new AdamW(auxParams, opts.aux);
+    this.baseLr = opts.lr;
+    // Learning rate lives in a device buffer, not a baked WGSL constant, so a
+    // WSD schedule can update it each step without recompiling the pipelines.
+    this.lrBuf = gpu.createStateBuffer(4);
+    gpu.writeStateBuffer(this.lrBuf, Float32Array.of(opts.lr));
     const momentum = opts.momentum ?? 0.95;
     const nesterov = opts.nesterov ?? true;
     const nsSteps = opts.nsSteps ?? 5;
@@ -304,7 +319,7 @@ export class MuonGpu {
       gpu.keepGradOnDevice(p);
       const buf = gpu.createStateBuffer(p.size * 4); // momentum, zero at start
       const ns = allocNs(gpu, m, n, gpu.createStateBuffer(p.size * 4));
-      const factor = opts.lr * Math.sqrt(Math.max(1, m / n));
+      const scale = Math.sqrt(Math.max(1, m / n)); // shape-static; lr is dynamic
       this.ops.push(
         gpu.prepareDispatch(
           srcMomentum(p.size, momentum, nesterov),
@@ -313,12 +328,22 @@ export class MuonGpu {
         ),
         ...buildNewtonSchulz(gpu, ns, m, n, nsSteps),
         gpu.prepareDispatch(
-          srcApply(m, n, m > n, factor),
-          [bufs.data, ns.X],
+          srcApply(m, n, m > n, scale),
+          [bufs.data, ns.X, this.lrBuf],
           ceilDiv(p.size, 256),
         ),
       );
     }
+  }
+
+  /**
+   * Scale both groups' lr by `scale` × their base lr (WSD schedule). The Muon
+   * lr write lands before the next optimizer submit (queue ordering), so the
+   * apply kernels read the fresh value; the aux AdamW is host-side.
+   */
+  setLrScale(scale: number) {
+    this.gpu.writeStateBuffer(this.lrBuf, Float32Array.of(this.baseLr * scale));
+    this.aux.setLrScale(scale);
   }
 
   /** Aux host grads only: Muon-group grads live on device and the backend

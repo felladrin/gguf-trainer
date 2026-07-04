@@ -31,6 +31,7 @@ import { Qwen3Model } from "../src/model/qwen3.ts";
 import type { Qwen3Config } from "../src/model/config.ts";
 import { Muon, newtonSchulz } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
+import { wsdSchedule } from "../src/train/schedule.ts";
 import { initWebGPU, WebGPUBackend } from "../src/backend/webgpu.ts";
 import { MuonGpu, newtonSchulzGpu } from "../src/backend/muon_gpu.ts";
 import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
@@ -468,6 +469,7 @@ async function main() {
   await newtonSchulzParity(gpu);
   await muonMomentumPersistence(gpu);
   await muonTrajectoryParity(gpu);
+  await wsdScheduleParity(gpu);
 
   // 8. sync() must fence GPU completion even when it reads nothing back.
   await syncFenceGate(gpu);
@@ -623,6 +625,68 @@ async function muonTrajectoryParity(gpu: WebGPUBackend) {
     `  ${ok ? "ok " : "FAIL"} Muon GPU training trajectory (${steps} steps, ` +
       `${cpuParams.length} weight tensors)`,
   );
+}
+
+/**
+ * Same as muonTrajectoryParity but with a WSD schedule driving a DISTINCT lr
+ * every step (warmup 2 → cooldown 2, floor 0.1: multipliers 0.5, 1, 0.55, 0.1).
+ * This is the gate for the dynamic-lr path: MuonGpu now reads lr from a device
+ * buffer that setLrScale() rewrites each step, and the CPU Muon scales its base
+ * lr in host arrays — the two must still track to BWD tolerance. A regression
+ * where the GPU lr write is mis-ordered relative to the apply dispatch, or the
+ * buffer isn't actually read, shows up here as trajectory divergence.
+ */
+async function wsdScheduleParity(gpu: WebGPUBackend) {
+  const cfg = microConfig();
+  const steps = 4, seqLen = 8, batchPerStep = 2;
+  const rngTok = mulberry32(0x70cc);
+  const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
+  const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
+  const schedule = wsdSchedule({ warmupSteps: 2, stableSteps: 0, cooldownSteps: 2, minScale: 0.1 });
+
+  const cpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const cg = cpuModel.paramGroups();
+  const cpuHist = trainLM(cpuModel, {
+    tokens,
+    seqLen,
+    steps,
+    batchPerStep,
+    optimizer: new Muon(cg.muon, cg.aux, hyper),
+    schedule,
+    logEvery: 1,
+    rng: mulberry32(7),
+  });
+
+  const gpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const gg = gpuModel.paramGroups();
+  const gpuHist = await trainLMGpuResident(gpuModel, gpu, {
+    tokens,
+    seqLen,
+    steps,
+    batchPerStep,
+    optimizer: new MuonGpu(gpu, gg.muon, gg.aux, hyper),
+    schedule,
+    logEvery: 1,
+    rng: mulberry32(7),
+  });
+
+  let ok = true;
+  for (let i = 0; i < Math.min(cpuHist.length, gpuHist.length); i++) {
+    const dl = Math.abs(gpuHist[i].loss - cpuHist[i].loss);
+    if (dl > 1e-3 + 1e-3 * Math.abs(cpuHist[i].loss)) {
+      console.log(
+        `    MISMATCH loss@step${cpuHist[i].step}: gpu=${gpuHist[i].loss} cpu=${cpuHist[i].loss}`,
+      );
+      ok = false;
+    }
+  }
+  const cpuParams = cpuModel.params();
+  const gpuParams = gpuModel.params();
+  for (let i = 0; i < cpuParams.length; i++) {
+    ok = compare(`wsd.param${i}`, gpuParams[i].data, cpuParams[i].data, BWD) && ok;
+  }
+  if (!ok) failures++;
+  console.log(`  ${ok ? "ok " : "FAIL"} WSD-scheduled Muon trajectory (GPU lr buffer vs CPU)`);
 }
 
 /**

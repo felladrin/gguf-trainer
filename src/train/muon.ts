@@ -32,6 +32,7 @@ export class Muon implements Optimizer {
   private bufs: Float32Array[];
   private aux: AdamW;
   private opts: Required<Omit<MuonOpts, "aux">>;
+  private baseLr: number;
 
   /**
    * @param muonParams 2-D hidden weight matrices ([out, in]).
@@ -49,6 +50,7 @@ export class Muon implements Optimizer {
       nesterov: opts.nesterov ?? true,
       nsSteps: opts.nsSteps ?? 5,
     };
+    this.baseLr = opts.lr;
     this.bufs = muonParams.map((p) => new Float32Array(p.size));
     this.aux = new AdamW(auxParams, opts.aux);
   }
@@ -56,6 +58,12 @@ export class Muon implements Optimizer {
   zeroGrad() {
     for (const p of this.muonParams) p.grad.fill(0);
     this.aux.zeroGrad();
+  }
+
+  /** Scale both groups' lr by `scale` × their base lr (WSD schedule). */
+  setLrScale(scale: number) {
+    this.opts.lr = this.baseLr * scale;
+    this.aux.setLrScale(scale);
   }
 
   step() {

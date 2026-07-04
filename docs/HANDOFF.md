@@ -137,11 +137,17 @@ functional gate at T=3584 under spec-default limits.
 ## Secondary roadmap (after the primary tasks above, priority order)
 
 1. **muP parametrization** — tune hyperparameters on a tiny proxy model, transfer to full size
-   (touches init + per-tensor LR). Note: `MuonGpu` bakes `lr` into WGSL pipeline constants at
-   construction; a WSD schedule will require rebuilding the apply pipelines when `lr` changes, or
-   passing `lr` via a uniform buffer instead.
-2. **WSD learning-rate schedule** (warmup → stable → linear cooldown) — cheap win, pure trainer
-   change. See note above re: `MuonGpu` and lr changes.
+   (touches init + per-tensor LR). The old `lr`-baking caveat is resolved: `MuonGpu` reads `lr` from
+   a device buffer now (see WSD), so per-tensor/per-step lr changes cost only a buffer write.
+2. **WSD learning-rate schedule** (warmup → stable → linear cooldown) — done.
+   `src/train/schedule.ts` `wsdSchedule()` returns a per-step lr multiplier; `Muon`, `MuonGpu`, and
+   `AdamW` gained `setLrScale()`, and all three training loops (`trainLM`, `trainLMGpu`,
+   `trainLMGpuResident`) apply an optional `schedule` before each step. `MuonGpu` holds `lr` in a
+   1-element device buffer that `setLrScale()` rewrites in place (the apply pipelines bind it once
+   via `prepareDispatch`, so no recompile). Gated by `wsdScheduleParity` (GPU-buffer lr vs CPU
+   trajectory) in `tests/gpu_parity.ts` and a shape self-check in `tests/gradcheck.ts`. Left off the
+   40-step demos on purpose — at that length the cooldown only costs final loss (the model is still
+   descending steeply); WSD's payoff is on longer runs, so wire it in at roadmap item 6.
 3. **MuonClip / attention-logit clipping** — stability when scaling up; pairs with the existing
    QK-norm.
 4. **Aux-group GPU residency** — `AdamW` still runs host-side on every step for embeddings/norms; at

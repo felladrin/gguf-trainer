@@ -32,11 +32,16 @@ embeddings.
 1. **Muon optimizer** — done. Biggest single win; ~2× compute efficiency.
 2. **muP (maximal-update parametrization)** — tune LR/init on a _tiny_ proxy model and transfer to
    the full model without re-tuning. High value because hyperparameter search on WebGPU is
-   expensive. Touches init + per-tensor LR. Note: `MuonGpu` bakes `lr` into WGSL pipeline constants
-   at construction; a schedule requires either rebuilding apply pipelines on lr change, or switching
-   to a uniform-buffer approach.
-3. **LR schedule: warmup → stable → linear cooldown** (WSD). Cheap, reliably improves final loss.
-   Pure trainer change (with the MuonGpu caveat above).
+   expensive. Touches init + per-tensor LR. The `lr`-baking obstacle is gone: `MuonGpu` now reads
+   `lr` from a device buffer (see WSD below), so per-step lr changes need no pipeline rebuild.
+3. **LR schedule: warmup → stable → linear cooldown** (WSD) — done. `src/train/schedule.ts`
+   `wsdSchedule()` returns a per-step multiplier in [minScale, 1]; the trainer applies it via
+   `setLrScale()` on both groups (Muon + aux AdamW) each step. `MuonGpu` holds `lr` in a 1-element
+   device buffer that `setLrScale()` rewrites — no WGSL constant baked, so the apply pipelines are
+   built once and the schedule costs a 4-byte upload per step. Gated by `wsdScheduleParity`
+   (GPU-buffer lr vs CPU) in `tests/gpu_parity.ts` and a shape self-check in `tests/gradcheck.ts`.
+   Its payoff is on long runs where constant lr plateaus; the 40-step demos leave it off (the
+   cooldown only costs final loss when the model is still descending steeply).
 4. **MuonClip / QK-logit control** — Moonshot's Muon variant clips attention logits to stop the
    "attention logit explosion" that shows up at scale; complements the QK-norm we already have. Add
    when scaling up.

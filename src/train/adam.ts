@@ -17,6 +17,7 @@ export class AdamW {
   private v: Float32Array[];
   private t = 0;
   private opts: Required<AdamOpts>;
+  private baseLr: number;
 
   constructor(params: Tensor[], opts: AdamOpts) {
     this.params = params;
@@ -28,12 +29,18 @@ export class AdamW {
       clip: 1.0,
       ...opts,
     };
+    this.baseLr = opts.lr;
     this.m = params.map((p) => new Float32Array(p.size));
     this.v = params.map((p) => new Float32Array(p.size));
   }
 
   zeroGrad() {
     for (const p of this.params) p.grad.fill(0);
+  }
+
+  /** Set the effective lr to `scale` × the constructed base lr (WSD schedule). */
+  setLrScale(scale: number) {
+    this.opts.lr = this.baseLr * scale;
   }
 
   step() {

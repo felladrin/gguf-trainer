@@ -34,6 +34,7 @@ export async function trainLMGpu(
   gpu.install();
   try {
     for (let step = 0; step < opts.steps; step++) {
+      if (opts.schedule) opt.setLrScale?.(opts.schedule(step));
       opt.zeroGrad();
       gpu.uploadParams(params); // host params changed in the previous opt.step()
 
@@ -75,6 +76,8 @@ export interface TrainGpuResidentOpts {
   logEvery?: number;
   rng?: () => number;
   onLog?: (step: number, loss: number) => void;
+  /** WSD (or any) lr-multiplier by step; applied before each optimizer step. */
+  schedule?: (step: number) => number;
   /** Per-step wall-time split and sync readback volume, for profiling. */
   onStepTime?: (fwdBwdSyncMs: number, optimizerMs: number, readbackBytes: number) => void;
 }
@@ -109,6 +112,7 @@ export async function trainLMGpuResident(
   try {
     for (let step = 0; step < opts.steps; step++) {
       const t0 = performance.now();
+      if (opts.schedule) opt.setLrScale(opts.schedule(step));
       opt.zeroGrad();
       gpu.uploadParams(opt.auxParams); // Muon weights are device-resident: no upload
 
