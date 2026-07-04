@@ -31,6 +31,7 @@ import {
 import { Qwen3Model } from "../src/model/qwen3.ts";
 import type { Qwen3Config } from "../src/model/config.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
+import { applyQKClip, qkLogitScale } from "../src/train/qk_clip.ts";
 
 // Storage is f32, so the finite difference carries ~1e-6 forward-rounding noise;
 // ε=1e-2 keeps both that noise (δ/2ε) and the O(ε²) truncation well under tol.
@@ -358,6 +359,58 @@ function main() {
     if (noCool(1) !== 1 || noCool(2) !== 0) ok = false;
     if (!ok) failures++;
     console.log(`  ${ok ? "ok " : "FAIL"} WSD schedule shape (warmup/stable/cooldown)`);
+  }
+
+  // MuonClip / QK-logit clip (pure, runtime-agnostic): capping the per-layer
+  // logit-scale proxy at tau by rescaling qNorm/kNorm. Verifies the proxy math,
+  // that clipping lands exactly on tau, symmetric q/k scaling, and no-op below.
+  {
+    const cfg: Qwen3Config = {
+      vocabSize: 13,
+      hiddenSize: 8,
+      nLayers: 2,
+      nHeads: 2,
+      nKVHeads: 1,
+      headDim: 4,
+      ffnDim: 16,
+      ropeBase: 10000,
+      rmsEps: 1e-6,
+      maxSeq: 16,
+      tieEmbeddings: true,
+    };
+    const model = new Qwen3Model(cfg, mulberry32(99));
+    let ok = true;
+    // At init qNorm=kNorm=ones -> proxy = (1/sqrt(hd))*sqrt(hd) = 1. tau=0.5 clips.
+    if (
+      Math.abs(qkLogitScale(model.layers[0].qNorm.data, model.layers[0].kNorm.data, 4) - 1) > 1e-6
+    ) {
+      ok = false;
+    }
+    // Inflate layer 0's norms so its proxy is well above tau; leave layer 1 at 1.
+    for (let d = 0; d < 4; d++) {
+      model.layers[0].qNorm.data[d] = 3;
+      model.layers[0].kNorm.data[d] = 2;
+    }
+    const before = qkLogitScale(model.layers[0].qNorm.data, model.layers[0].kNorm.data, 4); // 6
+    const tau = 0.5;
+    const qBefore = model.layers[0].qNorm.data.slice();
+    const kBefore = model.layers[0].kNorm.data.slice();
+    const clipped = applyQKClip(model, tau);
+    if (clipped !== 2) ok = false; // both layers exceed 0.5 (layer1 proxy=1)
+    const after = qkLogitScale(model.layers[0].qNorm.data, model.layers[0].kNorm.data, 4);
+    if (Math.abs(after - tau) > 1e-6) ok = false; // lands exactly on tau
+    const f = Math.sqrt(tau / before);
+    for (let d = 0; d < 4; d++) {
+      if (Math.abs(model.layers[0].qNorm.data[d] - qBefore[d] * f) > 1e-6) ok = false;
+      if (Math.abs(model.layers[0].kNorm.data[d] - kBefore[d] * f) > 1e-6) ok = false;
+    }
+    // Re-clipping is now a no-op (already at tau, within fp) — proxy stays <= tau.
+    applyQKClip(model, tau);
+    if (qkLogitScale(model.layers[0].qNorm.data, model.layers[0].kNorm.data, 4) > tau + 1e-6) {
+      ok = false;
+    }
+    if (!ok) failures++;
+    console.log(`  ${ok ? "ok " : "FAIL"} MuonClip / QK-logit clip (proxy, cap-at-tau, symmetric)`);
   }
 
   console.log(

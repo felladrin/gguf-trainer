@@ -5,6 +5,7 @@
 import { backward, crossEntropy } from "../model/autograd.ts";
 import type { Qwen3Model } from "../model/qwen3.ts";
 import type { Optimizer } from "./optimizer.ts";
+import { applyQKClip } from "./qk_clip.ts";
 
 export interface TrainOpts {
   tokens: number[]; // full training token stream
@@ -17,6 +18,8 @@ export interface TrainOpts {
   onLog?: (step: number, loss: number) => void;
   /** WSD (or any) lr-multiplier by step; applied before each optimizer step. */
   schedule?: (step: number) => number;
+  /** MuonClip/QK-logit clip threshold; when set, clip qNorm/kNorm after each step. */
+  qkClipTau?: number;
 }
 
 export function trainLM(model: Qwen3Model, opts: TrainOpts): { step: number; loss: number }[] {
@@ -45,6 +48,7 @@ export function trainLM(model: Qwen3Model, opts: TrainOpts): { step: number; los
     }
 
     opt.step();
+    if (opts.qkClipTau) applyQKClip(model, opts.qkClipTau);
     const avg = lossSum / opts.batchPerStep;
     if (step % logEvery === 0 || step === opts.steps - 1) {
       history.push({ step, loss: avg });

@@ -42,9 +42,17 @@ embeddings.
    (GPU-buffer lr vs CPU) in `tests/gpu_parity.ts` and a shape self-check in `tests/gradcheck.ts`.
    Its payoff is on long runs where constant lr plateaus; the 40-step demos leave it off (the
    cooldown only costs final loss when the model is still descending steeply).
-4. **MuonClip / QK-logit control** — Moonshot's Muon variant clips attention logits to stop the
-   "attention logit explosion" that shows up at scale; complements the QK-norm we already have. Add
-   when scaling up.
+4. **MuonClip / QK-logit control** — done, adapted for QK-norm. `src/train/qk_clip.ts`
+   `applyQKClip(model, tau)` caps each layer's logit-scale proxy
+   `s = (1/√headDim)·√Σ_d(qNorm[d]·kNorm[d])²` at `tau` by rescaling `qNorm`/`kNorm` (each by
+   `√(tau/s)`, so the product scales by `tau/s` and `s → tau`). Moonshot's original clips the q/k
+   _projection_ weights, but Qwen3's QK-RMSNorm renormalizes those away, so the norm weights are the
+   real lever (per-layer, since `qNorm`/`kNorm` are shared across a layer's heads). The proxy is the
+   std of a QK-normed logit; measured (T=128) the observed causal max tracks ~3.3–4.4× it and is
+   monotone, so bounding `s` bounds the max. Opt-in via `qkClipTau` on all three training loops;
+   host-side weight math, so CPU and GPU apply it identically. Gated by `qkClipTrajectoryParity` in
+   `tests/gpu_parity.ts` and a unit check in `tests/gradcheck.ts`. Off by default — QK-norm is the
+   primary guard; this is the belt-and-suspenders for scaling up.
 5. **GPU-resident Muon + flash attention** — done. Muon now runs entirely on the GPU (~3 ms/step at
    725K params vs 1276 ms CPU; ~2 ms at 5M params vs ~10 s). Causal attention uses a hybrid
    dispatch: materialized `[Hq,T,T]` path below T=2048 (faster there due to higher thread

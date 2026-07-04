@@ -14,6 +14,7 @@ import { backward, crossEntropy } from "../model/autograd.ts";
 import type { Tensor } from "../model/autograd.ts";
 import type { Qwen3Model } from "../model/qwen3.ts";
 import type { TrainOpts } from "../train/trainer.ts";
+import { applyQKClip } from "../train/qk_clip.ts";
 import type { MuonGpu } from "./muon_gpu.ts";
 import type { WebGPUBackend } from "./webgpu.ts";
 
@@ -51,6 +52,7 @@ export async function trainLMGpu(
       // One readback per step: loss scalars plus accumulated parameter grads.
       await gpu.sync(losses);
       opt.step();
+      if (opts.qkClipTau) applyQKClip(model, opts.qkClipTau);
 
       let lossSum = 0;
       for (const l of losses) lossSum += l.data[0];
@@ -78,6 +80,8 @@ export interface TrainGpuResidentOpts {
   onLog?: (step: number, loss: number) => void;
   /** WSD (or any) lr-multiplier by step; applied before each optimizer step. */
   schedule?: (step: number) => number;
+  /** MuonClip/QK-logit clip threshold; when set, clip qNorm/kNorm after each step. */
+  qkClipTau?: number;
   /** Per-step wall-time split and sync readback volume, for profiling. */
   onStepTime?: (fwdBwdSyncMs: number, optimizerMs: number, readbackBytes: number) => void;
 }
@@ -133,6 +137,9 @@ export async function trainLMGpuResident(
       opt.recordStep();
       await gpu.sync(); // flush the optimizer dispatches
       opt.stepAux();
+      // qNorm/kNorm are aux/host params after stepAux; clip here and the next
+      // step's uploadParams(auxParams) pushes the capped norms to the device.
+      if (opts.qkClipTau) applyQKClip(model, opts.qkClipTau);
       opts.onStepTime?.(t1 - t0, performance.now() - t1, readback);
 
       let lossSum = 0;

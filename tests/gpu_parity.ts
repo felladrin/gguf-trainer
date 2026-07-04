@@ -32,6 +32,7 @@ import type { Qwen3Config } from "../src/model/config.ts";
 import { Muon, newtonSchulz } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
+import { qkLogitScale } from "../src/train/qk_clip.ts";
 import { initWebGPU, WebGPUBackend } from "../src/backend/webgpu.ts";
 import { MuonGpu, newtonSchulzGpu } from "../src/backend/muon_gpu.ts";
 import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
@@ -470,6 +471,7 @@ async function main() {
   await muonMomentumPersistence(gpu);
   await muonTrajectoryParity(gpu);
   await wsdScheduleParity(gpu);
+  await qkClipTrajectoryParity(gpu);
 
   // 8. sync() must fence GPU completion even when it reads nothing back.
   await syncFenceGate(gpu);
@@ -687,6 +689,72 @@ async function wsdScheduleParity(gpu: WebGPUBackend) {
   }
   if (!ok) failures++;
   console.log(`  ${ok ? "ok " : "FAIL"} WSD-scheduled Muon trajectory (GPU lr buffer vs CPU)`);
+}
+
+/**
+ * MuonClip / QK-logit clip active during training: the clip is host-side weight
+ * math on the aux qNorm/kNorm, so CPU trainLM and GPU trainLMGpuResident must
+ * apply it identically and stay on the same trajectory. tau=0.5 triggers from
+ * init (qNorm=kNorm=ones gives proxy 1.0), so every step clips on both paths;
+ * a path that skipped or misordered the clip would diverge. Also asserts the
+ * clip actually held every layer's proxy at/under tau on the GPU-trained model.
+ */
+async function qkClipTrajectoryParity(gpu: WebGPUBackend) {
+  const cfg = microConfig();
+  const steps = 4, seqLen = 8, batchPerStep = 2, tau = 0.5;
+  const rngTok = mulberry32(0x70cc);
+  const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
+  const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
+
+  const cpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const cg = cpuModel.paramGroups();
+  const cpuHist = trainLM(cpuModel, {
+    tokens,
+    seqLen,
+    steps,
+    batchPerStep,
+    optimizer: new Muon(cg.muon, cg.aux, hyper),
+    qkClipTau: tau,
+    logEvery: 1,
+    rng: mulberry32(7),
+  });
+
+  const gpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const gg = gpuModel.paramGroups();
+  const gpuHist = await trainLMGpuResident(gpuModel, gpu, {
+    tokens,
+    seqLen,
+    steps,
+    batchPerStep,
+    optimizer: new MuonGpu(gpu, gg.muon, gg.aux, hyper),
+    qkClipTau: tau,
+    logEvery: 1,
+    rng: mulberry32(7),
+  });
+
+  let ok = true;
+  for (let i = 0; i < Math.min(cpuHist.length, gpuHist.length); i++) {
+    const dl = Math.abs(gpuHist[i].loss - cpuHist[i].loss);
+    if (dl > 1e-3 + 1e-3 * Math.abs(cpuHist[i].loss)) {
+      console.log(
+        `    MISMATCH loss@step${cpuHist[i].step}: gpu=${gpuHist[i].loss} cpu=${cpuHist[i].loss}`,
+      );
+      ok = false;
+    }
+  }
+  const cpuParams = cpuModel.params();
+  const gpuParams = gpuModel.params();
+  for (let i = 0; i < cpuParams.length; i++) {
+    ok = compare(`qkClip.param${i}`, gpuParams[i].data, cpuParams[i].data, BWD) && ok;
+  }
+  // The clip must actually have bounded the logit scale on the trained model.
+  for (const L of gpuModel.layers) {
+    if (qkLogitScale(L.qNorm.data, L.kNorm.data, cfg.headDim) > tau + 1e-4) ok = false;
+  }
+  if (!ok) failures++;
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} MuonClip trajectory parity + logit-scale bounded (GPU vs CPU)`,
+  );
 }
 
 /**

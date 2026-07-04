@@ -164,8 +164,17 @@ functional gate at T=3584 under spec-default limits.
    trajectory) in `tests/gpu_parity.ts` and a shape self-check in `tests/gradcheck.ts`. Left off the
    40-step demos on purpose — at that length the cooldown only costs final loss (the model is still
    descending steeply); WSD's payoff is on longer runs, so wire it in at roadmap item 6.
-3. **MuonClip / attention-logit clipping** — stability when scaling up; pairs with the existing
-   QK-norm.
+3. **MuonClip / attention-logit clipping** — done, adapted for QK-norm. `src/train/qk_clip.ts`
+   `applyQKClip(model, tau)` caps each layer's logit-scale proxy
+   `(1/√headDim)·√Σ_d(qNorm[d]·kNorm[d])²` at `tau` by rescaling `qNorm`/`kNorm` (each by
+   `√(tau/s)`). Moonshot clips the q/k _projection_ weights, but Qwen3's QK-RMSNorm renormalizes
+   those away — the norm weights are the actual lever (per-layer; they're shared across a layer's
+   heads). Opt-in via `qkClipTau` on `trainLM`/`trainLMGpu`/`trainLMGpuResident`; host-side weight
+   math so CPU and GPU apply it identically (gated by `qkClipTrajectoryParity` in `gpu_parity.ts`
+   plus a unit check in `gradcheck.ts`). Off by default — QK-norm is the primary guard. Not a
+   verbatim MuonClip: the observed-max version would mean instrumenting the parity-delicate
+   attention kernels; the norm-based proxy is data-independent and tracks the observed max ~3.3–4.4×
+   (T=128).
 4. **Aux-group GPU residency** — `AdamW` still runs host-side on every step for embeddings/norms; at
    large scale the host↔GPU transfer for aux params becomes a secondary bottleneck. Lower priority
    than the items above.
