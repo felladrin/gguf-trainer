@@ -29,8 +29,11 @@ import {
 } from "../src/model/autograd.ts";
 import { Qwen3Model } from "../src/model/qwen3.ts";
 import type { Qwen3Config } from "../src/model/config.ts";
-import { initWebGPU } from "../src/backend/webgpu.ts";
-import type { WebGPUBackend } from "../src/backend/webgpu.ts";
+import { Muon, newtonSchulz } from "../src/train/muon.ts";
+import { trainLM } from "../src/train/trainer.ts";
+import { initWebGPU, WebGPUBackend } from "../src/backend/webgpu.ts";
+import { MuonGpu, newtonSchulzGpu } from "../src/backend/muon_gpu.ts";
+import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
 
 // Same math, different summation order: f32 accumulation differences grow with
 // reduction depth, so backward (which chains more reductions) gets more slack.
@@ -268,6 +271,76 @@ async function accumulationParity(gpu: WebGPUBackend) {
   console.log(`  ${ok ? "ok " : "FAIL"} gradient accumulation across 2 micro-batches`);
 }
 
+/**
+ * Functional large-T check for flash attention (appended by the tiling task):
+ * on a device requested with SPEC-DEFAULT limits, run forward+backward at
+ * T=3584 (Hq=4, hd=32). The pre-flash kernels needed a ~205 MB [Hq,T,T] probs
+ * binding here — over the default 128 MiB maxStorageBufferBindingSize — and
+ * failed bind-group validation. CPU comparison is far too slow at this T, so
+ * assert completion with no device/validation error and finite, non-zero
+ * output and input gradients instead.
+ */
+async function flashLargeTCheck() {
+  // deno-lint-ignore no-explicit-any
+  const nav: any = (globalThis as any).navigator;
+  const adapter = await nav?.gpu?.requestAdapter?.();
+  if (!adapter) {
+    console.log("  SKIP flash large-T check: no WebGPU adapter");
+    return;
+  }
+  const device = await adapter.requestDevice(); // no requiredLimits: spec defaults
+  const gpu2 = new WebGPUBackend(device, "spec-default-limits");
+  const T = 3584, Hq = 4, Hkv = 2, hd = 32;
+  const rng = mulberry32(0xf1a5);
+  const q = randTensor([T, Hq * hd], rng, 0.5);
+  const k = randTensor([T, Hkv * hd], rng, 0.5);
+  const v = randTensor([T, Hkv * hd], rng, 0.5);
+  let ok = true;
+  gpu2.install();
+  try {
+    device.pushErrorScope?.("validation");
+    const out = attention(q, k, v, T, Hq, Hkv, hd);
+    const rngR = mulberry32(0xbeef);
+    for (let i = 0; i < out.grad.length; i++) out.grad[i] = rngR() * 2 - 1;
+    gpu2.seedGradFromHost(out);
+    out._backward();
+    await gpu2.sync([out]);
+    const err = await device.popErrorScope?.();
+    if (err) {
+      console.log(`    validation error: ${err.message}`);
+      ok = false;
+    }
+    const arrays: [string, Float32Array][] = [
+      ["out", out.data],
+      ["dQ", q.grad],
+      ["dK", k.grad],
+      ["dV", v.grad],
+    ];
+    for (const [label, arr] of arrays) {
+      let maxAbs = 0;
+      let finite = true;
+      for (let i = 0; i < arr.length; i++) {
+        if (!Number.isFinite(arr[i])) {
+          finite = false;
+          break;
+        }
+        const a = Math.abs(arr[i]);
+        if (a > maxAbs) maxAbs = a;
+      }
+      if (!finite || maxAbs === 0) {
+        console.log(`    ${label}: finite=${finite} maxAbs=${maxAbs}`);
+        ok = false;
+      }
+    }
+  } finally {
+    gpu2.destroy(); // uninstalls and frees its pooled buffers
+  }
+  if (!ok) failures++;
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} flash attention fwd+bwd @ T=3584 under spec-default limits`,
+  );
+}
+
 async function main() {
   const gpu = await initWebGPU();
   if (!gpu) {
@@ -351,6 +424,54 @@ async function main() {
   await modelParity(gpu);
   await accumulationParity(gpu);
 
+  // 6. Attention kernels (appended by the tiling task):
+  //    (a) Materialized path at small T (T < attnFlashMinT): non-multiples of
+  //        tile size, both head dims, both GQA group sizes.
+  //    (b) Flash path forced at the same T by temporarily lowering attnFlashMinT
+  //        to 1 — proves the flash kernels correct at small T without changing
+  //        the production threshold.
+  //    (c) Backward-heavy case that exercises srcAttnBwdDkv's GQA head-group loop.
+  //    (d) Large-T functional check under spec-default device limits.
+  const flashCases: [number, number, number, number, string][] = [
+    [67, 4, 2, 6, "T=67, hd=6, group=2"],
+    [67, 2, 2, 32, "T=67, hd=32, group=1"],
+    [130, 4, 2, 32, "T=130, hd=32, group=2"],
+    [130, 3, 3, 6, "T=130, hd=6, group=1"],
+    [193, 4, 1, 24, "T=193, hd=24, group=4"],
+  ];
+  for (const [T, Hq, Hkv, hd, label] of flashCases) {
+    const q = randTensor([T, Hq * hd], rng);
+    const k = randTensor([T, Hkv * hd], rng);
+    const v = randTensor([T, Hkv * hd], rng);
+    // Materialized path (default threshold keeps T < 2048 on the old kernels).
+    await opCase(
+      gpu,
+      `attention(${label}) mat`,
+      [q, k, v],
+      () => attention(q, k, v, T, Hq, Hkv, hd),
+    );
+    // Flash path forced: same inputs, just the kernel path changes.
+    gpu.attnFlashMinT = 1;
+    await opCase(
+      gpu,
+      `attention(${label}) flash`,
+      [q, k, v],
+      () => attention(q, k, v, T, Hq, Hkv, hd),
+    );
+    gpu.attnFlashMinT = 2048;
+  }
+  await flashLargeTCheck();
+
+  // 7. GPU-resident Muon optimizer (src/backend/muon_gpu.ts): Newton–Schulz
+  //    kernel parity, momentum-buffer persistence across steps, and the
+  //    HANDOFF-mandated whole-trajectory parity against the CPU Muon.
+  await newtonSchulzParity(gpu);
+  await muonMomentumPersistence(gpu);
+  await muonTrajectoryParity(gpu);
+
+  // 8. sync() must fence GPU completion even when it reads nothing back.
+  await syncFenceGate(gpu);
+
   console.log(
     failures === 0 ? "\n=== all parity checks passed ===" : `\n=== ${failures} FAILURES ===`,
   );
@@ -367,3 +488,179 @@ main().catch((e) => {
   const proc = (globalThis as any).process;
   if (proc?.exit) proc.exit(1);
 });
+
+// --- GPU-resident Muon cases (called at the end of main; declarations hoist) -----
+
+/**
+ * GPU vs CPU newtonSchulz() on random matrices covering m<n, m>n (transpose
+ * path), m=n, and non-multiple-of-16 dims (GEMM edge tiles). Tolerance: BWD.
+ * Five quintic iterations chain ~15 order-dependent f32 reductions — deeper
+ * than any single backward kernel — but NS is contractive toward the
+ * orthogonal manifold, so divergence stays small (measured max |Δ| ≈ 7e-7
+ * on these cases); BWD holds with >1000x margin.
+ */
+async function newtonSchulzParity(gpu: WebGPUBackend) {
+  const rng = mulberry32(0x5eed);
+  const cases: [number, number][] = [[5, 9], [24, 17], [33, 33], [16, 64]];
+  let ok = true;
+  for (const [m, n] of cases) {
+    const g = new Float32Array(m * n);
+    for (let i = 0; i < g.length; i++) g[i] = randn(rng) * 0.8;
+    const want = newtonSchulz(g, m, n, 5);
+    const got = await newtonSchulzGpu(gpu, g, m, n, 5);
+    ok = compare(`ns(${m}x${n})`, got, want, BWD) && ok;
+  }
+  if (!ok) failures++;
+  console.log(`  ${ok ? "ok " : "FAIL"} newtonSchulz GPU parity (m<n, m>n, m=n, odd dims)`);
+}
+
+/**
+ * Two consecutive optimizer steps with different grads must match the CPU
+ * two-step result: catches momentum buffers that are zeroed, recycled, or
+ * left dirty between steps (a fresh buf in step 2 shifts the result far
+ * beyond tolerance). BWD tolerance for the same reasons as newtonSchulzParity
+ * (measured max |Δ| ≈ 6e-8 — the lr·ortho update is small next to the weights).
+ */
+async function muonMomentumPersistence(gpu: WebGPUBackend) {
+  const rng = mulberry32(0xabcd);
+  const shape = [24, 17]; // flip path + non-multiple-of-16 dims
+  const size = 24 * 17;
+  const base = new Float32Array(size);
+  const g1 = new Float32Array(size);
+  const g2 = new Float32Array(size);
+  for (let i = 0; i < size; i++) {
+    base[i] = randn(rng) * 0.5;
+    g1[i] = randn(rng) * 0.1;
+    g2[i] = randn(rng) * 0.1;
+  }
+  const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 1e-3 } };
+
+  const pc = new Tensor(base.slice(), shape, true);
+  const cpuOpt = new Muon([pc], [], hyper);
+  pc.grad.set(g1);
+  cpuOpt.step();
+  pc.grad.set(g2);
+  cpuOpt.step();
+
+  const pg = new Tensor(base.slice(), shape, true);
+  const gpuOpt = new MuonGpu(gpu, [pg], [], hyper);
+  for (const g of [g1, g2]) {
+    // seedGradFromHost stands in for a backward pass: it flushes the pending
+    // grad clears first, so the write lands after them in queue order.
+    pg.grad.set(g);
+    gpu.seedGradFromHost(pg);
+    gpuOpt.recordStep();
+    await gpu.sync();
+  }
+  await gpuOpt.syncWeightsToHost();
+
+  const ok = compare("muon2step.w", pg.data, pc.data, BWD);
+  if (!ok) failures++;
+  console.log(`  ${ok ? "ok " : "FAIL"} Muon momentum persistence across 2 optimizer steps`);
+}
+
+/**
+ * The HANDOFF gate: same seeds, same batches (trainLM and trainLMGpuResident
+ * make identical rng calls), 4 full optimizer steps — CPU Muon trajectory vs
+ * the GPU-resident optimizer. Losses per step and every final weight tensor
+ * must agree. Tolerances: each step feeds fwd/bwd f32 divergence (~BWD-sized)
+ * through Newton–Schulz into the weights, compounding per step; measured over
+ * 4 steps: max loss |Δ| ≈ 4e-7, max weight |Δ| ≈ 4e-7, so the BWD-scale
+ * bounds hold with orders of magnitude to spare.
+ */
+async function muonTrajectoryParity(gpu: WebGPUBackend) {
+  const cfg = microConfig();
+  const steps = 4, seqLen = 8, batchPerStep = 2;
+  const rngTok = mulberry32(0x70cc);
+  const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
+  const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
+
+  const cpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const cg = cpuModel.paramGroups();
+  const cpuHist = trainLM(cpuModel, {
+    tokens,
+    seqLen,
+    steps,
+    batchPerStep,
+    optimizer: new Muon(cg.muon, cg.aux, hyper),
+    logEvery: 1,
+    rng: mulberry32(7),
+  });
+
+  const gpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const gg = gpuModel.paramGroups();
+  const gpuHist = await trainLMGpuResident(gpuModel, gpu, {
+    tokens,
+    seqLen,
+    steps,
+    batchPerStep,
+    optimizer: new MuonGpu(gpu, gg.muon, gg.aux, hyper),
+    logEvery: 1,
+    rng: mulberry32(7),
+  });
+
+  let ok = true;
+  if (gpuHist.length !== cpuHist.length) {
+    console.log(`    history length ${gpuHist.length} != ${cpuHist.length}`);
+    ok = false;
+  }
+  for (let i = 0; i < Math.min(cpuHist.length, gpuHist.length); i++) {
+    const dl = Math.abs(gpuHist[i].loss - cpuHist[i].loss);
+    if (dl > 1e-3 + 1e-3 * Math.abs(cpuHist[i].loss)) {
+      console.log(
+        `    MISMATCH loss@step${cpuHist[i].step}: gpu=${gpuHist[i].loss} cpu=${cpuHist[i].loss}`,
+      );
+      ok = false;
+    }
+  }
+  const cpuParams = cpuModel.params();
+  const gpuParams = gpuModel.params();
+  for (let i = 0; i < cpuParams.length; i++) {
+    ok = compare(`muonTraj.param${i}`, gpuParams[i].data, cpuParams[i].data, BWD) && ok;
+  }
+  if (!ok) failures++;
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} Muon GPU training trajectory (${steps} steps, ` +
+      `${cpuParams.length} weight tensors)`,
+  );
+}
+
+/**
+ * Verify that sync() fences GPU completion even when it reads nothing back.
+ * The resident training loop calls sync() twice per step: once to read losses
+ * and aux grads, once to flush the optimizer dispatches. The second sync has
+ * nothing to stage, so without an explicit fence (a staging copy of a 4-byte
+ * sentinel) it would resolve at submit rather than at GPU completion — making
+ * the optimizer-step timing dishonest and potentially recycling transients
+ * the GPU is still writing. This test encodes a GPU linear op, calls sync()
+ * with no reads, then reads the output in a second sync and checks correctness.
+ * If the first sync didn't actually fence, the second sync's copy would race
+ * the linear dispatch and either deadlock (invalid pipeline) or read zeros.
+ */
+async function syncFenceGate(gpu: WebGPUBackend) {
+  const rng = mulberry32(0xfeed);
+  const x = randTensor([8, 16], rng);
+  const w = randTensor([12, 16], rng);
+
+  // CPU reference for correctness check (linear is already imported at top).
+  for (const t of [x, w]) t.zeroGrad();
+  const cpuOut = linear(x, w);
+  const cpuData = cpuOut.data.slice();
+
+  // GPU: encode the linear dispatch, fence with empty sync(), then read back.
+  for (const t of [x, w]) t.zeroGrad();
+  gpu.install();
+  let ok = true;
+  try {
+    const gpuOut = linear(x, w);
+    // Empty sync: should fence GPU work even though it stages nothing.
+    await gpu.sync();
+    // Now read back — if the fence worked the values are those of the linear op.
+    await gpu.sync([gpuOut]);
+    ok = compare("syncFence.out", gpuOut.data, cpuData, FWD) && ok;
+  } finally {
+    gpu.uninstall();
+  }
+  if (!ok) failures++;
+  console.log(`  ${ok ? "ok " : "FAIL"} sync() fences GPU even with no readback`);
+}

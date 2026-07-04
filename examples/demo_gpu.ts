@@ -13,11 +13,11 @@ import { crossEntropy, mulberry32 } from "../src/model/autograd.ts";
 import { paramCount, tinyConfig } from "../src/model/config.ts";
 import { Qwen3Model } from "../src/model/qwen3.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
-import { Muon } from "../src/train/muon.ts";
 import { buildGGUF } from "../src/export/export_gguf.ts";
 import { initWebGPU } from "../src/backend/webgpu.ts";
 import type { WebGPUBackend } from "../src/backend/webgpu.ts";
-import { trainLMGpu } from "../src/backend/train_gpu.ts";
+import { MuonGpu } from "../src/backend/muon_gpu.ts";
+import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
 
 const CORPUS = `
 the cat sat on the mat. the cat saw a red ball. the dog ran to the cat.
@@ -110,22 +110,33 @@ async function main() {
     throw new Error("GPU/CPU parity probe failed — do not train on this backend");
   }
 
-  // 4. Train on the GPU: Muon on hidden matmuls, AdamW on the rest.
+  // 4. Train on the GPU: device-resident Muon on hidden matmuls (weights,
+  //    momentum, and grads never leave the GPU), host AdamW on the rest.
   const groups = model.paramGroups();
-  const opt = new Muon(groups.muon, groups.aux, {
+  const opt = new MuonGpu(gpu, groups.muon, groups.aux, {
     lr: 0.02,
     momentum: 0.95,
     aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 },
   });
-  console.log(`\nMuon on ${groups.muon.length} matrices; AdamW on ${groups.aux.length} tensors\n`);
+  console.log(
+    `\nGPU Muon on ${groups.muon.length} matrices; host AdamW on ${groups.aux.length} tensors\n`,
+  );
 
   let firstLoss = 0;
   let lastLoss = 0;
+  // Step 0 pays the one-time WGSL pipeline compiles; report it apart from the
+  // steady-state per-phase averages.
+  let fwdMs = 0;
+  let optMs = 0;
+  let step0Ms = 0;
+  let readback = 0;
+  let stepIdx = 0;
+  const steps = 40;
   const t0 = Date.now();
-  await trainLMGpu(model, gpu, {
+  await trainLMGpuResident(model, gpu, {
     tokens,
     seqLen: 32,
-    steps: 40,
+    steps,
     batchPerStep: 2,
     optimizer: opt,
     logEvery: 10,
@@ -135,11 +146,27 @@ async function main() {
       lastLoss = loss;
       console.log(`  step ${String(step).padStart(3)}  loss ${loss.toFixed(4)}`);
     },
+    onStepTime: (fwd, o, bytes) => {
+      if (stepIdx++ === 0) {
+        step0Ms = fwd + o;
+        return;
+      }
+      fwdMs += fwd;
+      optMs += o;
+      readback = bytes;
+    },
   });
   const secs = (Date.now() - t0) / 1000;
+  const warm = steps - 1;
   console.log(
     `\nTraining: loss ${firstLoss.toFixed(3)} -> ${lastLoss.toFixed(3)} in ${secs.toFixed(1)}s ` +
-      `(${(40 / secs).toFixed(1)} steps/s on GPU)`,
+      `(${(steps / secs).toFixed(1)} steps/s on GPU)`,
+  );
+  console.log(
+    `Per-step split (steady state): fwd+bwd+sync ${(fwdMs / warm).toFixed(1)} ms, ` +
+      `optimizer ${(optMs / warm).toFixed(1)} ms; ` +
+      `readback ${(readback / 1024).toFixed(1)} KiB/step (aux grads + losses only); ` +
+      `step 0 incl. pipeline compiles ${step0Ms.toFixed(0)} ms`,
   );
   if (!(lastLoss < firstLoss)) throw new Error("Loss did not decrease");
 

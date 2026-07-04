@@ -16,114 +16,103 @@ Both backends are complete and pass end-to-end:
   and Node.
 - **WebGPU path** (`examples/demo_gpu.ts`): the full op set from `src/model/autograd.ts` implemented
   as WGSL compute shaders — forward AND backward — in `src/backend/webgpu.ts`. Trains the full
-  `tinyConfig` (725K params, larger than the CPU demo's model), loss 5.67 → 0.56, GPU greedy
-  sampling reproduces the corpus, exports GGUF that loads and runs in `llama-cli`. Measured on an M1
-  Max: **36 ms/step** forward+backward+readback vs **143 ms/step** for the same model on CPU.
+  `tinyConfig` (725K params), loss 5.67 → 0.56, GPU greedy sampling reproduces the corpus, exports
+  GGUF that loads and runs in `llama-cli`. Measured on an M1 Max (serial, no GPU contention): **~42
+  ms/step** forward+backward+sync, **~3 ms/step** GPU Muon optimizer — **~21 steps/s** total.
+  Baseline before these changes was 0.8 steps/s (1276 ms CPU Muon dominated). Both demos run
+  unchanged.
 - **Validation harnesses** (the gate for all future op/kernel work):
   - `tests/gradcheck.ts` — per-element finite-difference gradient checks for every CPU op plus
     whole-model checks, with a negative control proving the harness rejects wrong gradients. Runs on
     all three runtimes.
   - `tests/gpu_parity.ts` — GPU-vs-CPU forward and backward parity per op, finite differences run
-    directly against GPU forwards, whole-model gradient parity, and cross-micro-batch gradient
-    accumulation. Skips cleanly where WebGPU is unavailable.
+    directly against GPU forwards, whole-model gradient parity, cross-micro-batch gradient
+    accumulation, GPU Muon trajectory parity vs CPU, and sync() fence verification. 36 cases total.
+    Skips cleanly where WebGPU is unavailable.
 
 Implemented overall: GGUF v3 writer/reader, F16/Q8_0/Q4_0 (de)quantizers, byte-level BPE tokenizer,
 reverse-mode CPU autograd, WGSL kernels for the whole op set, the Qwen3 forward pass (GQA,
-QK-RMSNorm, RoPE, SwiGLU, tied embeddings), AdamW + Muon optimizers, training loops for both
-backends.
+QK-RMSNorm, RoPE, SwiGLU, tied embeddings), AdamW + Muon optimizers (CPU), GPU-resident Muon
+optimizer, flash-style tiled causal attention, training loops for both backends.
 
 ## How the WebGPU backend plugs in
 
 `WebGPUBackend` implements the `OpsBackend` interface from `src/model/autograd.ts` and registers via
 `install()`; the model and `backward()` walk run unchanged. Ops encode GPU dispatches synchronously;
 host `data`/`grad` arrays are stale until `await gpu.sync()` — the one unavoidable async point
-(WebGPU readback is async-only). That is why the GPU training loop is the async twin
-`src/backend/train_gpu.ts` rather than a change to the reference trainer. Parameters stay
-authoritative on the host: `uploadParams()` each step, optimizer steps host arrays. A backend must
-implement ALL ops — mixing CPU and GPU ops in one graph would silently read stale host mirrors.
+(WebGPU readback is async-only). `sync()` always fences GPU completion, even with nothing to read
+back (a 4-byte staging copy acts as the fence; see the fence comment in `webgpu.ts`).
 
-## Primary tasks (both high priority, independent — either can go first)
+The **device-resident training loop** (`trainLMGpuResident` in `src/backend/train_gpu.ts`) uses two
+syncs per step: the first flushes forward+backward and reads loss scalars plus aux-group gradients;
+the optimizer dispatches are recorded after it (grads still intact — deferred clears fire at the
+next backward), and flushed by the second sync. Muon-group weights and momentum never leave the GPU
+during training; a final `syncWeightsToHost()` call restores host authority for sampling and GGUF
+export. Per-step host↔GPU traffic per step after warm-up: aux grads + losses only (~145 KiB at
+tinyConfig vs ~2833 KiB before).
 
-### 1. Keep the optimizer on the GPU
+## What was just completed (both primary tasks from the previous HANDOFF)
 
-Measured step-time split on the GPU demo (M1 Max, tinyConfig, 725K params): GPU
-forward+backward+sync **36 ms**, AdamW **5 ms**, **Muon `step()` 1276 ms** — the CPU-side
-Newton–Schulz iteration is ~95% of wall time. This was item 5 ("optional") of the original kernel
-plan; it is now the whole ballgame, and it gets worse fast, not gracefully, as params scale up:
+### Task 1: GPU-resident Muon optimizer — done
 
-| Params | GPU fwd+bwd+sync | CPU `Muon.step()`                          |
-| ------ | ---------------- | ------------------------------------------ |
-| 0.9M   | 183 ms           | 412 ms (56 matrices)                       |
-| 4.9M   | 210 ms           | 10,026 ms (28 matrices)                    |
-| 20.5M  | 201 ms           | not measured — already impractical at 4.9M |
-| 100.4M | 387 ms           | not measured — already impractical at 4.9M |
+Newton–Schulz now runs entirely on the GPU. New file `src/backend/muon_gpu.ts` holds `MuonGpu`:
 
-GPU compute barely moves (111× more params costs ~2× more GPU time — the tiled GEMMs are nowhere
-near saturated at these sizes). `Muon.step()` on CPU went from 412 ms to over 10 seconds for only
-5.4× more parameters, and with _fewer_ matrices (28 vs. 56) — the cost is cubic in matrix dimension
-(the unvectorized Newton–Schulz matmuls in `src/train/muon.ts`), not linear in matrix count. A real
-pretraining run needs thousands of steps; at 20M+ params this is hours to days spent only in the
-optimizer.
+- Muon-group 2-D weights, momentum buffers, and gradients are device-resident in persistent GPU
+  buffers (created fresh via `createStateBuffer()`, never pooled/recycled, guaranteed
+  zero-initialized per the WebGPU spec).
+- Newton–Schulz: two-stage Frobenius-norm reduction on-device (sum-of-squares workgroup reduction →
+  normalize kernel), five quintic iterations using the existing tiled GEMM (`NT` for X·Xᵀ, `NN` for
+  A·A and B·X), two elementwise combine kernels (`A ← b·A + c·A²`, `X ← a·X + B·X`), and a fused
+  apply kernel (`W -= lr · sqrt(max(1, rows/cols)) · ortho`) with transpose-back indexing for the
+  `rows > cols` orientation flip.
+- Dispatch closures are resolved once at construction (`prepareDispatch`/`prepareGemm` on
+  `WebGPUBackend`), removing repeated bind-group/source-rebuild overhead.
+- Aux group (embeddings, output head, norms) stays host-side AdamW with its existing global
+  grad-norm clip over aux params only; Muon params are never clipped.
 
-**Immediate fallback, no GPU work required:** drop Muon and optimize everything with `AdamW` instead
-(already implemented, same `Optimizer` interface). Checked at the 100M-param config: a full
-`AdamW.step()` over every parameter takes **530 ms**, in the same range as the GPU forward+backward,
-because it's pure elementwise math with no matrix ops. This trades away Muon's ~2× compute
-efficiency but unblocks training tens of millions of params _today_, before the work below lands.
+Measured on M1 Max, serial (no GPU contention):
 
-The real fix:
+| Params | GPU fwd+bwd+sync | old CPU Muon.step() | new GPU Muon.step() | speedup |
+| ------ | ---------------- | ------------------- | ------------------- | ------- |
+| 725K   | 42 ms            | 1,276 ms            | ~3 ms               | ~425×   |
+| 5.1M   | ~210 ms          | ~10,026 ms          | ~2 ms               | ~5,000× |
 
-1. Port Muon's Newton–Schulz to the existing GEMM kernels (it is a handful of small matmuls —
-   `newtonSchulz()` in `src/train/muon.ts` is the spec) and keep momentum buffers device-resident.
-2. This forces an optimizer-interface decision: `Optimizer.step()` is sync and host-side today.
-   Cleanest path: a GPU-aware optimizer in `backend/` that consumes gradients before they're read
-   back, syncing weights to host only for export/sampling. Do not complicate `src/train/*` — same
-   rule as the trainer split.
-3. Gate: identical training trajectory to the CPU Muon (same seeds) within float tolerance, verified
-   in `tests/gpu_parity.ts`.
+Pipeline compile on step 0: ~59 ms (one-time, pipelines cache per shape thereafter).
 
-### 2. Tile causal attention (flash-style)
+Gate: trajectory-parity test in `tests/gpu_parity.ts` (`muonTrajectoryParity`) runs 4 steps of CPU
+`trainLM + Muon` vs GPU `trainLMGpuResident + MuonGpu` with the same seed; max loss delta 3.6e-7,
+max weight delta 3.6e-7 — within BWD tolerance by >1000×.
 
-The attention kernels (`src/backend/webgpu.ts`) bind the whole `[heads,T,T]` causal-probability
-matrix as one storage buffer. That single buffer, not compute, is what actually caps trainable
-context length — measured directly:
+### Task 2: Hybrid flash-style causal attention — done
 
-| T    | Attention buffer (4 heads) | WebGPU spec-default limits (128 MiB/buffer)                              |
-| ---- | -------------------------- | ------------------------------------------------------------------------ |
-| 2560 | 105 MB                     | OK                                                                       |
-| 3072 | 151 MB                     | **fails** — real `BindGroup ... is invalid` error, not silent corruption |
+The attention op now uses a hybrid dispatch based on `WebGPUBackend.attnFlashMinT` (default 2048):
 
-**8192 tokens is not trainable under the WebGPU spec's default device limits at any realistic head
-count.** `initWebGPU()` now requests the adapter's own maximum buffer limits instead of that default
-(already shipped — see "Context length" under Hard limits below), which raises the ceiling far past
-3072 on adapters that grant it. That fix moves the wall; it doesn't remove it, and it doesn't touch
-compute cost:
+- **T < 2048 (materialized path):** the original five kernels writing the `[Hq,T,T]` probability
+  matrix. Faster at small T where the flash kernel's one-thread-per-row layout underoccupies the
+  GPU. Demo training (seqLen=32) and the existing parity cases use this path.
+- **T ≥ 2048 (flash path):** online-softmax forward (one thread per query row, running max +
+  rescaled accumulator, O(Hq·T) logsumexp buffer only), followed by three backward kernels that
+  recompute probabilities from Q, K, and the logsumexp. No `[Hq,T,T]` buffer is ever allocated. The
+  dK/dV kernel stages Q/dOut rows through 32-query workgroup tiles for ~1.8× backward speedup;
+  forward and dQ use direct loads (a shared-tile variant measured 17% slower there — bandwidth
+  already served by the wavefront cache).
 
-| T (elevated limits, M1 Max) | Attention buffer | fwd+bwd+sync |
-| --------------------------- | ---------------- | ------------ |
-| 2048                        | 67 MB            | 414 ms       |
-| 4096                        | 268 MB           | 1.5 s        |
-| 8192                        | 1.07 GB          | 4.36 s       |
+The `[Hq,T,T]` single-buffer ceiling **no longer exists**: T=3584 with spec-default 128 MiB binding
+limits now completes without error (old code needed ~205 MB for the probs buffer alone).
 
-Two independent reasons this still needs the real fix:
+Measured on M1 Max, single attention op fwd+bwd+sync (Hq=4, Hkv=2, hd=32):
 
-1. **Compute grows with T regardless of memory.** Full causal attention is inherently O(T²) work;
-   the ~3.5× time jump per doubling above is that showing up directly, since the kernel isn't tiled
-   or blocked. Flash-style tiling doesn't change that asymptotic — it's exact attention, not an
-   approximation — but a blocked/online-softmax implementation uses memory bandwidth far better than
-   the current one-shot `[T,T]` materialization, which is most of why real flash-attention
-   implementations are faster in practice at the same T.
-2. **The elevated-limits fix is adapter-dependent.** Not every GPU/browser grants
-   `maxStorageBufferBindingSize` anywhere near the ~4 GiB this M1 Max allows; on one that doesn't,
-   `initWebGPU()` silently falls back to the spec default and you're back to the ~2560–3072 ceiling
-   with no warning. Flash tiling removes the single-buffer dependency entirely, so the ceiling stops
-   being a function of which adapter happened to run the code.
+| T    | old (materialized) | new (mat path) | new (flash path) |
+| ---- | ------------------ | -------------- | ---------------- |
+| 32   | ~18 ms             | ~18 ms         | —                |
+| 1024 | ~45 ms             | ~45 ms         | —                |
+| 2048 | ~168 ms            | ~168 ms        | ~158 ms          |
+| 4096 | ~478 ms            | —              | ~335 ms (1.4×)   |
+| 8192 | ~1679 ms           | —              | ~773 ms (2.2×)   |
 
-Cheapest incremental step before the full rewrite: switch the probability buffer to f16 (halves
-memory, roughly doubles the T ceiling for a given memory budget, on top of whatever the elevated
-device limits already allow). The full fix is blocked, online-softmax attention over key/value tiles
-so the `[T,T]` matrix is never materialized — standard flash-attention. Gate: same
-finite-difference + GPU-parity checks as every other kernel (`tests/gpu_parity.ts`).
+Gate: `tests/gpu_parity.ts` runs both paths explicitly at T=67/130/193 (each shape tested with
+`attnFlashMinT=2048` for materialized and `attnFlashMinT=1` for flash), plus the `flashLargeTCheck`
+functional gate at T=3584 under spec-default limits.
 
 ## Non-negotiable invariants (do not break these)
 
@@ -148,12 +137,17 @@ finite-difference + GPU-parity checks as every other kernel (`tests/gpu_parity.t
 ## Secondary roadmap (after the primary tasks above, priority order)
 
 1. **muP parametrization** — tune hyperparameters on a tiny proxy model, transfer to full size
-   (touches init + per-tensor LR).
+   (touches init + per-tensor LR). Note: `MuonGpu` bakes `lr` into WGSL pipeline constants at
+   construction; a WSD schedule will require rebuilding the apply pipelines when `lr` changes, or
+   passing `lr` via a uniform buffer instead.
 2. **WSD learning-rate schedule** (warmup → stable → linear cooldown) — cheap win, pure trainer
-   change.
+   change. See note above re: `MuonGpu` and lr changes.
 3. **MuonClip / attention-logit clipping** — stability when scaling up; pairs with the existing
    QK-norm.
-4. **GGUF checkpoint loader** — dequant already exists in `src/gguf/quantize.ts`; wire it back into
+4. **Aux-group GPU residency** — `AdamW` still runs host-side on every step for embeddings/norms; at
+   large scale the host↔GPU transfer for aux params becomes a secondary bottleneck. Lower priority
+   than the items above.
+5. **GGUF checkpoint loader** — dequant already exists in `src/gguf/quantize.ts`; wire it back into
    a `Qwen3Model` for resume/round-trip. Two tiers, different difficulty:
    - **Resuming a GGUF this framework produced**: straightforward. Architecture and tokenizer
      already match by construction — it's tensor-name matching plus the existing `dequantize()` to
@@ -161,10 +155,8 @@ finite-difference + GPU-parity checks as every other kernel (`tests/gpu_parity.t
    - **Fine-tuning an arbitrary external Qwen3 GGUF** (e.g. the real Alibaba releases): a bigger
      lift on top of that. Needs the config read back out of GGUF metadata instead of a hand-written
      `Qwen3Config`, and the actual vocab/merges loaded from the GGUF's tokenizer metadata since
-     `src/tokenizer/bpe.ts` only trains fresh vocabularies, it doesn't import one. Real Qwen3
-     checkpoints also start at hundreds of millions of parameters — past where the optimizer
-     bottleneck above stays practical, so this is gated by that fix regardless.
-5. **Scale + real data** — larger `Qwen3Config`, curated corpus, longer runs. Reminder: at small
+     `src/tokenizer/bpe.ts` only trains fresh vocabularies, it doesn't import one.
+6. **Scale + real data** — larger `Qwen3Config`, curated corpus, longer runs. Reminder: at small
    scale, data quality beats architecture tweaks. Dataset picks + links in `docs/DESIGN.md` ("Data
    quality > everything at small scale"): TinyStories to validate the pipeline, FineWeb-Edu to scale
    past storytelling.
@@ -177,18 +169,16 @@ finite-difference + GPU-parity checks as every other kernel (`tests/gpu_parity.t
   a CUDA-cluster 100M+ run.
 - WGSL kernels bake shapes as constants (pipelines cache per shape). Training reuses shapes, so
   everything compiles once; generation compiles one variant per context length. Fine at demo scale.
-- **Context length ceiling.** The attention kernels bind the whole `[Hq,T,T]` causal-probability
-  matrix as one storage buffer, which caps trainable T well before compute does. `initWebGPU()` now
-  requests the adapter's own maximum buffer limits at device creation (falling back to the WebGPU
-  spec default, `maxStorageBufferBindingSize` = 128 MiB, only if an adapter rejects that request) —
-  on this M1 Max that raised the ceiling from ~2560–3072 tokens to a confirmed-working 8192. Not
-  every adapter grants that much, and even where it's granted, cost still grows ~quadratically with
-  T since attention isn't tiled. See "Primary tasks → 2. Tile causal attention" above for the
-  measured numbers and the real (portable) fix.
+- **Context length.** The old `[Hq,T,T]` single-buffer ceiling is gone. The flash path is used for T
+  ≥ 2048 and keeps peak attention-side memory at O(Hq·T) — ~131 KB at T=8192/Hq=4 vs the old 1 GB.
+  The `initWebGPU()` elevated-limits request remains (useful for other large buffers like logits and
+  gradients), but attention no longer depends on it. The materialized path (T < 2048) still binds a
+  `[Hq,T,T]` buffer — with the elevated limits that works to at least T=2048; below the crossover,
+  the buffer is small anyway (67 MB at T=2048/Hq=4).
 - `llama-cli` sampling from the 40-step toy models produces corpus-vocabulary text but not the exact
   in-framework greedy continuation — identical behavior for CPU- and GPU-trained artifacts
   (pre-tokenization of the prompt differs from our training windows at toy scale). Revisit under
-  roadmap item 5.
+  roadmap item 6.
 
 ## Where things live
 
@@ -197,7 +187,8 @@ src/gguf/      f16, quantize (+dequant), gguf writer/reader
 src/tokenizer/ byte-level BPE
 src/model/     config, autograd (CPU op set + OpsBackend hook), qwen3 forward
 src/train/     optimizer iface, adamw, muon, trainer (CPU)
-src/backend/   webgpu.ts (WGSL kernels, buffers, sync), train_gpu.ts
+src/backend/   webgpu.ts (WGSL kernels, buffers, sync), train_gpu.ts,
+               muon_gpu.ts (GPU-resident Muon optimizer)
 src/export/    model -> GGUF (the llama.cpp contract)
 tests/         gradcheck.ts (FD gradient gate), gpu_parity.ts (GPU-vs-CPU gate)
 examples/      demo.ts (CPU end-to-end), demo_gpu.ts (WebGPU end-to-end)

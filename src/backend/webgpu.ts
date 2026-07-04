@@ -36,7 +36,7 @@ import type { OpsBackend } from "../model/autograd.ts";
 const USAGE = { MAP_READ: 0x0001, COPY_SRC: 0x0004, COPY_DST: 0x0008, STORAGE: 0x0080 } as const;
 const MAP_MODE_READ = 0x0001;
 
-interface GpuBuffer {
+export interface GpuBuffer {
   mapAsync(mode: number): Promise<void>;
   getMappedRange(): ArrayBuffer;
   unmap(): void;
@@ -74,6 +74,7 @@ interface GpuDevice {
   createBindGroup(desc: unknown): unknown;
   createCommandEncoder(): GpuCommandEncoder;
   queue: GpuQueue;
+  limits?: { maxStorageBufferBindingSize?: number };
   lost?: Promise<{ message?: string }>;
   onuncapturederror?: ((ev: { error?: { message?: string } }) => void) | null;
 }
@@ -86,12 +87,12 @@ interface Entry {
   gradNeedsClear: boolean;
 }
 
-function ceilDiv(a: number, b: number): number {
+export function ceilDiv(a: number, b: number): number {
   return Math.ceil(a / b);
 }
 
 /** Format a JS number as a WGSL f32 literal. */
-function f32lit(v: number): string {
+export function f32lit(v: number): string {
   const s = String(v);
   return /[.e]/i.test(s) ? s : `${s}.0`;
 }
@@ -138,7 +139,7 @@ class BufferPool {
 
 // --- WGSL kernel sources --------------------------------------------------------
 
-function bindF32(i: number, name: string, access: "read" | "read_write"): string {
+export function bindF32(i: number, name: string, access: "read" | "read_write"): string {
   return `@group(0) @binding(${i}) var<storage, ${access}> ${name}: array<f32>;`;
 }
 function bindU32(i: number, name: string): string {
@@ -396,6 +397,17 @@ const QS: u32 = ${a.Hq * a.hd}u; const KS: u32 = ${a.Hkv * a.hd}u;
 const SCALE: f32 = ${f32lit(scale)};`;
 }
 
+// --- Attention, small-T regime: materialized [Hq,T,T] probabilities ----------
+// Two attention implementations coexist on purpose. These five kernels write
+// the full probability (and dScore) matrix but parallelize over hd as well —
+// T·Hq·hd threads with O(T)-deep loops. The flash kernels below never touch a
+// [Hq,T,T] buffer but run one thread per (head, query row) — Hq·T threads with
+// O(T·hd)-deep loops — which underoccupies the GPU and lengthens the serial
+// chain at small T. Measured on M1 Max (fwd+bwd+sync, Hq=4 Hkv=2 hd=32, same
+// harness on both): flash-only was 1.4–2× SLOWER than these below T≈1536 and
+// only wins from T≈2048 up. attention() picks per problem size; the crossover
+// lives in WebGPUBackend.attnFlashMinT.
+
 /** Causal softmax probabilities per (head, query): P[h,t,s] for s<=t. */
 function srcAttnProbs(a: AttnDims): string {
   return `
@@ -542,6 +554,244 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }`;
 }
 
+// --- Attention, large-T regime: flash-style, no [Hq,T,T] buffer ---------------
+
+/**
+ * Fused causal attention forward, flash-style: one thread per (head, query
+ * row) runs an online softmax — running max `m`, running denominator `l`,
+ * and an HD-wide output accumulator rescaled by exp(m−mNew) whenever the max
+ * moves — so the [Hq,T,T] probability matrix is never materialized. The only
+ * side product is the per-row logsumexp (O(Hq·T)), from which backward
+ * recomputes any probability as exp(score − LSE). The final m/l equal the
+ * two-pass CPU values mathematically; only summation-order float noise
+ * differs. HD is baked per pipeline, so the private arrays are static.
+ *
+ * Deliberately NOT staged through workgroup memory: consecutive threads are
+ * consecutive query rows of one head walking keys in lockstep from s=0, so
+ * every K/V fetch is already wavefront-uniform and cache-served. A 32-key
+ * shared-tile variant measured ~17% slower at T=4096 on M1 Max (barrier
+ * overhead, no bandwidth saved). Contrast srcAttnBwdDkv, where thread loop
+ * bounds diverge and staging wins.
+ */
+function srcAttnFwd(a: AttnDims): string {
+  return `
+${bindF32(0, "QB", "read")}
+${bindF32(1, "KB", "read")}
+${bindF32(2, "VB", "read")}
+${bindF32(3, "YB", "read_write")}
+${bindF32(4, "LSE", "read_write")}
+${attnConsts(a)}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= HQ * T) { return; }
+  let h = i / T;
+  let t = i % T;
+  let kv = h / GROUP;
+  var qr: array<f32, HD>;
+  var acc: array<f32, HD>;
+  for (var d = 0u; d < HD; d++) {
+    qr[d] = QB[t * QS + h * HD + d];
+    acc[d] = 0.0;
+  }
+  var m = -3.0e38;
+  var l = 0.0;
+  for (var s = 0u; s <= t; s++) {
+    var dot = 0.0;
+    for (var d = 0u; d < HD; d++) { dot = dot + qr[d] * KB[s * KS + kv * HD + d]; }
+    let sc = dot * SCALE;
+    let mNew = max(m, sc);
+    let corr = exp(m - mNew);
+    let p = exp(sc - mNew);
+    l = l * corr + p;
+    for (var d = 0u; d < HD; d++) { acc[d] = acc[d] * corr + p * VB[s * KS + kv * HD + d]; }
+    m = mNew;
+  }
+  for (var d = 0u; d < HD; d++) { YB[t * QS + h * HD + d] = acc[d] / l; }
+  LSE[h * T + t] = m + log(l);
+}`;
+}
+
+/**
+ * D[h,t] = Σ_d dOut[t,h,d]·out[t,h,d] — the softmax-backward row constant
+ * (equals Σ_s P·dP), precomputed once so neither backward kernel re-derives
+ * it inside its O(T) scan.
+ */
+function srcAttnBwdD(a: AttnDims): string {
+  return `
+${bindF32(0, "GB", "read")}
+${bindF32(1, "YB", "read")}
+${bindF32(2, "DB", "read_write")}
+${attnConsts(a)}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= HQ * T) { return; }
+  let h = i / T;
+  let t = i % T;
+  var s = 0.0;
+  for (var d = 0u; d < HD; d++) { s = s + GB[t * QS + h * HD + d] * YB[t * QS + h * HD + d]; }
+  DB[h * T + t] = s;
+}`;
+}
+
+/**
+ * dQ[t,h,:] += Σ_{s<=t} dS[t,s]·K[s,kv,:] with dS recomputed on the fly:
+ * p = exp(q·k·scale − LSE[h,t]), dP = Σ_d dOut·V[s], dS = p·(dP − D[h,t])·scale.
+ * One thread per (head, query row) owns the whole dQ row — each (t,s) score
+ * is computed once and reused across HD via the private accumulator, and no
+ * atomics are needed. Direct loads for the same reason as srcAttnFwd: the
+ * lockstep key scan is already uniform per wavefront (shared-tile variant
+ * measured slower).
+ */
+function srcAttnBwdDq(a: AttnDims): string {
+  return `
+${bindF32(0, "QB", "read")}
+${bindF32(1, "KB", "read")}
+${bindF32(2, "VB", "read")}
+${bindF32(3, "GB", "read")}
+${bindF32(4, "LSE", "read")}
+${bindF32(5, "DB", "read")}
+${bindF32(6, "DQ", "read_write")}
+${attnConsts(a)}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= HQ * T) { return; }
+  let h = i / T;
+  let t = i % T;
+  let kv = h / GROUP;
+  var qr: array<f32, HD>;
+  var go: array<f32, HD>;
+  var dq: array<f32, HD>;
+  for (var d = 0u; d < HD; d++) {
+    qr[d] = QB[t * QS + h * HD + d];
+    go[d] = GB[t * QS + h * HD + d];
+    dq[d] = 0.0;
+  }
+  let lse = LSE[h * T + t];
+  let dRow = DB[h * T + t];
+  for (var s = 0u; s <= t; s++) {
+    var dot = 0.0;
+    var dp = 0.0;
+    for (var d = 0u; d < HD; d++) {
+      dot = dot + qr[d] * KB[s * KS + kv * HD + d];
+      dp = dp + go[d] * VB[s * KS + kv * HD + d];
+    }
+    let ds = exp(dot * SCALE - lse) * (dp - dRow) * SCALE;
+    for (var d = 0u; d < HD; d++) { dq[d] = dq[d] + ds * KB[s * KS + kv * HD + d]; }
+  }
+  for (var d = 0u; d < HD; d++) {
+    DQ[t * QS + h * HD + d] = DQ[t * QS + h * HD + d] + dq[d];
+  }
+}`;
+}
+
+/**
+ * dK[s,kv,:] += Σ_{h in group} Σ_{t>=s} dS[t,s]·Q[t,h,:] and
+ * dV[s,kv,:] += Σ_{h in group} Σ_{t>=s} P[t,s]·dOut[t,h,:], fused so each
+ * (t,s) score is computed once and serves both. One thread per (key, kv head)
+ * owns both gradient rows and reduces over the GQA head group itself, so
+ * head-sharing needs no atomics. Workgroup = (kv head, 64-key block); Q/dOut
+ * rows and the LSE/D statistics stream through workgroup memory in 32-query
+ * tiles per group head. Query tiles start at the block's first key — the
+ * causal t>=s means earlier tiles can't contribute to any key in the block.
+ * Staging pays off here (unlike srcAttnFwd/srcAttnBwdDq, ~1.8x at T=4096):
+ * each thread's scan starts at its own key t=s, so direct loads would be
+ * wavefront-divergent; the shared tile re-aligns the whole block to one
+ * uniform t range. Shared footprint 2·32·HD+64 f32 ≈ 8.3 KiB at HD=32, under
+ * the 16 KiB spec-default maxComputeWorkgroupStorageSize. Tail threads
+ * (s >= T) still run the cooperative loads: barriers must stay uniform.
+ */
+function srcAttnBwdDkv(a: AttnDims): string {
+  return `
+${bindF32(0, "QB", "read")}
+${bindF32(1, "KB", "read")}
+${bindF32(2, "VB", "read")}
+${bindF32(3, "GB", "read")}
+${bindF32(4, "LSE", "read")}
+${bindF32(5, "DB", "read")}
+${bindF32(6, "DK", "read_write")}
+${bindF32(7, "DV", "read_write")}
+${attnConsts(a)}
+const BT: u32 = 32u;
+var<workgroup> Qs: array<f32, ${32 * a.hd}>;
+var<workgroup> Gs: array<f32, ${32 * a.hd}>;
+var<workgroup> Ls: array<f32, 32>;
+var<workgroup> Ds: array<f32, 32>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: vec3<u32>) {
+  let kv = wg.y;
+  let s = wg.x * 64u + li.x;
+  let live = s < T;
+  var kr: array<f32, HD>;
+  var vr: array<f32, HD>;
+  var dk: array<f32, HD>;
+  var dv: array<f32, HD>;
+  if (live) {
+    for (var d = 0u; d < HD; d++) {
+      kr[d] = KB[s * KS + kv * HD + d];
+      vr[d] = VB[s * KS + kv * HD + d];
+      dk[d] = 0.0;
+      dv[d] = 0.0;
+    }
+  }
+  for (var h = kv * GROUP; h < kv * GROUP + GROUP; h++) {
+    for (var t0 = wg.x * 64u; t0 < T; t0 += BT) {
+      for (var j = li.x; j < BT * HD; j += 64u) {
+        let t = t0 + j / HD;
+        let d = j % HD;
+        var qval = 0.0;
+        var gval = 0.0;
+        if (t < T) {
+          qval = QB[t * QS + h * HD + d];
+          gval = GB[t * QS + h * HD + d];
+        }
+        Qs[j] = qval;
+        Gs[j] = gval;
+      }
+      if (li.x < BT) {
+        let t = t0 + li.x;
+        var lval = 0.0;
+        var dval = 0.0;
+        if (t < T) {
+          lval = LSE[h * T + t];
+          dval = DB[h * T + t];
+        }
+        Ls[li.x] = lval;
+        Ds[li.x] = dval;
+      }
+      workgroupBarrier();
+      if (live) {
+        let tEnd = min(t0 + BT, T);
+        for (var t = max(t0, s); t < tEnd; t++) {
+          let b = (t - t0) * HD;
+          var dot = 0.0;
+          var dp = 0.0;
+          for (var d = 0u; d < HD; d++) {
+            dot = dot + Qs[b + d] * kr[d];
+            dp = dp + Gs[b + d] * vr[d];
+          }
+          let p = exp(dot * SCALE - Ls[t - t0]);
+          let ds = p * (dp - Ds[t - t0]) * SCALE;
+          for (var d = 0u; d < HD; d++) {
+            dk[d] = dk[d] + ds * Qs[b + d];
+            dv[d] = dv[d] + p * Gs[b + d];
+          }
+        }
+      }
+      workgroupBarrier();
+    }
+  }
+  if (live) {
+    for (var d = 0u; d < HD; d++) {
+      DK[s * KS + kv * HD + d] = DK[s * KS + kv * HD + d] + dk[d];
+      DV[s * KS + kv * HD + d] = DV[s * KS + kv * HD + d] + dv[d];
+    }
+  }
+}`;
+}
+
 /** Per-row softmax + NLL; stashes probs for backward, per-row loss for reduce. */
 function srcCeFwd(T: number, V: number): string {
   return `
@@ -604,12 +854,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 export class WebGPUBackend implements OpsBackend {
   readonly adapterName: string;
+  /**
+   * Context-length threshold for the flash-style attention kernels. Below this
+   * T, the materialized [Hq,T,T] kernels win because flash's one-thread-per-row
+   * structure underoccupies the GPU when T is small (measured crossover
+   * M1 Max: flash is 1.4–2x slower below T~1536 and only wins from ~T=2048).
+   * Above this threshold flash removes the O(T²) buffer and improves bandwidth.
+   * The large-T tests require flash; small-T parity (T=67/130/193) uses the
+   * materialized path and must also pass — attention() routes automatically.
+   */
+  attnFlashMinT = 2048;
+  /** Bytes staged back to the host by the most recent sync() (profiling). */
+  lastSyncReadbackBytes = 0;
   private device: GpuDevice;
   private queue: GpuQueue;
   private pool: BufferPool;
   private pipelines = new Map<string, GpuPipeline>();
   private entries = new WeakMap<Tensor, Entry>();
   private touchedExternals = new Set<Tensor>();
+  private gradKeptOnDevice = new WeakSet<Tensor>();
   private transients: { buf: GpuBuffer; size: number }[] = [];
   private pendingClears: GpuBuffer[] = [];
   private enc: GpuCommandEncoder | null = null;
@@ -676,11 +939,12 @@ export class WebGPUBackend implements OpsBackend {
     }
     for (const t of this.touchedExternals) {
       const e = this.entries.get(t)!;
-      if (t.requiresGrad) {
+      if (t.requiresGrad && !this.gradKeptOnDevice.has(t)) {
         stagings.push({ stage: this.copyToStaging(e.grad, t.size * 4), dst: t.grad });
       }
       e.gradNeedsClear = true;
     }
+    this.lastSyncReadbackBytes = stagings.reduce((a, s) => a + s.dst.length * 4, 0);
 
     this.submit();
     await Promise.all(stagings.map((s) => s.stage.mapAsync(MAP_MODE_READ)));
@@ -879,19 +1143,47 @@ export class WebGPUBackend implements OpsBackend {
     const ek = this.entryFor(k);
     const ev = this.entryFor(v);
     const { t: out, e: eo } = this.makeOut([T, Hq * hd], [q, k, v]);
-    // Softmax probabilities, kept for backward (the CPU op does the same).
-    // Only the causal s<=t triangle is ever written or read, so no clear needed.
-    const probs = this.acquireTransient(Hq * T * T * 4);
-    this.dispatch(srcAttnProbs(a), [eq.data, ek.data, probs], ceilDiv(Hq * T, 64));
-    this.dispatch(srcAttnOut(a), [probs, ev.data, eo.data], ceilDiv(T * Hq * hd, 64));
-    out._backward = () => {
-      this.ensureBackwardBegun();
-      const dScore = this.acquireTransient(Hq * T * T * 4);
-      this.dispatch(srcAttnDScore(a), [eo.grad, ev.data, probs, dScore], ceilDiv(Hq * T, 64));
-      this.dispatch(srcAttnDq(a), [dScore, ek.data, eq.grad], ceilDiv(T * Hq * hd, 64));
-      this.dispatch(srcAttnDkv(a, false), [dScore, eq.data, ek.grad], ceilDiv(T * Hkv * hd, 64));
-      this.dispatch(srcAttnDkv(a, true), [probs, eo.grad, ev.grad], ceilDiv(T * Hkv * hd, 64));
-    };
+    if (T >= this.attnFlashMinT) {
+      // Flash path: per-row logsumexp (O(Hq·T)) is the only side buffer —
+      // no [Hq,T,T] allocation, so context length is no longer capped by
+      // maxStorageBufferBindingSize.
+      const lse = this.acquireTransient(Hq * T * 4);
+      this.dispatch(
+        srcAttnFwd(a),
+        [eq.data, ek.data, ev.data, eo.data, lse],
+        ceilDiv(Hq * T, 64),
+      );
+      out._backward = () => {
+        this.ensureBackwardBegun();
+        const dRow = this.acquireTransient(Hq * T * 4);
+        this.dispatch(srcAttnBwdD(a), [eo.grad, eo.data, dRow], ceilDiv(Hq * T, 64));
+        this.dispatch(
+          srcAttnBwdDq(a),
+          [eq.data, ek.data, ev.data, eo.grad, lse, dRow, eq.grad],
+          ceilDiv(Hq * T, 64),
+        );
+        this.dispatch(
+          srcAttnBwdDkv(a),
+          [eq.data, ek.data, ev.data, eo.grad, lse, dRow, ek.grad, ev.grad],
+          ceilDiv(T, 64),
+          Hkv,
+        );
+      };
+    } else {
+      // Materialized path: [Hq,T,T] probability buffer — faster at small T
+      // where flash's one-thread-per-row layout underoccupies the GPU.
+      const probs = this.acquireTransient(Hq * T * T * 4);
+      this.dispatch(srcAttnProbs(a), [eq.data, ek.data, probs], ceilDiv(Hq * T, 64));
+      this.dispatch(srcAttnOut(a), [probs, ev.data, eo.data], ceilDiv(T * Hq * hd, 64));
+      out._backward = () => {
+        this.ensureBackwardBegun();
+        const dScore = this.acquireTransient(Hq * T * T * 4);
+        this.dispatch(srcAttnDScore(a), [eo.grad, ev.data, probs, dScore], ceilDiv(Hq * T, 64));
+        this.dispatch(srcAttnDq(a), [dScore, ek.data, eq.grad], ceilDiv(T * Hq * hd, 64));
+        this.dispatch(srcAttnDkv(a, false), [dScore, eq.data, ek.grad], ceilDiv(T * Hkv * hd, 64));
+        this.dispatch(srcAttnDkv(a, true), [probs, eo.grad, ev.grad], ceilDiv(T * Hkv * hd, 64));
+      };
+    }
     return out;
   }
 
@@ -949,6 +1241,80 @@ export class WebGPUBackend implements OpsBackend {
     const e = this.entries.get(t);
     if (!e) throw new Error("seedGradFromHost: tensor has no GPU buffers");
     this.queue.writeBuffer(e.grad, 0, t.grad);
+  }
+
+  // --- raw-buffer access for GPU-side optimizers (see muon_gpu.ts) ---------------
+
+  /**
+   * The device buffers backing an external tensor, creating them (and
+   * uploading the current host data) on first use. The buffers are stable for
+   * the tensor's lifetime, so an optimizer can capture them once.
+   */
+  buffersFor(t: Tensor): { data: GpuBuffer; grad: GpuBuffer } {
+    const e = this.entryFor(t);
+    return { data: e.data, grad: e.grad };
+  }
+
+  /**
+   * Stop sync() from reading this tensor's gradient back to the host: a GPU
+   * optimizer consumes it in place. Per-step grad clearing is unaffected.
+   */
+  keepGradOnDevice(t: Tensor) {
+    this.gradKeptOnDevice.add(t);
+  }
+
+  /**
+   * A fresh zero-initialized storage buffer OUTSIDE the pool. Optimizer state
+   * (momentum) must survive sync()'s transient recycling and must start at
+   * exactly zero — pooled buffers come back dirty, freshly created ones are
+   * guaranteed zeroed by the WebGPU spec.
+   */
+  createStateBuffer(bytes: number): GpuBuffer {
+    return this.device.createBuffer({
+      size: Math.max(4, Math.ceil(bytes / 4) * 4),
+      usage: USAGE.STORAGE | USAGE.COPY_SRC | USAGE.COPY_DST,
+    });
+  }
+
+  /**
+   * Resolve pipeline + bind group once and return a closure that records the
+   * dispatch. Only valid for PERSISTENT buffers (a pooled transient may be
+   * recycled under the cached bind group). An optimizer re-records identical
+   * dispatches every step, so this removes the dominant per-step encode cost
+   * (measured: bind-group/source rebuilding was ~85% of the optimizer step).
+   */
+  prepareDispatch(code: string, buffers: GpuBuffer[], x: number, y = 1): () => void {
+    const p = this.pipeline(code);
+    const group = this.device.createBindGroup({
+      layout: p.getBindGroupLayout(0),
+      entries: buffers.map((buf, i) => ({ binding: i, resource: { buffer: buf } })),
+    });
+    return () => {
+      if (!this.enc) this.enc = this.device.createCommandEncoder();
+      if (!this.pass) this.pass = this.enc.beginComputePass();
+      this.pass.setPipeline(p);
+      this.pass.setBindGroup(0, group);
+      this.pass.dispatchWorkgroups(x, y, 1);
+    };
+  }
+
+  /** prepareDispatch for the tiled GEMM (flavors as in srcGemm). */
+  prepareGemm(
+    kind: "NT" | "NN" | "TN",
+    accum: boolean,
+    M: number,
+    N: number,
+    K: number,
+    a: GpuBuffer,
+    b: GpuBuffer,
+    c: GpuBuffer,
+  ): () => void {
+    return this.prepareDispatch(
+      srcGemm(kind, accum, M, N, K),
+      [a, b, c],
+      ceilDiv(N, 16),
+      ceilDiv(M, 16),
+    );
   }
 
   private entryFor(t: Tensor): Entry {
@@ -1116,13 +1482,14 @@ export async function initWebGPU(): Promise<WebGPUBackend | null> {
   const adapter = await nav.gpu.requestAdapter();
   if (!adapter) return null;
   // Request the adapter's own maximum buffer limits instead of the WebGPU
-  // spec's conservative default (128 MiB per storage buffer binding). The
-  // attention kernels bind the whole [heads,T,T] causal-probability matrix as
-  // one buffer, so the default caps trainable context length at a few
-  // thousand tokens (see docs/HANDOFF.md "Tile causal attention"). Asking for
-  // exactly the adapter's reported ceiling can never exceed what it supports;
-  // fall back to the default-limits device on the rare adapter that still
-  // rejects it, so WebGPU availability itself never regresses.
+  // spec's conservative default (128 MiB per storage buffer binding).
+  // Attention is flash-tiled and no longer binds a [heads,T,T] buffer, but
+  // other single buffers still grow with model/context size (logits [T,V]
+  // and their gradients, embedding-weight gradients), so headroom stays
+  // useful. Asking for exactly the adapter's reported ceiling can never
+  // exceed what it supports; fall back to the default-limits device on the
+  // rare adapter that still rejects it, so WebGPU availability itself never
+  // regresses.
   let device: GpuDevice;
   try {
     device = await adapter.requestDevice({

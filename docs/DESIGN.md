@@ -32,13 +32,20 @@ embeddings.
 1. **Muon optimizer** — done. Biggest single win; ~2× compute efficiency.
 2. **muP (maximal-update parametrization)** — tune LR/init on a _tiny_ proxy model and transfer to
    the full model without re-tuning. High value because hyperparameter search on WebGPU is
-   expensive. Touches init + per-tensor LR.
+   expensive. Touches init + per-tensor LR. Note: `MuonGpu` bakes `lr` into WGSL pipeline constants
+   at construction; a schedule requires either rebuilding apply pipelines on lr change, or switching
+   to a uniform-buffer approach.
 3. **LR schedule: warmup → stable → linear cooldown** (WSD). Cheap, reliably improves final loss.
-   Pure trainer change.
+   Pure trainer change (with the MuonGpu caveat above).
 4. **MuonClip / QK-logit control** — Moonshot's Muon variant clips attention logits to stop the
    "attention logit explosion" that shows up at scale; complements the QK-norm we already have. Add
    when scaling up.
-5. **Data quality > everything at small scale** — a curated corpus beats architecture tweaks for
+5. **GPU-resident Muon + flash attention** — done. Muon now runs entirely on the GPU (~3 ms/step at
+   725K params vs 1276 ms CPU; ~2 ms at 5M params vs ~10 s). Causal attention uses a hybrid
+   dispatch: materialized `[Hq,T,T]` path below T=2048 (faster there due to higher thread
+   parallelism), online-softmax flash path at T≥2048 (O(Hq·T) memory, no single-buffer ceiling).
+   Full numbers in `docs/HANDOFF.md`.
+6. **Data quality > everything at small scale** — a curated corpus beats architecture tweaks for
    models in the 1–50M range. Concretely:
    [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) (short synthetic stories,
    deliberately limited vocabulary) gets coherent output out of models as small as **3M params**;
@@ -46,7 +53,7 @@ embeddings.
    quality-filtered from FineWeb's 15T, the corpus behind the SmolLM family) is the step up once a
    model needs to know things beyond storytelling. Start with the former to validate the pipeline at
    real (non-toy) scale, move to a slice of the latter once it saturates.
-6. **ReLU² MLP / value-residuals / attention-window warmup** — speedrun tricks with real but smaller
+7. **ReLU² MLP / value-residuals / attention-window warmup** — speedrun tricks with real but smaller
    gains. Note: ReLU² would diverge from the Qwen3 schema (SwiGLU), so keep it optional/off by
    default to preserve llama.cpp loadability.
 
@@ -56,19 +63,20 @@ cluster scale, but WebGPU targets f16/f32 compute — not worth the complexity h
 
 ## WebGPU backend bring-up
 
-**Done (items 1–4)** — the CPU op set (`src/model/autograd.ts`) is implemented as WGSL compute
+**Done (items 1–5)** — the CPU op set (`src/model/autograd.ts`) is implemented as WGSL compute
 shaders behind the same `Tensor` interface in `src/backend/webgpu.ts`, forward and backward, in the
 planned order:
 
 1. `matmul`/`linear` (tiled GEMM) — throughput-critical, built first. ✓
 2. elementwise `add`, `mul`, `silu`. ✓
 3. `rmsnorm`, `rmsnorm_heads` (QK-norm) — workgroup reductions. ✓
-4. `rope`, causal `attention`, `cross_entropy`. ✓ (Attention materializes the causal probability
-   triangle as one storage buffer rather than flash-tiling — correct first. This caps trainable
-   context length well before compute does; see the measured numbers in `docs/HANDOFF.md`.)
-5. AdamW/Muon as kernels to keep params on-device — **next up, and no longer optional**: measured on
-   M1 Max, CPU-side Muon Newton–Schulz costs 1276 ms/step vs 36 ms/step for the entire GPU
-   forward+backward. Muon's Newton–Schulz is a handful of small GEMMs — cheap on GPU.
+4. `rope`, causal `attention`, `cross_entropy`. ✓ Attention uses a hybrid dispatch: materialized
+   `[Hq,T,T]` path for T < 2048 (higher thread parallelism wins at small T), online-softmax flash
+   path for T ≥ 2048 (O(Hq·T) memory, no buffer-size ceiling; 1.4–2.2× faster at T=2048–8192).
+5. GPU-resident Muon optimizer (`src/backend/muon_gpu.ts`). ✓ Newton–Schulz runs entirely on the GPU
+   via the existing tiled GEMM; momentum buffers and weights are device-resident. ~3 ms/step at 725K
+   params and ~2 ms/step at 5M params, vs 1276 ms / ~10 s on CPU. Measured on M1 Max; full numbers
+   in `docs/HANDOFF.md`.
 
 **Validation gate (in place):** `tests/gradcheck.ts` finite-difference-checks every CPU op;
 `tests/gpu_parity.ts` checks every kernel's forward and gradient against the CPU backend. Both ran
