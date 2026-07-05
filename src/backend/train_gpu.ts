@@ -13,7 +13,7 @@
 import { backward, crossEntropy } from "../model/autograd.ts";
 import type { Tensor } from "../model/autograd.ts";
 import type { Qwen3Model } from "../model/qwen3.ts";
-import type { TrainOpts } from "../train/trainer.ts";
+import { maskWindow, type TrainOpts } from "../train/trainer.ts";
 import { applyQKClip } from "../train/qk_clip.ts";
 import { toTokenSource } from "../data/tokens.ts";
 import type { TokenSource } from "../data/tokens.ts";
@@ -47,6 +47,7 @@ export async function trainLMGpu(
         const start = Math.floor(rng() * maxStart);
         const inputIds = tokens.window(start, opts.seqLen);
         const targetIds = tokens.window(start + 1, opts.seqLen);
+        if (opts.supervised) maskWindow(targetIds, opts.supervised, start + 1);
         const loss = crossEntropy(model.forward(inputIds), targetIds);
         backward(loss, 1 / opts.batchPerStep); // average grads over the batch
         losses.push(loss);
@@ -87,6 +88,19 @@ export interface TrainGpuResidentOpts {
   qkClipTau?: number;
   /** Per-step wall-time split and sync readback volume, for profiling. */
   onStepTime?: (fwdBwdSyncMs: number, optimizerMs: number, readbackBytes: number) => void;
+  /**
+   * Optional supervision mask aligned to `tokens` (1 = train, 0 = ignore).
+   * Masked target positions become -1 (crossEntropy ignore-index) — this is
+   * assistant-only loss for chat models. Same semantics as TrainOpts.supervised.
+   */
+  supervised?: TokenSource;
+  /**
+   * Mid-run checkpoint: every `checkpointEvery` steps, sync the device-resident
+   * weights back to the host and call `onCheckpoint` (e.g. to export a GGUF), so
+   * a long run survives interruption. Skipped when either is unset.
+   */
+  checkpointEvery?: number;
+  onCheckpoint?: (step: number) => void | Promise<void>;
 }
 
 /**
@@ -136,6 +150,7 @@ export async function trainLMGpuResident(
         const start = Math.floor(rng() * maxStart);
         const inputIds = tokens.window(start, opts.seqLen);
         const targetIds = tokens.window(start + 1, opts.seqLen);
+        if (opts.supervised) maskWindow(targetIds, opts.supervised, start + 1);
         const loss = crossEntropy(model.forward(inputIds), targetIds);
         backward(loss, 1 / opts.batchPerStep); // average grads over the batch
         losses.push(loss);
@@ -159,6 +174,14 @@ export async function trainLMGpuResident(
       if (step % logEvery === 0 || step === opts.steps - 1) {
         history.push({ step, loss: avg });
         opts.onLog?.(step, avg);
+      }
+
+      if (
+        opts.onCheckpoint && opts.checkpointEvery && step > 0 &&
+        step % opts.checkpointEvery === 0
+      ) {
+        await opt.syncWeightsToHost(); // pull device-resident weights before export
+        await opts.onCheckpoint(step);
       }
     }
   } finally {

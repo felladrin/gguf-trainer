@@ -813,7 +813,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     sum = sum + e;
   }
   for (var v = 0u; v < V; v++) { PROBS[t * V + v] = PROBS[t * V + v] / sum; }
-  LT[t] = -log(PROBS[t * V + TGT[t]] + 1e-12);
+  let tgt = TGT[t];
+  if (tgt == 0xffffffffu) { LT[t] = 0.0; }             // ignore-index: no loss
+  else { LT[t] = -log(PROBS[t * V + tgt] + 1e-12); }
 }`;
 }
 
@@ -821,13 +823,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 function srcCeReduce(T: number): string {
   return `
 ${bindF32(0, "LT", "read")}
-${bindF32(1, "LOSS", "read_write")}
+${bindF32(1, "DIV", "read")}
+${bindF32(2, "LOSS", "read_write")}
 const T: u32 = ${T}u;
 @compute @workgroup_size(1)
 fn main() {
   var a = 0.0;
   for (var t = 0u; t < T; t++) { a = a + LT[t]; }
-  LOSS[0] = a / f32(T);
+  LOSS[0] = a / DIV[0];                                 // mean over kept rows
 }`;
 }
 
@@ -836,17 +839,20 @@ function srcCeBwd(T: number, V: number): string {
 ${bindF32(0, "PROBS", "read")}
 ${bindU32(1, "TGT")}
 ${bindF32(2, "LG", "read")}
-${bindF32(3, "DLOG", "read_write")}
+${bindF32(3, "DIV", "read")}
+${bindF32(4, "DLOG", "read_write")}
 const N: u32 = ${T * V}u; const T: u32 = ${T}u; const V: u32 = ${V}u;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= N) { return; }
   let t = i / V;
+  let tgt = TGT[t];
+  if (tgt == 0xffffffffu) { return; }                  // ignore-index: no gradient
   let v = i % V;
   var ind = 0.0;
-  if (v == TGT[t]) { ind = 1.0; }
-  DLOG[i] = DLOG[i] + (LG[0] / f32(T)) * (PROBS[i] - ind);
+  if (v == tgt) { ind = 1.0; }
+  DLOG[i] = DLOG[i] + (LG[0] / DIV[0]) * (PROBS[i] - ind);
 }`;
 }
 
@@ -1191,18 +1197,21 @@ export class WebGPUBackend implements OpsBackend {
     this.beginForwardOp();
     const [T, V] = logits.shape;
     const el = this.entryFor(logits);
-    const tgtBuf = this.uploadU32(targets);
+    const tgtBuf = this.uploadU32(targets); // a target of -1 uploads as 0xffffffff (ignore)
+    let kept = 0;
+    for (const g of targets) if (g >= 0) kept++;
+    const divBuf = this.uploadF32([kept > 0 ? kept : 1]); // mean over kept rows (== T unmasked)
     const probs = this.acquireTransient(T * V * 4);
     const perRow = this.acquireTransient(T * 4);
     const { t: loss, e: eo } = this.makeOut([1], [logits]);
     this.dispatch(srcCeFwd(T, V), [el.data, tgtBuf, probs, perRow], ceilDiv(T, 64));
-    this.dispatch(srcCeReduce(T), [perRow, eo.data], 1);
+    this.dispatch(srcCeReduce(T), [perRow, divBuf, eo.data], 1);
     loss._backward = () => {
       // backward(loss, seed) already wrote the seed into the HOST grad array;
       // push it into the GPU-side loss grad after the grad clears are flushed.
       this.ensureBackwardBegun();
       this.queue.writeBuffer(eo.grad, 0, loss.grad);
-      this.dispatch(srcCeBwd(T, V), [probs, tgtBuf, eo.grad, el.grad], ceilDiv(T * V, 256));
+      this.dispatch(srcCeBwd(T, V), [probs, tgtBuf, eo.grad, divBuf, el.grad], ceilDiv(T * V, 256));
     };
     return loss;
   }
@@ -1389,6 +1398,12 @@ export class WebGPUBackend implements OpsBackend {
     // buffer can't appear in already-encoded (unsubmitted) passes: it was free
     // in the pool until this call.
     this.queue.writeBuffer(buf, 0, Uint32Array.from(values));
+    return buf;
+  }
+
+  private uploadF32(values: number[]): GpuBuffer {
+    const buf = this.acquireTransient(values.length * 4);
+    this.queue.writeBuffer(buf, 0, Float32Array.from(values));
     return buf;
   }
 

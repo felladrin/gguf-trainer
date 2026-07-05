@@ -463,7 +463,12 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
   const [T, V] = logits.shape;
   const loss = Tensor.zeros([1]);
   const probs = new Float32Array(T * V);
+  // A target < 0 marks an ignored position (e.g. prompt tokens under
+  // assistant-only loss masking): it contributes no loss and no gradient, and
+  // the mean is over kept rows only. With no ignored rows this is the plain
+  // full-sequence mean (kept === T), so existing callers are unchanged.
   let total = 0;
+  let kept = 0;
   for (let t = 0; t < T; t++) {
     const b = t * V;
     let maxL = -Infinity;
@@ -475,13 +480,18 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
       sum += e;
     }
     for (let v = 0; v < V; v++) probs[b + v] /= sum;
-    total += -Math.log(probs[b + targets[t]] + 1e-12);
+    if (targets[t] >= 0) {
+      total += -Math.log(probs[b + targets[t]] + 1e-12);
+      kept++;
+    }
   }
-  loss.data[0] = total / T;
+  const denom = kept > 0 ? kept : 1;
+  loss.data[0] = total / denom;
   loss._prev = [logits];
   loss._backward = () => {
-    const scale = loss.grad[0] / T;
+    const scale = loss.grad[0] / denom;
     for (let t = 0; t < T; t++) {
+      if (targets[t] < 0) continue; // ignored position: no gradient
       const b = t * V;
       for (let v = 0; v < V; v++) {
         logits.grad[b + v] += scale * (probs[b + v] - (v === targets[t] ? 1 : 0));

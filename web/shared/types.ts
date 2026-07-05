@@ -33,6 +33,7 @@ export interface TrainConfig {
     muonLr: number;
     auxLr: number;
     quant: QuantName;
+    maskPromptLoss?: boolean; // chat: compute loss only on assistant turns (default true)
   };
   resumeFrom?: string; // server-side filename of a prior GGUF to continue
 }

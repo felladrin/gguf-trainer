@@ -12,13 +12,20 @@ import { loadQwen3FromGGUF } from "../../src/export/load_gguf.ts";
 import { readGGUF } from "../../src/gguf/gguf.ts";
 import { wsdSchedule } from "../../src/train/schedule.ts";
 import { diskTokenSource } from "../../src/data/tokens.ts";
+import type { TokenSource } from "../../src/data/tokens.ts";
 import { readFileBytes, writeFileBytes } from "../../src/io.ts";
 import { initWebGPU } from "../../src/backend/webgpu.ts";
 import type { WebGPUBackend } from "../../src/backend/webgpu.ts";
 import { MuonGpu } from "../../src/backend/muon_gpu.ts";
 import { trainLMGpuResident } from "../../src/backend/train_gpu.ts";
 import type { BPETokenizer } from "../../src/tokenizer/bpe.ts";
-import { fetchParquetUrls, fetchSplits, hfHeaders, resolveDataset } from "./hf.ts";
+import {
+  fetchParquetUrls,
+  fetchRepoDataFiles,
+  fetchSplits,
+  hfHeaders,
+  resolveDataset,
+} from "./hf.ts";
 import { parseDataFile, type Row } from "./parse.ts";
 import { buildCorpus } from "./corpus.ts";
 import { emit, type Job, StopSignal } from "./jobs.ts";
@@ -31,7 +38,7 @@ function getGPU(): Promise<WebGPUBackend | null> {
 }
 
 const MAX_CORPUS_BYTES = 64 * 1024 * 1024; // cap raw download for one run
-const MAX_PARQUET_FILES = 8;
+const MAX_DATA_FILES = 8;
 
 async function fetchBytes(url: string, token?: string): Promise<Uint8Array> {
   const r = await fetch(url, { headers: hfHeaders(token) });
@@ -51,25 +58,38 @@ async function loadRows(
     return parseDataFile(res.url, bytes);
   }
 
-  const config = ds.config ?? (await fetchSplits(res.id, ds.hfToken)).configs[0];
   const splitInfo = await fetchSplits(res.id, ds.hfToken);
+  const config = ds.config ?? splitInfo.configs[0];
   const split = ds.split ?? (splitInfo.byConfig[config]?.[0] ?? "train");
-  const urls = await fetchParquetUrls(res.id, config, split, ds.hfToken);
-  if (urls.length === 0) {
+
+  // Prefer the Datasets Server's canonical auto-converted Parquet; fall back to
+  // downloading the repo's own data files for sets it never converted. Each
+  // source carries a filename so parseDataFile picks the right parser.
+  let sources: { url: string; name: string }[] =
+    (await fetchParquetUrls(res.id, config, split, ds.hfToken))
+      .map((url) => ({ url, name: "f.parquet" }));
+  if (sources.length === 0) {
+    log("no auto-converted Parquet; listing the dataset repo files");
+    sources = (await fetchRepoDataFiles(res.id, split, ds.hfToken))
+      .map((f) => ({ url: f.url, name: f.path }));
+  }
+  if (sources.length === 0) {
     throw new Error(
-      `No Parquet files exposed for ${res.id} [${config}/${split}]. ` +
-        `Point at a direct data file URL (.jsonl/.parquet/.txt) instead.`,
+      `No data files found for ${res.id} [${config}/${split}]. If the dataset is gated or ` +
+        `private, paste an access token in step 2; otherwise point at a direct data file URL ` +
+        `(.jsonl/.parquet/.csv/.txt).`,
     );
   }
 
   const rows: Row[] = [];
   let got = 0;
   const maxRows = ds.maxRows && ds.maxRows > 0 ? ds.maxRows : Infinity;
-  for (let i = 0; i < urls.length && i < MAX_PARQUET_FILES; i++) {
-    log(`downloading data file ${i + 1}/${Math.min(urls.length, MAX_PARQUET_FILES)}`);
-    const bytes = await fetchBytes(urls[i], ds.hfToken);
+  const nFiles = Math.min(sources.length, MAX_DATA_FILES);
+  for (let i = 0; i < nFiles; i++) {
+    log(`downloading data file ${i + 1}/${nFiles} (${sources[i].name})`);
+    const bytes = await fetchBytes(sources[i].url, ds.hfToken);
     got += bytes.length;
-    const part = await parseDataFile("f.parquet", bytes);
+    const part = await parseDataFile(sources[i].name, bytes);
     for (const r of part) {
       rows.push(r);
       if (rows.length >= maxRows) break;
@@ -158,9 +178,14 @@ export async function runJob(job: Job, modelsDir: string, jobDir: string): Promi
       chatTemplate: cfg.chatTemplate,
       outPath: tokensPath,
       existingTok,
+      maskAssistantLoss: cfg.training.maskPromptLoss ?? true,
       onProgress: (m) => status("corpus", m),
     });
     const src = await diskTokenSource(tokensPath, built.bytesPerToken);
+    // Assistant-only loss: a parallel supervision mask, when the corpus builder
+    // produced one (chat families with ChatML delimiters).
+    let supervised: TokenSource | undefined;
+    if (built.maskPath) supervised = await diskTokenSource(built.maskPath, built.bytesPerToken);
     const tps = cfg.training.batch * cfg.training.seqLen;
     emit(job, {
       type: "corpus",
@@ -232,6 +257,7 @@ export async function runJob(job: Job, modelsDir: string, jobDir: string): Promi
     const t0 = Date.now();
     await trainLMGpuResident(model, gpu, {
       tokens: src,
+      supervised,
       seqLen: cfg.training.seqLen,
       steps,
       batchPerStep: cfg.training.batch,
@@ -248,6 +274,7 @@ export async function runJob(job: Job, modelsDir: string, jobDir: string): Promi
       },
     });
     src.close();
+    supervised?.close();
     void firstLoss;
 
     status("sample", "Sampling from the trained model");

@@ -54,6 +54,23 @@ export function Step4Model({ state, set }: StepProps) {
         <Num label="Batch" value={state.batch} onChange={(v) => set({ batch: v })} />
       </div>
 
+      {state.modelType !== "base" && (
+        <label className="checkrow" style={{ marginTop: 12 }}>
+          <input
+            type="checkbox"
+            checked={state.maskPromptLoss}
+            onChange={(e) => set({ maskPromptLoss: e.target.checked })}
+          />
+          <span>
+            Train on assistant turns only{" "}
+            <span className="muted">
+              (mask the system/user prompt from the loss — the standard way to fine-tune instruct
+              models)
+            </span>
+          </span>
+        </label>
+      )}
+
       <div style={{ marginTop: 12 }}>
         <button className="ghost" onClick={() => setAdvanced(!advanced)}>
           {advanced ? "Hide" : "Show"} advanced settings

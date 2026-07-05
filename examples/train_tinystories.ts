@@ -195,6 +195,17 @@ async function main() {
       `GPU AdamW (lr ${auxLr}) on ${groups.aux.length} tensors; WSD schedule\n`,
   );
 
+  // GGUF export, reused for mid-run checkpoints and the final write, so a long
+  // run always leaves a loadable model on disk even if it is interrupted.
+  const outPath = `${dir}tinystories-qwen3-f16.gguf`;
+  const exportGGUF = async (): Promise<Uint8Array> => {
+    const b = buildGGUF(model, tok.export(), cfg, { quant: "f16", name: "tinystories-qwen3" });
+    await writeFileBytes(outPath, b);
+    return b;
+  };
+  // Checkpoint ~6 times over the run (at least every 500 steps).
+  const checkpointEvery = Math.min(500, Math.max(1, Math.round(steps / 6)));
+
   let firstLoss = 0, lastLoss = 0, stepIdx = 0, fwdMs = 0, optMs = 0, readback = 0;
   const t0 = Date.now();
   await trainLMGpuResident(model, gpu, {
@@ -206,6 +217,13 @@ async function main() {
     schedule,
     logEvery: Math.max(1, Math.round(steps / 30)),
     rng: mulberry32(7),
+    checkpointEvery,
+    onCheckpoint: async (step) => {
+      const b = await exportGGUF();
+      console.log(
+        `  [checkpoint @ step ${step}] wrote ${outPath} (${(b.length / 1e6).toFixed(1)} MB)`,
+      );
+    },
     onLog: (step, loss) => {
       if (step === 0) firstLoss = loss;
       lastLoss = loss;
@@ -234,9 +252,7 @@ async function main() {
   console.log(`\nGreedy sample: "${await generateGpu(gpu, model, tok, "Once upon a time", 40)}"`);
 
   // 6. Export GGUF (f16 for a faithful resume) and verify it parses.
-  const bytes = buildGGUF(model, tok.export(), cfg, { quant: "f16", name: "tinystories-qwen3" });
-  const outPath = `${dir}tinystories-qwen3-f16.gguf`;
-  await writeFileBytes(outPath, bytes);
+  const bytes = await exportGGUF();
   const g = readGGUF(bytes);
   if (g.metadata.get("general.architecture") !== "qwen3") die("exported arch != qwen3");
   const expected = 2 + (cfg.tieEmbeddings ? 0 : 1) + cfg.nLayers * 11;

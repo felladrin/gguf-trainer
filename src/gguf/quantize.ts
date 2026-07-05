@@ -9,6 +9,7 @@ export const GGMLType = {
   F16: 1,
   Q4_0: 2,
   Q8_0: 8,
+  BF16: 30, // read-only: import path for external GGUFs (we never serialize BF16)
 } as const;
 export type GGMLTypeId = (typeof GGMLType)[keyof typeof GGMLType];
 
@@ -123,6 +124,15 @@ export function dequantize(type: GGMLTypeId, bytes: Uint8Array, count: number): 
     case GGMLType.F16:
       for (let i = 0; i < count; i++) out[i] = f16BitsToF32(dv.getUint16(i * 2, true));
       return out;
+    case GGMLType.BF16: {
+      // bfloat16 = the high 16 bits of an f32; widen by shifting back up.
+      const conv = new DataView(new ArrayBuffer(4));
+      for (let i = 0; i < count; i++) {
+        conv.setUint32(0, dv.getUint16(i * 2, true) << 16, true);
+        out[i] = conv.getFloat32(0, true);
+      }
+      return out;
+    }
     case GGMLType.Q8_0: {
       const blockBytes = 2 + QK;
       const nBlocks = count / QK;
@@ -147,8 +157,46 @@ export function dequantize(type: GGMLTypeId, bytes: Uint8Array, count: number): 
       }
       return out;
     }
+    default: {
+      // Fail loud rather than return a silent zero tensor: an unsupported type
+      // means the weights would be garbage. k-quants (Q4_K/Q5_K/Q6_K/…) use a
+      // different super-block layout this reader does not decode yet.
+      const name = GGML_TYPE_NAMES[type] ?? `id ${type}`;
+      throw new Error(
+        `Unsupported GGUF tensor type ${name}. This reader dequantizes F32, F16, Q8_0, and Q4_0 ` +
+          `only; k-quants and other block formats are not supported. Load an F16/Q8_0/Q4_0 GGUF, ` +
+          `or re-export the source model at one of those types.`,
+      );
+    }
   }
 }
+
+/** ggml quant type ids -> names, for clear "unsupported type" diagnostics. */
+const GGML_TYPE_NAMES: Record<number, string> = {
+  0: "F32",
+  1: "F16",
+  2: "Q4_0",
+  3: "Q4_1",
+  6: "Q5_0",
+  7: "Q5_1",
+  8: "Q8_0",
+  9: "Q8_1",
+  10: "Q2_K",
+  11: "Q3_K",
+  12: "Q4_K",
+  13: "Q5_K",
+  14: "Q6_K",
+  15: "Q8_K",
+  16: "IQ2_XXS",
+  17: "IQ2_XS",
+  19: "IQ3_XXS",
+  20: "IQ1_S",
+  21: "IQ4_NL",
+  23: "IQ3_S",
+  24: "IQ2_S",
+  26: "IQ4_XS",
+  30: "BF16",
+};
 
 export type QuantName = "f32" | "f16" | "q8_0" | "q4_0";
 

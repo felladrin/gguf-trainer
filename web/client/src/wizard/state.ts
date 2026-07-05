@@ -35,6 +35,7 @@ export interface State {
   muonLr: number;
   auxLr: number;
   quant: QuantName;
+  maskPromptLoss: boolean; // chat: train loss only on assistant turns
 
   jobId?: string;
   models: { file: string; sizeMB: number }[];
@@ -63,6 +64,7 @@ export function defaultState(chatTemplate: string): State {
     muonLr: 0.02,
     auxLr: 0.003,
     quant: "f16",
+    maskPromptLoss: true,
     models: [],
   };
 }
@@ -89,6 +91,8 @@ export function buildConfig(s: State): TrainConfig {
       muonLr: s.muonLr,
       auxLr: s.auxLr,
       quant: s.quant,
+      // Only meaningful for chat families; the server ignores it for base models.
+      maskPromptLoss: s.modelType === "base" ? undefined : s.maskPromptLoss,
     },
     resumeFrom: s.goal === "continue" && s.resumeFrom ? s.resumeFrom : undefined,
   };

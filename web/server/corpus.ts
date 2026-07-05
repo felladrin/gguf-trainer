@@ -9,6 +9,7 @@ import { Template } from "@huggingface/jinja";
 import { BPETokenizer } from "../../src/tokenizer/bpe.ts";
 import { tokenBytes, writeTokenFile } from "../../src/data/tokens.ts";
 import {
+  assistantLossMask,
   CHATML_SPECIALS,
   type FieldMapping,
   type ModelType,
@@ -27,6 +28,7 @@ export interface BuildCorpusOpts {
   maxTokens?: number; // stop once the corpus has this many tokens (bounds huge sets)
   sampleBytes?: number; // BPE training sample size (default 8 MB)
   existingTok?: BPETokenizer; // resume: reuse this vocab instead of training a new one
+  maskAssistantLoss?: boolean; // chat: train loss only on assistant turns (default true)
   onProgress?: (msg: string) => void;
 }
 
@@ -36,6 +38,7 @@ export interface BuiltCorpus {
   numTokens: number;
   numDocs: number;
   bytesPerToken: 2 | 4;
+  maskPath?: string; // assistant-only loss mask (present iff masking was applied)
 }
 
 /** Materialize training documents (strings) from rows per the model type. */
@@ -98,17 +101,31 @@ export async function buildCorpus(o: BuildCorpusOpts): Promise<BuiltCorpus> {
   }
 
   // Inference EOS: chat stops at <|im_end|>; base stops at <|endoftext|>.
+  const imStart = tok.idOf("<|im_start|>");
   const imEnd = tok.idOf("<|im_end|>");
   if (o.modelType !== "base" && imEnd !== undefined) tok.eosId = imEnd;
   const sepId = tok.idOf("<|endoftext|>") ?? tok.eosId; // hard document separator
 
-  // Encode all docs, EOS-joined, up to the token budget.
+  // Assistant-only loss: for chat families, train only on assistant-turn tokens
+  // (prompt/system/user positions become ignore-index -1). Needs the atomic
+  // ChatML delimiters; falls back to full-sequence loss without them.
+  const doMask = o.maskAssistantLoss !== false && o.modelType !== "base" &&
+    imStart !== undefined && imEnd !== undefined;
+
+  // Encode all docs, EOS-joined, up to the token budget (with a parallel mask).
   const maxTokens = o.maxTokens ?? Infinity;
   const ids: number[] = [];
+  const sup: number[] = [];
   let used = 0;
   for (const d of docs) {
-    for (const id of tok.encode(d)) ids.push(id);
-    ids.push(sepId);
+    const docIds = tok.encode(d);
+    const m = doMask ? assistantLossMask(docIds, imStart!, imEnd!, (x) => tok.decode(x)) : null;
+    for (let k = 0; k < docIds.length; k++) {
+      ids.push(docIds[k]);
+      if (doMask) sup.push(m![k]);
+    }
+    ids.push(sepId); // separator is scaffolding, never supervised
+    if (doMask) sup.push(0);
     used++;
     if (ids.length >= maxTokens) break;
   }
@@ -117,11 +134,20 @@ export async function buildCorpus(o: BuildCorpusOpts): Promise<BuiltCorpus> {
   const bpt = tokenBytes(tok.vocabSize);
   await writeTokenFile(o.outPath, ids, bpt);
 
+  let maskPath: string | undefined;
+  if (doMask) {
+    maskPath = o.outPath.replace(/\.tokens$/, "") + ".mask";
+    await writeTokenFile(maskPath, sup, bpt);
+    const kept = sup.reduce((a, b) => a + b, 0);
+    log(`assistant-only loss mask: ${kept}/${sup.length} tokens supervised`);
+  }
+
   return {
     tok,
     tokenizerJSON: JSON.stringify(tok.export()),
     numTokens: ids.length,
     numDocs: used,
     bytesPerToken: bpt,
+    maskPath,
   };
 }

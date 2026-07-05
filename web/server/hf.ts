@@ -4,6 +4,7 @@
 // file URL) and parses them locally — see parse.ts.
 
 const DS = "https://datasets-server.huggingface.co";
+const HUB = "https://huggingface.co";
 const DATA_EXT = /\.(jsonl|json|txt|csv|parquet|tsv)(\?|$)/i;
 
 export interface Resolved {
@@ -98,6 +99,47 @@ export async function fetchParquetUrls(
   return data.parquet_files
     .filter((f) => f.config === config && f.split === split)
     .map((f) => f.url);
+}
+
+export interface RepoFile {
+  path: string;
+  size: number;
+  url: string; // resolve URL to download the raw file
+}
+
+/**
+ * Enumerate a dataset repo's file tree and return the original data files
+ * (jsonl/json/csv/tsv/txt/parquet). This is the fallback for datasets the
+ * Datasets Server never auto-converted to Parquet (unconvertible layouts, or
+ * gated/private repos): list the repo, then download the source files directly.
+ * When `split` is given, prefer files whose path names that split (train/…);
+ * otherwise return every data file found. Order is smallest-first so a bounded
+ * run pulls whole files rather than a fraction of one giant shard.
+ */
+export async function fetchRepoDataFiles(
+  id: string,
+  split?: string,
+  token?: string,
+): Promise<RepoFile[]> {
+  const tree = await getJSON(
+    `${HUB}/api/datasets/${id}/tree/main?recursive=true`,
+    token,
+  ) as { type: string; path: string; size?: number }[];
+  const files = tree
+    .filter((e) => e.type === "file" && DATA_EXT.test(e.path))
+    .map((e) => ({
+      path: e.path,
+      size: e.size ?? 0,
+      url: `${HUB}/datasets/${id}/resolve/main/${
+        e.path.split("/").map(encodeURIComponent).join("/")
+      }`,
+    }))
+    .sort((a, b) => a.size - b.size);
+  if (split) {
+    const named = files.filter((f) => new RegExp(`(^|[/_.-])${split}([/_.-]|$)`, "i").test(f.path));
+    if (named.length) return named;
+  }
+  return files;
 }
 
 /** Optional total row count for a config/split (nice-to-have; may be absent). */

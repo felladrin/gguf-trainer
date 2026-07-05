@@ -207,3 +207,61 @@ export function rowToText(row: unknown, mapping: FieldMapping): string | null {
   const v = row[mapping.textField ?? "text"];
   return typeof v === "string" && v.length > 0 ? v : null;
 }
+
+/**
+ * Assistant-only loss mask over an encoded ChatML token stream: 1 where a token
+ * is part of an assistant turn's CONTENT or its terminating <|im_end|> (what the
+ * model must learn to generate), 0 for system/user turns and all ChatML
+ * scaffolding (the prompt it is merely conditioned on). Turn spans come from the
+ * atomic <|im_start|>/<|im_end|> ids; the "assistant\n" header is excluded by
+ * decoding the prefix up to its first newline, so the mask is exact even when
+ * BPE fuses the header/content boundary (a fused boundary token drops from the
+ * mask — a negligible one-token effect). Feed the result to maskedTargets() to
+ * build the ignore-index (-1) targets crossEntropy skips. Same length as `ids`.
+ */
+export function assistantLossMask(
+  ids: number[],
+  imStart: number,
+  imEnd: number,
+  decode: (ids: number[]) => string,
+): number[] {
+  const sup = new Array<number>(ids.length).fill(0);
+  let i = 0;
+  while (i < ids.length) {
+    if (ids[i] !== imStart) {
+      i++;
+      continue;
+    }
+    // This turn's body runs from just after <|im_start|> to the next <|im_end|>.
+    let j = i + 1;
+    while (j < ids.length && ids[j] !== imEnd) j++;
+    // Role = the turn's leading word. Decode the whole body (one turn, small):
+    // a byte-level tokenizer may spread "assistant" over many tokens, so a fixed
+    // token-count prefix is not enough to read the role reliably.
+    const body = decode(ids.slice(i + 1, j)).trimStart();
+    if (body.startsWith("assistant")) {
+      // Skip past the "assistant\n" header: first token index after its newline.
+      let contentStart = i + 1;
+      for (let p = i + 1; p < j; p++) {
+        if (decode(ids.slice(i + 1, p + 1)).includes("\n")) {
+          contentStart = p + 1;
+          break;
+        }
+      }
+      const end = j < ids.length ? j : ids.length - 1; // include <|im_end|> (the stop token)
+      for (let k = contentStart; k <= end; k++) sup[k] = 1;
+    }
+    i = j < ids.length ? j + 1 : ids.length;
+  }
+  return sup;
+}
+
+/**
+ * Apply a supervision mask to a target window: positions with mask 0 become -1
+ * (crossEntropy's ignore-index). Returns a new array; inputs are untouched.
+ */
+export function maskedTargets(targets: number[], mask: ArrayLike<number>): number[] {
+  const out = targets.slice();
+  for (let k = 0; k < out.length; k++) if (!mask[k]) out[k] = -1;
+  return out;
+}

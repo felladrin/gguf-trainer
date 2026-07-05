@@ -44,7 +44,9 @@ the memory budget that makes big local runs practical.
    the vocabulary automatically so turns tokenize atomically.
 4. **Model & training** — a size preset (Tiny/Small/Medium) or custom, plus the same knobs the CLI
    takes (steps, sequence length, batch, Muon/aux LR, muP base width, export quant), with rough
-   parameter/memory/time estimates.
+   parameter/memory/time estimates. For chat families, **"Train on assistant turns only"** (on by
+   default) masks the system/user prompt out of the loss so training supervises only what the model
+   must generate — the standard instruct-tuning objective.
 5. **Train** — start the run; loss curve, tokens/sec, log, and a sample generation stream live over
    Server-Sent Events. Stop any time.
 6. **Test** — download the GGUF, or load it into wllama and chat/complete in the browser using the
@@ -78,6 +80,8 @@ and download.
 
 - At WebGPU-from-scratch sizes (a few million to ~50M params), a chat/reasoning/tool model learns
   the _format_ but not strong capability. Great for the pipeline; not a large pretrained model.
-- Training data is downloaded via HF's auto-converted Parquet (or a direct file URL). For a gated or
-  private dataset, paste an HF token in step 2.
+- Training data is downloaded via HF's auto-converted Parquet, or — for datasets HF never converted
+  — by listing the dataset repo and pulling its original files (`.jsonl`/`.json`/`.csv`/`.tsv`/
+  `.txt`/`.parquet`), or from a direct file URL. For a gated or private dataset, paste an HF token in
+  step 2.
 - One training job runs at a time (a single GPU).

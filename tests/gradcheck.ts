@@ -34,10 +34,12 @@ import { wsdSchedule } from "../src/train/schedule.ts";
 import { applyQKClip, qkLogitScale } from "../src/train/qk_clip.ts";
 import { buildGGUF } from "../src/export/export_gguf.ts";
 import { loadQwen3FromGGUF } from "../src/export/load_gguf.ts";
+import { dequantize } from "../src/gguf/quantize.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { Muon } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
 import { diskTokenSource, memTokenSource, tokenBytes, writeTokenFile } from "../src/data/tokens.ts";
+import { assistantLossMask, maskedTargets } from "../src/data/chat.ts";
 
 // Storage is f32, so the finite difference carries ~1e-6 forward-rounding noise;
 // ε=1e-2 keeps both that noise (δ/2ε) and the O(ε²) truncation well under tol.
@@ -492,6 +494,69 @@ async function main() {
     );
   }
 
+  // External / resumed tokenizer import: control tokens must survive the GGUF
+  // round-trip (buildGGUF writes token_type; tokenizerFromGGUF recovers the
+  // specials) so a resumed chat model still tokenizes ChatML atomically. And
+  // dequantize must reject unsupported (k-quant) types loudly, not silently
+  // return zeros. Both are the Tier-2 external-GGUF loader's guardrails.
+  {
+    const tok = new BPETokenizer();
+    tok.train(
+      "the cat sat on the mat. the dog ran to the cat.".repeat(8),
+      320,
+      ["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+    );
+    const cfg: Qwen3Config = {
+      vocabSize: tok.vocabSize,
+      hiddenSize: 32,
+      nLayers: 1,
+      nHeads: 1,
+      nKVHeads: 1,
+      headDim: 32,
+      ffnDim: 64,
+      ropeBase: 10000,
+      rmsEps: 1e-6,
+      maxSeq: 32,
+      tieEmbeddings: true,
+    };
+    const model = new Qwen3Model(cfg, mulberry32(9));
+    const chat = "<|im_start|>user\nthe cat<|im_end|>\n";
+    const before = tok.encode(chat);
+    const { tokenizer: tok2 } = loadQwen3FromGGUF(
+      buildGGUF(model, tok.export(), cfg, { quant: "f16" }),
+    );
+    const imStart = tok2.idOf("<|im_start|>");
+    const imEnd = tok2.idOf("<|im_end|>");
+    let ok = imStart !== undefined && imEnd !== undefined;
+    const after = tok2.encode(chat);
+    if (after.join(",") !== before.join(",")) ok = false; // specials still atomic post-load
+    if (after.filter((id) => id === imStart || id === imEnd).length !== 2) ok = false;
+    // BF16 import path: the high-16-bits float format external Qwen3 base GGUFs
+    // ship in. These values are exactly bf16-representable, so dequant is exact.
+    const bfVals = [1.5, -2.25, 0, 3];
+    const bf = new Uint8Array(bfVals.length * 2);
+    const bfdv = new DataView(bf.buffer);
+    const conv = new DataView(new ArrayBuffer(4));
+    for (let i = 0; i < bfVals.length; i++) {
+      conv.setFloat32(0, bfVals[i], true);
+      bfdv.setUint16(i * 2, conv.getUint32(0, true) >>> 16, true);
+    }
+    const bfOut = dequantize(30 as never, bf, bfVals.length); // 30 = BF16
+    for (let i = 0; i < bfVals.length; i++) if (bfOut[i] !== bfVals[i]) ok = false;
+    // Unsupported quant type -> loud throw, not a silent zero tensor.
+    let threw = false;
+    try {
+      dequantize(12 as never, new Uint8Array(64), 32); // 12 = Q4_K (k-quant)
+    } catch {
+      threw = true;
+    }
+    if (!threw) ok = false;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} external GGUF import (specials + BF16 + unsupported-quant guard)`,
+    );
+  }
+
   // Special-token encoding: ChatML control tokens must encode atomically (one id
   // each), not shred into bytes, so a chat model learns real turn boundaries.
   // Ordinary text (no specials) must be unaffected, and export()/fromData() must
@@ -518,6 +583,36 @@ async function main() {
     if (rebuilt.encode(chat).join(",") !== ids.join(",")) ok = false;
     if (!ok) failures++;
     console.log(`  ${ok ? "ok " : "FAIL"} special-token encoding (ChatML atomic + roundtrip)`);
+  }
+
+  // Assistant-only loss mask: over a rendered ChatML conversation, supervise the
+  // assistant turn's content + its terminating <|im_end|>, and nothing else.
+  {
+    const tok = new BPETokenizer();
+    tok.train(
+      "the cat sat on the mat. the dog ran to the cat and the ball.".repeat(6),
+      320,
+      ["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+    );
+    const imStart = tok.idOf("<|im_start|>")!;
+    const imEnd = tok.idOf("<|im_end|>")!;
+    const chat = "<|im_start|>user\nthe cat<|im_end|>\n<|im_start|>assistant\nthe dog<|im_end|>\n";
+    const ids = tok.encode(chat);
+    const mask = assistantLossMask(ids, imStart, imEnd, (x) => tok.decode(x));
+    let ok = mask.length === ids.length;
+    const supText = tok.decode(ids.filter((_, k) => mask[k] === 1));
+    if (!supText.includes("the dog")) ok = false; // assistant content supervised
+    if (supText.includes("cat")) ok = false; // user content NOT supervised
+    if (supText.includes("assistant")) ok = false; // "assistant\n" header excluded
+    // The assistant turn's <|im_end|> is supervised (learn to stop); the user
+    // turn's <|im_end|> is not.
+    const ends = ids.map((id, k) => (id === imEnd ? k : -1)).filter((k) => k >= 0);
+    if (mask[ends[0]] !== 0 || mask[ends[1]] !== 1) ok = false;
+    // maskedTargets turns every mask-0 position into ignore-index -1.
+    const ignores = maskedTargets(ids, mask).filter((t) => t === -1).length;
+    if (ignores !== mask.filter((m) => m === 0).length) ok = false;
+    if (!ok) failures++;
+    console.log(`  ${ok ? "ok " : "FAIL"} assistant-only loss mask (assistant span + stop token)`);
   }
 
   // muP coordinate check: the standard muP diagnostic. Sweep width at fixed

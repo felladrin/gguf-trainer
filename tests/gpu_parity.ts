@@ -423,6 +423,14 @@ async function main() {
     const targets = [2, 7, 2, 0, 16];
     await opCase(gpu, "crossEntropy", [logits], () => crossEntropy(logits, targets));
   }
+  {
+    // Ignore-index (-1) = assistant-only loss masking: masked rows contribute
+    // no loss and no gradient; the mean is over kept rows. GPU must match CPU.
+    const T = 8, V = 17;
+    const logits = randTensor([T, V], rng);
+    const targets = [-1, 3, -1, 11, 0, -1, 16, 5];
+    await opCase(gpu, "crossEntropy (ignore-index)", [logits], () => crossEntropy(logits, targets));
+  }
 
   // 5. graph-level
   await modelParity(gpu);

@@ -118,6 +118,28 @@ Gate: `tests/gpu_parity.ts` runs both paths explicitly at T=67/130/193 (each sha
 `attnFlashMinT=2048` for materialized and `attnFlashMinT=1` for flash), plus the `flashLargeTCheck`
 functional gate at T=3584 under spec-default limits.
 
+## Also added (later session)
+
+- **Assistant-only loss masking (chat/instruct SFT).** `crossEntropy` (CPU `src/model/autograd.ts`
+  and the GPU kernels in `src/backend/webgpu.ts`) now treats a target of `-1` as an ignore-index:
+  no loss, no gradient, mean over kept rows (`divBuf` uniform; `-1` uploads as `0xffffffff`). With no
+  masked rows it is bit-identical to the old full-sequence mean, so existing parity holds — plus a
+  new `crossEntropy (ignore-index)` parity case. `chat.assistantLossMask()` builds the per-token mask
+  over rendered ChatML (supervise assistant content + its `<|im_end|>`, skip the `assistant\n`
+  header, system/user, and scaffolding); the web corpus builder writes a parallel `.mask`, and both
+  trainers take an optional `supervised` TokenSource (`maskWindow()` applies it). On by default for
+  chat models (wizard toggle in step 4). Self-check in `tests/gradcheck.ts`.
+- **External Qwen3 GGUF import (Tier-2 loader).** `tokenizerFromGGUF` recovers control/special tokens
+  from `tokenizer.ggml.token_type` (also fixes our own chat-model resume, which was silently losing
+  atomic ChatML); `dequantize` gained BF16 and now throws a clear error on unsupported k-quants
+  instead of returning silent zeros. F16/BF16/Q8_0/Q4_0 external Qwen3 GGUFs load for fine-tune.
+  Remaining for arbitrary Alibaba releases: k-quant super-block dequant + Qwen's exact pre-tokenizer
+  regex (roadmap task #26).
+- **Mid-run checkpointing.** `trainLMGpuResident` takes `checkpointEvery` + `onCheckpoint`; it syncs
+  device-resident weights to the host and fires the callback so long runs export a loadable GGUF
+  periodically (used by `examples/train_tinystories.ts`). Measured ~6.46 s/step for the 29.4M config
+  (hidden 512 × 8 layers) on an M1 Max.
+
 ## Non-negotiable invariants (do not break these)
 
 1. **GGUF loadability is a contract.** The `qwen3` tensor names and metadata keys in

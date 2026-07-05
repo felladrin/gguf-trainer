@@ -4,13 +4,22 @@
 // vocab/merges, so a run can resume (continue training or sample) from a saved
 // GGUF instead of re-initializing from scratch.
 //
-// Scope: GGUFs written by this project's buildGGUF(). Tensor names, metadata
-// keys, and the [out,in]->ne[in,out] weight layout match by construction, so
-// loading is name lookup + dequantize + copy. Fidelity follows the export
-// quant: f32/f16 round-trip cleanly; a q4_0/q8_0 checkpoint resumes from its
-// (lossy) dequantized weights — export in f16 or f32 for a faithful resume.
-// Loading an arbitrary external Qwen3 GGUF is a larger job (its tokenizer would
-// need importing beyond our own gpt2/BPE data); see docs/HANDOFF.md.
+// Primary scope: GGUFs written by this project's buildGGUF(). Tensor names,
+// metadata keys, and the [out,in]->ne[in,out] weight layout match by
+// construction, so loading is name lookup + dequantize + copy. Fidelity follows
+// the export quant: f32/f16 round-trip cleanly; a q4_0/q8_0 checkpoint resumes
+// from its (lossy) dequantized weights — export in f16 or f32 for a faithful
+// resume.
+//
+// External Qwen3 GGUFs (e.g. real Alibaba releases) also load as far as the
+// pieces line up: configFromGGUF reads the standard qwen3.* metadata,
+// tokenizerFromGGUF imports the gpt2/BPE vocab + merges + control tokens (via
+// tokenizer.ggml.token_type), and loadWeightsFromGGUF dequantizes per tensor.
+// Two known gaps remain for real quantized releases: (1) dequantize() decodes
+// F32/F16/Q8_0/Q4_0 only — a k-quant file (Q4_K/Q6_K/…) now throws a clear
+// error rather than loading garbage; (2) tokenization uses our GPT-2 split
+// regex, so token boundaries may differ slightly from Qwen's own pre-tokenizer.
+// Fine-tuning an external F16/Q8_0/Q4_0 Qwen3 works today; see docs/HANDOFF.md.
 
 import { readGGUF } from "../gguf/gguf.ts";
 import type { GGUFFile } from "../gguf/gguf.ts";
@@ -51,6 +60,8 @@ export function configFromGGUF(g: GGUFFile): Qwen3Config {
   };
 }
 
+const TOKEN_TYPE_CONTROL = 3; // llama.cpp: NORMAL=1, UNKNOWN=2, CONTROL=3, USER_DEFINED=4
+
 /** Reconstruct the tokenizer data from the GGUF's tokenizer.ggml.* metadata. */
 export function tokenizerFromGGUF(g: GGUFFile): TokenizerData {
   const tokens = g.metadata.get("tokenizer.ggml.tokens");
@@ -58,11 +69,23 @@ export function tokenizerFromGGUF(g: GGUFFile): TokenizerData {
   if (!Array.isArray(tokens) || !Array.isArray(merges)) {
     throw new Error("GGUF missing tokenizer.ggml.tokens/merges");
   }
+  const toks = tokens as string[];
+  // Recover the control/special tokens so they re-encode atomically (ChatML,
+  // <|endoftext|>, …). Prefer the token_type array (how llama.cpp and our own
+  // exporter flag control tokens); fall back to the "<|…|>" shape when a GGUF
+  // omits token_type. Without this, a resumed chat model — or an imported
+  // external Qwen3 GGUF — would shred its special tokens back into bytes.
+  const types = g.metadata.get("tokenizer.ggml.token_type");
+  let specials: string[] = Array.isArray(types)
+    ? toks.filter((_, i) => (types as number[])[i] === TOKEN_TYPE_CONTROL)
+    : [];
+  if (specials.length === 0) specials = toks.filter((t) => /^<\|.*\|>$/.test(t));
   return {
-    tokens: tokens as string[],
+    tokens: toks,
     merges: merges as string[],
     bosId: metaNum(g, "tokenizer.ggml.bos_token_id"),
     eosId: metaNum(g, "tokenizer.ggml.eos_token_id"),
+    specials: specials.length ? specials : undefined,
   };
 }
 

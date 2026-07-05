@@ -22,6 +22,19 @@ export interface TrainOpts {
   schedule?: (step: number) => number;
   /** MuonClip/QK-logit clip threshold; when set, clip qNorm/kNorm after each step. */
   qkClipTau?: number;
+  /**
+   * Optional supervision mask aligned to `tokens` (1 = train on this position,
+   * 0 = ignore). When present, target positions with mask 0 become -1
+   * (crossEntropy's ignore-index) — this is assistant-only loss for chat models.
+   */
+  supervised?: TokenSource;
+}
+
+/** In place: set target to -1 (ignore-index) where the supervision mask is 0. */
+export function maskWindow(targetIds: number[], supervised: TokenSource, start: number): number[] {
+  const m = supervised.window(start, targetIds.length);
+  for (let k = 0; k < targetIds.length; k++) if (!m[k]) targetIds[k] = -1;
+  return targetIds;
 }
 
 export function trainLM(model: Qwen3Model, opts: TrainOpts): { step: number; loss: number }[] {
@@ -43,6 +56,7 @@ export function trainLM(model: Qwen3Model, opts: TrainOpts): { step: number; los
       const start = Math.floor(rng() * maxStart);
       const inputIds = tokens.window(start, opts.seqLen);
       const targetIds = tokens.window(start + 1, opts.seqLen);
+      if (opts.supervised) maskWindow(targetIds, opts.supervised, start + 1);
 
       const logits = model.forward(inputIds);
       const loss = crossEntropy(logits, targetIds);
