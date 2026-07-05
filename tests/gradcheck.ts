@@ -40,6 +40,7 @@ import { Muon } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
 import { diskTokenSource, memTokenSource, tokenBytes, writeTokenFile } from "../src/data/tokens.ts";
 import { assistantLossMask, maskedTargets } from "../src/data/chat.ts";
+import { f16BitsToF32, f32ToF16Bits } from "../src/backend/f16.ts";
 
 // Storage is f32, so the finite difference carries ~1e-6 forward-rounding noise;
 // ε=1e-2 keeps both that noise (δ/2ε) and the O(ε²) truncation well under tol.
@@ -715,6 +716,29 @@ async function main() {
     }
     if (!ok) failures++;
     console.log(`  ${ok ? "ok " : "FAIL"} streaming token source (disk vs memory, u16 + u32)`);
+  }
+
+  {
+    // f16 <-> f32 conversion (host<->GPU transfer for mixed precision).
+    let ok = true;
+    const exact: [number, number][] = [[1, 0x3c00], [0.5, 0x3800], [2, 0x4000], [-1, 0xbc00], [
+      0,
+      0,
+    ]];
+    for (const [v, bits] of exact) if (f32ToF16Bits(v) !== bits) ok = false;
+    if (f16BitsToF32(0x3c00) !== 1) ok = false;
+    if (f32ToF16Bits(70000) !== 0x7c00) ok = false; // overflow -> +inf
+    if (f16BitsToF32(f32ToF16Bits(65504)) !== 65504) ok = false; // max normal, exact
+    if (!Number.isNaN(f16BitsToF32(f32ToF16Bits(NaN)))) ok = false;
+    const rng = mulberry32(11);
+    for (let i = 0; i < 3000; i++) {
+      const v = (rng() * 2 - 1) * 10;
+      const back = f16BitsToF32(f32ToF16Bits(v));
+      if (Math.abs(back - v) > Math.abs(v) / 1024 + 1e-3) ok = false; // within f16 precision
+      if (f16BitsToF32(f32ToF16Bits(-v)) !== -back) ok = false; // sign-symmetric RNE
+    }
+    if (!ok) failures++;
+    console.log(`  ${ok ? "ok " : "FAIL"} f16 <-> f32 conversion (exact + round-trip + inf/nan)`);
   }
 
   console.log(

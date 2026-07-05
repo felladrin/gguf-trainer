@@ -973,6 +973,8 @@ export class WebGPUBackend implements OpsBackend {
   readonly adapterName: string;
   /** Whether the device granted the timestamp-query feature (see startProfile). */
   readonly timestampSupported: boolean;
+  /** Whether the device granted shader-f16 (prerequisite for mixed-precision training). */
+  readonly f16Supported: boolean;
   /**
    * Context-length threshold for the flash-style attention kernels. Below this
    * T, the materialized [Hq,T,T] kernels win because flash's one-thread-per-row
@@ -1002,12 +1004,18 @@ export class WebGPUBackend implements OpsBackend {
   private curLabel = "";
   private prof: Profiler | null = null;
 
-  constructor(device: GpuDevice, adapterName: string, timestampSupported = false) {
+  constructor(
+    device: GpuDevice,
+    adapterName: string,
+    timestampSupported = false,
+    f16Supported = false,
+  ) {
     this.device = device;
     this.queue = device.queue;
     this.pool = new BufferPool(device);
     this.adapterName = adapterName;
     this.timestampSupported = timestampSupported;
+    this.f16Supported = f16Supported;
     device.lost?.then((info) => {
       this.deviceError = `WebGPU device lost: ${info?.message ?? "unknown"}`;
     });
@@ -1777,7 +1785,11 @@ export async function initWebGPU(): Promise<WebGPUBackend | null> {
   // regresses.
   // Opt into timestamp-query when the adapter offers it, so per-kernel GPU-time
   // profiling (startProfile) is available; absence just disables profiling.
-  const wantTimestamp = !!adapter.features?.has?.("timestamp-query");
+  // Opt into optional features when offered: timestamp-query enables per-kernel
+  // profiling (startProfile); shader-f16 enables mixed-precision training.
+  const feats: string[] = [];
+  if (adapter.features?.has?.("timestamp-query")) feats.push("timestamp-query");
+  if (adapter.features?.has?.("shader-f16")) feats.push("shader-f16");
   let device: GpuDevice;
   try {
     device = await adapter.requestDevice({
@@ -1785,11 +1797,16 @@ export async function initWebGPU(): Promise<WebGPUBackend | null> {
         maxBufferSize: adapter.limits.maxBufferSize,
         maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       },
-      requiredFeatures: wantTimestamp ? ["timestamp-query"] : [],
+      requiredFeatures: feats,
     });
   } catch {
     device = await adapter.requestDevice();
   }
   const name = adapter.info?.description || adapter.info?.vendor || "unknown adapter";
-  return new WebGPUBackend(device, String(name), !!device.features?.has?.("timestamp-query"));
+  return new WebGPUBackend(
+    device,
+    String(name),
+    !!device.features?.has?.("timestamp-query"),
+    !!device.features?.has?.("shader-f16"),
+  );
 }
