@@ -21,7 +21,7 @@
 import { Tensor } from "../model/autograd.ts";
 import type { AdamOpts } from "../train/adam.ts";
 import { AdamWGpu } from "./adamw_gpu.ts";
-import { bindF32, ceilDiv, f32lit } from "./webgpu.ts";
+import { bindF32, ceilDiv, f32lit, grid2D } from "./webgpu.ts";
 import type { GpuBuffer, WebGPUBackend } from "./webgpu.ts";
 
 export interface MuonGpuOpts {
@@ -56,7 +56,7 @@ ${bindF32(2, "UB", "read_write")}
 const N: u32 = ${n}u; const M: f32 = ${f32lit(momentum)};
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(n).roww}u + gid.x;
   if (i >= N) { return; }
   BUF[i] = M * BUF[i] + GB[i];
   UB[i] = ${nesterov ? "GB[i] + M * BUF[i]" : "BUF[i]"};
@@ -126,7 +126,7 @@ ${bindF32(2, "XB", "read_write")}
 const N: u32 = ${m * n}u; const C: u32 = ${flip ? m : n}u; const NCOLS: u32 = ${n}u;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(m * n).roww}u + gid.x;
   if (i >= N) { return; }
   let row = i / C;
   let col = i % C;
@@ -142,7 +142,7 @@ ${bindF32(1, "AAB", "read")}
 const N: u32 = ${n}u;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(n).roww}u + gid.x;
   if (i >= N) { return; }
   AB[i] = ${f32lit(NS_B)} * AB[i] + ${f32lit(NS_C)} * AAB[i];
 }`;
@@ -156,7 +156,7 @@ ${bindF32(1, "BXB", "read")}
 const N: u32 = ${n}u;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(n).roww}u + gid.x;
   if (i >= N) { return; }
   XB[i] = ${f32lit(NS_A)} * XB[i] + BXB[i];
 }`;
@@ -181,7 +181,7 @@ const N: u32 = ${m * n}u; const C: u32 = ${n}u; const NROWS: u32 = ${m}u;
 const SCALE: f32 = ${f32lit(scale)};
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(m * n).roww}u + gid.x;
   if (i >= N) { return; }
   let row = i / C;
   let col = i % C;

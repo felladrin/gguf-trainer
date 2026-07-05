@@ -34,7 +34,7 @@ import { trainLM } from "../src/train/trainer.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
 import { qkLogitScale } from "../src/train/qk_clip.ts";
 import { AdamW } from "../src/train/adam.ts";
-import { initWebGPU, WebGPUBackend } from "../src/backend/webgpu.ts";
+import { initWebGPU, MAX_WG, WebGPUBackend } from "../src/backend/webgpu.ts";
 import { MuonGpu, newtonSchulzGpu } from "../src/backend/muon_gpu.ts";
 import { AdamWGpu } from "../src/backend/adamw_gpu.ts";
 import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
@@ -142,6 +142,36 @@ async function profilerSmoke(gpu: WebGPUBackend) {
   }
   if (!ok) failures++;
   console.log(`  ${ok ? "ok " : "FAIL"} timestamp-query profiler (labels + times)`);
+}
+
+/**
+ * Force the 2-D workgroup-grid fold (flat per-element path): a dispatch with
+ * more than MAX_WG workgroups in x overflows WebGPU's per-dimension cap, so the
+ * backend splits it across (x, y) and each kernel rebuilds its flat index. Sized
+ * just past the cap so the tail spills into a second grid row; every element
+ * must be summed exactly once (no skipped tail, no double-count).
+ */
+async function flatOverflowGate(gpu: WebGPUBackend) {
+  const n = MAX_WG * 256 + 777; // 65535*256 + 777 -> ceilDiv(n,256) = 65538 > cap
+  const a = Tensor.zeros([n]);
+  const b = Tensor.zeros([n]);
+  for (let i = 0; i < n; i++) {
+    a.data[i] = 1;
+    b.data[i] = 2;
+  }
+  gpu.install();
+  let ok = true;
+  try {
+    const y = add(a, b);
+    await gpu.sync([y]);
+    let bad = 0;
+    for (let i = 0; i < n; i++) if (y.data[i] !== 3) bad++;
+    ok = bad === 0;
+    if (!ok) failures++;
+    console.log(`  ${ok ? "ok " : "FAIL"} dispatch 2-D fold, flat (add n=${n}, ${bad} wrong)`);
+  } finally {
+    gpu.uninstall();
+  }
 }
 
 /** Finite differences straight against GPU forwards (samples a few elements). */
@@ -404,6 +434,20 @@ async function main() {
   }
   await gpuMatmulFdCheck(gpu);
   await profilerSmoke(gpu);
+  await flatOverflowGate(gpu);
+  {
+    // Row-per-workgroup 2-D fold: rmsNormHeads with rows = T*H past the cap.
+    const T = 8200, H = 8, hd = 4; // rows = 65600 > MAX_WG (65535)
+    const x = randTensor([T, H * hd], rng);
+    const w = Tensor.zeros([hd], true);
+    for (let i = 0; i < hd; i++) w.data[i] = 1 + 0.3 * randn(rng);
+    await opCase(
+      gpu,
+      "dispatch 2-D fold, rows (rmsNormHeads rows=65600)",
+      [x, w],
+      () => rmsNormHeads(x, w, T, H, hd, 1e-6),
+    );
+  }
 
   // 2. elementwise
   {

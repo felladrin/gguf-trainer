@@ -19,7 +19,7 @@
 // every param's update then reads, matching AdamW's clip-then-step order.
 
 import type { Tensor } from "../model/autograd.ts";
-import { bindF32, ceilDiv, f32lit } from "./webgpu.ts";
+import { bindF32, ceilDiv, f32lit, grid2D } from "./webgpu.ts";
 import type { GpuBuffer, WebGPUBackend } from "./webgpu.ts";
 import type { AdamOpts } from "../train/adam.ts";
 
@@ -113,7 +113,7 @@ const N: u32 = ${n}u;
 const B1: f32 = ${f32lit(beta1)}; const B2: f32 = ${f32lit(beta2)}; const EPS: f32 = ${f32lit(eps)};
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(n).roww}u + gid.x;
   if (i >= N) { return; }
   let g = GB[i] * SCALE[0];
   let m = B1 * MB[i] + (1.0 - B1) * g;

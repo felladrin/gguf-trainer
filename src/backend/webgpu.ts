@@ -121,6 +121,29 @@ export function ceilDiv(a: number, b: number): number {
   return Math.ceil(a / b);
 }
 
+/** WebGPU's per-dimension workgroup-count cap (spec default, and what Metal/M1 reports). */
+export const MAX_WG = 65535;
+
+/**
+ * Split a 1-D per-element dispatch of `n` items (256 threads/workgroup) into a
+ * 2-D workgroup grid that stays under MAX_WG per dimension. `roww` (= gridX·256)
+ * is baked into the kernel so it rebuilds the flat index as `gid.y*roww + gid.x`.
+ * A flat ceilDiv(n,256) grid overflows past ~16.7M elements — reached by SwiGLU
+ * on [T,ffn], cross-entropy on [T,V], or a large embedding at long context /
+ * large vocab. Below the cap this is identical to a 1-D dispatch (gridY=1).
+ */
+export function grid2D(n: number): { x: number; y: number; roww: number } {
+  const total = Math.max(1, ceilDiv(n, 256));
+  const x = Math.min(total, MAX_WG);
+  return { x, y: ceilDiv(total, x), roww: x * 256 };
+}
+
+/** 2-D grid for one-workgroup-per-row kernels (rmsNorm): row = wg.y*gridX + wg.x. */
+export function gridRows(rows: number): { x: number; y: number } {
+  const x = Math.min(Math.max(1, rows), MAX_WG);
+  return { x, y: ceilDiv(Math.max(1, rows), x) };
+}
+
 /** Format a JS number as a WGSL f32 literal. */
 export function f32lit(v: number): string {
   const s = String(v);
@@ -276,7 +299,7 @@ ${bindings.join("\n")}
 const N: u32 = ${n}u;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(n).roww}u + gid.x;
   if (i >= N) { return; }
   ${body}
 }`;
@@ -288,17 +311,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * rmsNormHeads: a [T, H*hd] tensor per-head-normalized is exactly rmsNorm on
  * a [T*H, hd] view because rows are contiguous.
  */
-function srcRmsNormFwd(d: number, eps: number): string {
+function srcRmsNormFwd(rows: number, d: number, eps: number): string {
   return `
 ${bindF32(0, "XB", "read")}
 ${bindF32(1, "WB", "read")}
 ${bindF32(2, "YB", "read_write")}
 ${bindF32(3, "RINV", "read_write")}
-const D: u32 = ${d}u; const EPS: f32 = ${f32lit(eps)};
+const D: u32 = ${d}u; const ROWS: u32 = ${rows}u; const EPS: f32 = ${f32lit(eps)};
 var<workgroup> red: array<f32, 128>;
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: vec3<u32>) {
-  let row = wg.x;
+  let row = wg.y * ${gridRows(rows).x}u + wg.x;
+  if (row >= ROWS) { return; } // whole workgroup: row is uniform, no barrier reached
   let lid = li.x;
   var s = 0.0;
   for (var j = lid; j < D; j += 128u) { let v = XB[row * D + j]; s = s + v * v; }
@@ -318,18 +342,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: 
 }
 
 /** RMSNorm backward wrt x. Same row-parallel shape as forward; S = Σ g·w·x. */
-function srcRmsNormBwdX(d: number): string {
+function srcRmsNormBwdX(rows: number, d: number): string {
   return `
 ${bindF32(0, "XB", "read")}
 ${bindF32(1, "WB", "read")}
 ${bindF32(2, "GB", "read")}
 ${bindF32(3, "RINV", "read")}
 ${bindF32(4, "DX", "read_write")}
-const D: u32 = ${d}u;
+const D: u32 = ${d}u; const ROWS: u32 = ${rows}u;
 var<workgroup> red: array<f32, 128>;
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: vec3<u32>) {
-  let row = wg.x;
+  let row = wg.y * ${gridRows(rows).x}u + wg.x;
+  if (row >= ROWS) { return; } // whole workgroup: row is uniform, no barrier reached
   let lid = li.x;
   var s = 0.0;
   for (var j = lid; j < D; j += 128u) {
@@ -382,7 +407,7 @@ ${bindF32(2, "YB", "read_write")}
 const N: u32 = ${T * d}u; const D: u32 = ${d}u;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(T * d).roww}u + gid.x;
   if (i >= N) { return; }
   let t = i / D;
   let j = i % D;
@@ -403,7 +428,7 @@ ${bindF32(2, "DW", "read_write")}
 const N: u32 = ${V * d}u; const D: u32 = ${d}u; const T: u32 = ${T}u;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(V * d).roww}u + gid.x;
   if (i >= N) { return; }
   let v = i / D;
   let j = i % D;
@@ -438,7 +463,7 @@ const HALF: u32 = ${half}u; const ROW: u32 = ${H * hd}u;
 const BASE: f32 = ${f32lit(base)}; const POS: f32 = ${f32lit(posOffset)};
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(T * H * half).roww}u + gid.x;
   if (i >= N) { return; }
   let j = i % HALF;
   let th = i / HALF;
@@ -917,7 +942,7 @@ ${bindF32(4, "DLOG", "read_write")}
 const N: u32 = ${T * V}u; const T: u32 = ${T}u; const V: u32 = ${V}u;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.y * ${grid2D(T * V).roww}u + gid.x;
   if (i >= N) { return; }
   let t = i / V;
   let tgt = TGT[t];
@@ -1612,11 +1637,11 @@ export class WebGPUBackend implements OpsBackend {
     const ew = this.entryFor(weight);
     const { t: out, e: eo } = this.makeOut(outShape, [x, weight]);
     const rInv = this.acquireTransient(rows * 4);
-    this.dispatch(srcRmsNormFwd(d, eps), [ex.data, ew.data, eo.data, rInv], rows);
+    this.dispatch(srcRmsNormFwd(rows, d, eps), [ex.data, ew.data, eo.data, rInv], rows);
     out._backward = () => {
       this.ensureBackwardBegun();
       this.curLabel = "rmsnorm";
-      this.dispatch(srcRmsNormBwdX(d), [ex.data, ew.data, eo.grad, rInv, ex.grad], rows);
+      this.dispatch(srcRmsNormBwdX(rows, d), [ex.data, ew.data, eo.grad, rInv, ex.grad], rows);
       this.dispatch(
         srcRmsNormBwdW(rows, d),
         [ex.data, eo.grad, rInv, ew.grad],
@@ -1666,6 +1691,17 @@ export class WebGPUBackend implements OpsBackend {
     label: string,
   ) {
     if (!this.enc) this.enc = this.device.createCommandEncoder();
+    // Fold an x-workgroup count over the per-dimension cap into a 2-D grid. The
+    // overflow-capable kernels (elementwise, rmsNorm rows, embedding, rope,
+    // cross-entropy, AdamW) bake the matching gridX via grid2D/gridRows to
+    // rebuild their index as gid.y*gridX*256 + gid.x; kernels that stay under
+    // the cap dispatch unchanged (gy stays 1).
+    let gx = x, gy = y;
+    if (x > MAX_WG) {
+      if (y !== 1) throw new Error(`dispatch x=${x} exceeds the workgroup cap with y=${y}`);
+      gx = MAX_WG;
+      gy = ceilDiv(x, MAX_WG);
+    }
     const pr = this.prof;
     if (pr) {
       this.endPass();
@@ -1684,14 +1720,14 @@ export class WebGPUBackend implements OpsBackend {
       const pass = this.enc.beginComputePass(ts ? { timestampWrites: ts } : undefined);
       pass.setPipeline(p);
       pass.setBindGroup(0, group);
-      pass.dispatchWorkgroups(x, y, z);
+      pass.dispatchWorkgroups(gx, gy, z);
       pass.end();
       return;
     }
     if (!this.pass) this.pass = this.enc.beginComputePass();
     this.pass.setPipeline(p);
     this.pass.setBindGroup(0, group);
-    this.pass.dispatchWorkgroups(x, y, z);
+    this.pass.dispatchWorkgroups(gx, gy, z);
   }
 
   private endPass() {
