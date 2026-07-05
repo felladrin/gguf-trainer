@@ -114,6 +114,36 @@ async function opCase(
   console.log(`  ${ok ? "ok " : "FAIL"} ${name}`);
 }
 
+/**
+ * timestamp-query profiler smoke check: a profiled forward must attribute time
+ * to the right op labels, with sane counts and no slot overflow. Numerics are
+ * covered by every other case (profiling is a no-op on results); this only
+ * guards the profiling plumbing. Skips cleanly when the device lacks the feature.
+ */
+async function profilerSmoke(gpu: WebGPUBackend) {
+  if (!gpu.timestampSupported) {
+    console.log("  skip timestamp-query profiler (feature unavailable)");
+    return;
+  }
+  const x = randTensor([40, 48], mulberry32(5));
+  const w = randTensor([40, 48], mulberry32(6));
+  gpu.install();
+  let ok = true;
+  try {
+    gpu.startProfile(64);
+    const y = silu(linear(x, w));
+    await gpu.sync([y]);
+    const { kernels, overflow } = gpu.stopProfile();
+    const labels = new Set(kernels.map((k) => k.label));
+    ok = kernels.length > 0 && labels.has("linear") && labels.has("silu") && !overflow &&
+      kernels.every((k) => k.ms >= 0 && k.count > 0);
+  } finally {
+    gpu.uninstall();
+  }
+  if (!ok) failures++;
+  console.log(`  ${ok ? "ok " : "FAIL"} timestamp-query profiler (labels + times)`);
+}
+
 /** Finite differences straight against GPU forwards (samples a few elements). */
 async function gpuMatmulFdCheck(gpu: WebGPUBackend) {
   const rng = mulberry32(31337);
@@ -365,7 +395,15 @@ async function main() {
     const w = randTensor([37, 48], rng);
     await opCase(gpu, "linear (33x48 · 37x48ᵀ, tiled)", [x, w], () => linear(x, w));
   }
+  {
+    // Straddles the register-tiled block dims (BM=BN=64, BK=8) in all three
+    // axes with remainders: 2 row-blocks + tail, 2 col-blocks + tail, 10 K-steps.
+    const x = randTensor([70, 80], rng);
+    const w = randTensor([75, 80], rng);
+    await opCase(gpu, "linear (70x80 · 75x80ᵀ, multi-block)", [x, w], () => linear(x, w));
+  }
   await gpuMatmulFdCheck(gpu);
+  await profilerSmoke(gpu);
 
   // 2. elementwise
   {

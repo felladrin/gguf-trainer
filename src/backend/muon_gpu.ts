@@ -233,18 +233,19 @@ function buildNewtonSchulz(
   const r = flip ? n : m;
   const c = flip ? m : n;
   const groups = reduceGroups(size);
+  const L = "muon"; // profiling label for every Newton–Schulz dispatch
   const ops = [
-    gpu.prepareDispatch(srcSumSqPartial(size, groups), [ns.U, ns.PART], groups),
-    gpu.prepareDispatch(srcSumSqFinal(groups), [ns.PART, ns.NORM], 1),
-    gpu.prepareDispatch(srcNormalize(m, n, flip), [ns.U, ns.NORM, ns.X], ceilDiv(size, 256)),
+    gpu.prepareDispatch(srcSumSqPartial(size, groups), [ns.U, ns.PART], groups, 1, L),
+    gpu.prepareDispatch(srcSumSqFinal(groups), [ns.PART, ns.NORM], 1, 1, L),
+    gpu.prepareDispatch(srcNormalize(m, n, flip), [ns.U, ns.NORM, ns.X], ceilDiv(size, 256), 1, L),
   ];
   for (let s = 0; s < steps; s++) {
     ops.push(
-      gpu.prepareGemm("NT", false, r, r, c, ns.X, ns.X, ns.A), // A = X·Xᵀ
-      gpu.prepareGemm("NN", false, r, r, r, ns.A, ns.A, ns.AA), // AA = A²
-      gpu.prepareDispatch(srcCombineA(r * r), [ns.A, ns.AA], ceilDiv(r * r, 256)),
-      gpu.prepareGemm("NN", false, r, c, r, ns.A, ns.X, ns.BX), // BX = B·X
-      gpu.prepareDispatch(srcCombineX(size), [ns.X, ns.BX], ceilDiv(size, 256)),
+      gpu.prepareGemm("NT", false, r, r, c, ns.X, ns.X, ns.A, L), // A = X·Xᵀ
+      gpu.prepareGemm("NN", false, r, r, r, ns.A, ns.A, ns.AA, L), // AA = A²
+      gpu.prepareDispatch(srcCombineA(r * r), [ns.A, ns.AA], ceilDiv(r * r, 256), 1, L),
+      gpu.prepareGemm("NN", false, r, c, r, ns.A, ns.X, ns.BX, L), // BX = B·X
+      gpu.prepareDispatch(srcCombineX(size), [ns.X, ns.BX], ceilDiv(size, 256), 1, L),
     );
   }
   return ops;
@@ -325,12 +326,16 @@ export class MuonGpu {
           srcMomentum(p.size, momentum, nesterov),
           [bufs.grad, buf, ns.U],
           ceilDiv(p.size, 256),
+          1,
+          "muon",
         ),
         ...buildNewtonSchulz(gpu, ns, m, n, nsSteps),
         gpu.prepareDispatch(
           srcApply(m, n, m > n, scale),
           [bufs.data, ns.X, this.lrBuf],
           ceilDiv(p.size, 256),
+          1,
+          "muon",
         ),
       );
     }

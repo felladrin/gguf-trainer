@@ -33,7 +33,13 @@ import type { OpsBackend } from "../model/autograd.ts";
 // lib configs, and this file must merely type-check everywhere (it only *runs*
 // where navigator.gpu exists). Numeric usage flags are fixed by the WebGPU spec.
 
-const USAGE = { MAP_READ: 0x0001, COPY_SRC: 0x0004, COPY_DST: 0x0008, STORAGE: 0x0080 } as const;
+const USAGE = {
+  MAP_READ: 0x0001,
+  COPY_SRC: 0x0004,
+  COPY_DST: 0x0008,
+  STORAGE: 0x0080,
+  QUERY_RESOLVE: 0x0200,
+} as const;
 const MAP_MODE_READ = 0x0001;
 
 export interface GpuBuffer {
@@ -51,8 +57,16 @@ interface GpuComputePass {
   dispatchWorkgroups(x: number, y?: number, z?: number): void;
   end(): void;
 }
+interface GpuQuerySet {
+  destroy(): void;
+}
+interface TimestampWrites {
+  querySet: GpuQuerySet;
+  beginningOfPassWriteIndex: number;
+  endOfPassWriteIndex: number;
+}
 interface GpuCommandEncoder {
-  beginComputePass(): GpuComputePass;
+  beginComputePass(desc?: { timestampWrites?: TimestampWrites }): GpuComputePass;
   clearBuffer(buffer: GpuBuffer): void;
   copyBufferToBuffer(
     src: GpuBuffer,
@@ -60,6 +74,13 @@ interface GpuCommandEncoder {
     dst: GpuBuffer,
     dstOff: number,
     size: number,
+  ): void;
+  resolveQuerySet(
+    querySet: GpuQuerySet,
+    firstQuery: number,
+    queryCount: number,
+    dst: GpuBuffer,
+    dstOffset: number,
   ): void;
   finish(): unknown;
 }
@@ -73,10 +94,19 @@ interface GpuDevice {
   createComputePipeline(desc: unknown): GpuPipeline;
   createBindGroup(desc: unknown): unknown;
   createCommandEncoder(): GpuCommandEncoder;
+  createQuerySet(desc: { type: string; count: number }): GpuQuerySet;
   queue: GpuQueue;
   limits?: { maxStorageBufferBindingSize?: number };
+  features?: { has(name: string): boolean };
   lost?: Promise<{ message?: string }>;
   onuncapturederror?: ((ev: { error?: { message?: string } }) => void) | null;
+}
+
+/** One kernel's accumulated GPU time from timestamp-query profiling. */
+export interface KernelTime {
+  label: string;
+  ms: number; // total GPU time across all dispatches in the profiled window
+  count: number; // number of dispatches attributed to this label
 }
 
 interface Entry {
@@ -146,13 +176,28 @@ function bindU32(i: number, name: string): string {
   return `@group(0) @binding(${i}) var<storage, read> ${name}: array<u32>;`;
 }
 
+// Register-tiled GEMM block dims. A workgroup computes a BM×BN output tile in
+// BK-deep K steps; each of its (BM/TM)×(BN/TN) threads owns a TM×TN micro-tile
+// of accumulators, so every value staged into shared memory is reused across TM
+// (or TN) MACs instead of one — the arithmetic-intensity lever that lifts this
+// off the "SMEM-tiled, 1 output/thread" rung. Single-sourced with the dispatch
+// grid (gemm/prepareGemm below) so block size and workgroup count never drift.
+const GEMM_BM = 64, GEMM_BN = 64, GEMM_BK = 8, GEMM_TM = 4, GEMM_TN = 4;
+const GEMM_WG = (GEMM_BM / GEMM_TM) * (GEMM_BN / GEMM_TN); // threads/workgroup (256)
+
 /**
- * Tiled 16x16 GEMM: C[M,N] = sum_k A'[m,k] * B'[k,n], optionally accumulating
+ * Register-tiled GEMM: C[M,N] = sum_k A'[m,k] * B'[k,n], optionally accumulating
  * into C. Transpose flavors cover the forward and both backward products of
  * `linear` without ever materializing a transposed matrix:
  *   NT: A stored [M,K], B stored [N,K]   (y = x·Wᵀ)
  *   NN: A stored [M,K], B stored [K,N]   (dX = dY·W)
  *   TN: A stored [K,M], B stored [K,N]   (dW = dYᵀ·x)
+ * The TM×TN accumulator tile and its A/B fragments are UNROLLED into named
+ * scalars (acc0_0 … acc{TM-1}_{TN-1}): a WGSL array indexed by loop variables is
+ * not promoted to registers, so a rolled version spills the accumulators to
+ * memory and runs *slower* than the 1-output/thread kernel (measured ~3× on
+ * M1 Max). Bounds are guarded per load and per store, so M/N/K need not be
+ * multiples of the block dims (the parity suite covers tiny, odd, multi-block).
  */
 function srcGemm(
   kind: "NT" | "NN" | "TN",
@@ -161,39 +206,67 @@ function srcGemm(
   N: number,
   K: number,
 ): string {
-  const aLoad = kind === "TN" ? "AB[ka * M + m]" : "AB[m * K + ka]";
-  const bLoad = kind === "NT" ? "BB[n * K + kb]" : "BB[kb * N + n]";
-  const store = accum ? "CB[m * N + n] = CB[m * N + n] + acc;" : "CB[m * N + n] = acc;";
+  const [BM, BN, BK, TM, TN, WG] = [GEMM_BM, GEMM_BN, GEMM_BK, GEMM_TM, GEMM_TN, GEMM_WG];
+  // gr = global row (m), gc = global col (n), gk = global k index.
+  const aLoad = kind === "TN" ? "AB[gk * M + gr]" : "AB[gr * K + gk]";
+  const bLoad = kind === "NT" ? "BB[gc * K + gk]" : "BB[gk * N + gc]";
+  // Unroll the tile so every accumulator/fragment is a compile-time-named
+  // scalar (stays in registers) rather than a dynamically-indexed array.
+  let decl = "", fragA = "", fragB = "", macs = "", stores = "";
+  for (let i = 0; i < TM; i++) fragA += `      let a${i} = As[(tRow + ${i}u) * ${BK}u + kc];\n`;
+  for (let j = 0; j < TN; j++) fragB += `      let b${j} = Bs[kc * ${BN}u + tCol + ${j}u];\n`;
+  for (let i = 0; i < TM; i++) {
+    for (let j = 0; j < TN; j++) {
+      decl += `  var acc${i}_${j} = 0.0;\n`;
+      macs += `      acc${i}_${j} = acc${i}_${j} + a${i} * b${j};\n`;
+      const idx = `(blockRow + tRow + ${i}u) * N + (blockCol + tCol + ${j}u)`;
+      const rhs = accum ? `CB[ci] + acc${i}_${j}` : `acc${i}_${j}`;
+      stores += `  if (blockRow + tRow + ${i}u < M && blockCol + tCol + ${j}u < N) ` +
+        `{ let ci = ${idx}; CB[ci] = ${rhs}; }\n`;
+    }
+  }
   return `
 ${bindF32(0, "AB", "read")}
 ${bindF32(1, "BB", "read")}
 ${bindF32(2, "CB", "read_write")}
 const M: u32 = ${M}u; const N: u32 = ${N}u; const K: u32 = ${K}u;
-var<workgroup> As: array<f32, 256>;
-var<workgroup> Bs: array<f32, 256>;
-@compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: vec3<u32>) {
-  let m = wg.y * 16u + li.y;
-  let n = wg.x * 16u + li.x;
-  var acc = 0.0;
-  let tiles = (K + 15u) / 16u;
-  for (var tt = 0u; tt < tiles; tt++) {
-    let ka = tt * 16u + li.x;
-    var av = 0.0;
-    if (m < M && ka < K) { av = ${aLoad}; }
-    As[li.y * 16u + li.x] = av;
-    let kb = tt * 16u + li.y;
-    var bv = 0.0;
-    if (n < N && kb < K) { bv = ${bLoad}; }
-    Bs[li.y * 16u + li.x] = bv;
-    workgroupBarrier();
-    for (var k = 0u; k < 16u; k++) {
-      acc = acc + As[li.y * 16u + k] * Bs[k * 16u + li.x];
+var<workgroup> As: array<f32, ${BM * BK}>;
+var<workgroup> Bs: array<f32, ${BK * BN}>;
+@compute @workgroup_size(${WG})
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+  let blockRow = wg.y * ${BM}u;
+  let blockCol = wg.x * ${BN}u;
+  let tRow = (lidx / ${BN / TN}u) * ${TM}u; // this thread's first row in the tile
+  let tCol = (lidx % ${BN / TN}u) * ${TN}u; // this thread's first col in the tile
+${decl}  var kk = 0u;
+  loop {
+    if (kk >= K) { break; }
+    // Cooperatively stage the A and B tiles (grid-strided).
+    for (var t = lidx; t < ${BM * BK}u; t += ${WG}u) {
+      let r = t / ${BK}u;
+      let kc = t % ${BK}u;
+      let gr = blockRow + r;
+      let gk = kk + kc;
+      var v = 0.0;
+      if (gr < M && gk < K) { v = ${aLoad}; }
+      As[r * ${BK}u + kc] = v;
+    }
+    for (var t = lidx; t < ${BK * BN}u; t += ${WG}u) {
+      let kc = t / ${BN}u;
+      let c = t % ${BN}u;
+      let gk = kk + kc;
+      let gc = blockCol + c;
+      var v = 0.0;
+      if (gk < K && gc < N) { v = ${bLoad}; }
+      Bs[kc * ${BN}u + c] = v;
     }
     workgroupBarrier();
+    for (var kc = 0u; kc < ${BK}u; kc++) {
+${fragA}${fragB}${macs}    }
+    workgroupBarrier();
+    kk = kk + ${BK}u;
   }
-  if (m < M && n < N) { ${store} }
-}`;
+${stores}}`;
 }
 
 /** Elementwise kernel over N threads; body sees index `i`. */
@@ -858,8 +931,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // --- The backend ---------------------------------------------------------------
 
+// timestamp-query profiling state. When active, each dispatch runs in its own
+// compute pass with a begin/end timestamp pair; ms accumulate per curLabel.
+interface Profiler {
+  qs: GpuQuerySet;
+  resolve: GpuBuffer; // QUERY_RESOLVE | COPY_SRC
+  read: GpuBuffer; // COPY_DST | MAP_READ
+  capPairs: number; // max (begin,end) pairs = querySet.count / 2
+  idx: number; // next free timestamp slot (2 per profiled dispatch)
+  labels: string[]; // label per recorded pair, in slot order
+  totals: Map<string, { ms: number; count: number }>;
+  overflow: boolean; // ran out of query slots this window (reported, not silent)
+}
+
 export class WebGPUBackend implements OpsBackend {
   readonly adapterName: string;
+  /** Whether the device granted the timestamp-query feature (see startProfile). */
+  readonly timestampSupported: boolean;
   /**
    * Context-length threshold for the flash-style attention kernels. Below this
    * T, the materialized [Hq,T,T] kernels win because flash's one-thread-per-row
@@ -885,12 +973,16 @@ export class WebGPUBackend implements OpsBackend {
   private pass: GpuComputePass | null = null;
   private backwardBegun = false;
   private deviceError: string | null = null;
+  /** Label attributed to dispatches recorded via dispatch() (profiling only). */
+  private curLabel = "";
+  private prof: Profiler | null = null;
 
-  constructor(device: GpuDevice, adapterName: string) {
+  constructor(device: GpuDevice, adapterName: string, timestampSupported = false) {
     this.device = device;
     this.queue = device.queue;
     this.pool = new BufferPool(device);
     this.adapterName = adapterName;
+    this.timestampSupported = timestampSupported;
     device.lost?.then((info) => {
       this.deviceError = `WebGPU device lost: ${info?.message ?? "unknown"}`;
     });
@@ -952,6 +1044,14 @@ export class WebGPUBackend implements OpsBackend {
     }
     this.lastSyncReadbackBytes = stagings.reduce((a, s) => a + s.dst.length * 4, 0);
 
+    // Resolve any profiling timestamps recorded this window into a mappable
+    // buffer, ordered after all timed passes in this same encoder.
+    const profTs = this.prof ? this.prof.idx : 0;
+    if (this.prof && profTs > 0) {
+      this.enc.resolveQuerySet(this.prof.qs, 0, profTs, this.prof.resolve, 0);
+      this.enc.copyBufferToBuffer(this.prof.resolve, 0, this.prof.read, 0, profTs * 8);
+    }
+
     this.submit();
     await Promise.all(stagings.map((s) => s.stage.mapAsync(MAP_MODE_READ)));
     for (const s of stagings) {
@@ -959,6 +1059,7 @@ export class WebGPUBackend implements OpsBackend {
       s.stage.unmap();
       s.stage.destroy();
     }
+    if (this.prof && profTs > 0) await this.readProfile(profTs);
 
     // The mapAsync completions above prove all submitted work finished, so
     // every transient buffer is idle and safe to recycle.
@@ -976,10 +1077,73 @@ export class WebGPUBackend implements OpsBackend {
     this.pool.destroyAll();
   }
 
+  // --- timestamp-query profiling -------------------------------------------------
+
+  /**
+   * Begin per-kernel GPU-time profiling: until stopProfile(), each dispatch runs
+   * in its own compute pass with a begin/end timestamp pair, attributed to its
+   * op label, and the deltas accumulate across every sync() window. Numerically
+   * a no-op (same kernels, buffers, and order — only pass batching changes).
+   * Requires the device to have granted timestamp-query (see initWebGPU).
+   * `capDispatches` bounds how many dispatches a single sync() window can time;
+   * running past it sets the overflow flag stopProfile() returns (never silent).
+   */
+  startProfile(capDispatches = 4096) {
+    if (!this.timestampSupported) throw new Error("timestamp-query not available on this device");
+    if (this.prof) return;
+    const bytes = capDispatches * 2 * 8;
+    this.prof = {
+      qs: this.device.createQuerySet({ type: "timestamp", count: capDispatches * 2 }),
+      resolve: this.device.createBuffer({
+        size: bytes,
+        usage: USAGE.QUERY_RESOLVE | USAGE.COPY_SRC,
+      }),
+      read: this.device.createBuffer({ size: bytes, usage: USAGE.COPY_DST | USAGE.MAP_READ }),
+      capPairs: capDispatches,
+      idx: 0,
+      labels: [],
+      totals: new Map(),
+      overflow: false,
+    };
+  }
+
+  /** End profiling and return per-label GPU time (ms), largest first. */
+  stopProfile(): { kernels: KernelTime[]; overflow: boolean } {
+    const pr = this.prof;
+    if (!pr) return { kernels: [], overflow: false };
+    this.prof = null;
+    const kernels = [...pr.totals]
+      .map(([label, v]) => ({ label, ms: v.ms, count: v.count }))
+      .sort((a, b) => b.ms - a.ms);
+    pr.qs.destroy();
+    pr.resolve.destroy();
+    pr.read.destroy();
+    return { kernels, overflow: pr.overflow };
+  }
+
+  /** Drain the timestamps resolved this sync() into per-label totals. */
+  private async readProfile(count: number) {
+    const pr = this.prof!;
+    await pr.read.mapAsync(MAP_MODE_READ);
+    const ts = new BigUint64Array(pr.read.getMappedRange(), 0, count);
+    const pairs = count >> 1;
+    for (let i = 0; i < pairs; i++) {
+      const label = pr.labels[i] ?? "?";
+      const t = pr.totals.get(label) ?? { ms: 0, count: 0 };
+      if (ts[i * 2 + 1] > ts[i * 2]) t.ms += Number(ts[i * 2 + 1] - ts[i * 2]) / 1e6;
+      t.count += 1;
+      pr.totals.set(label, t);
+    }
+    pr.read.unmap();
+    pr.idx = 0;
+    pr.labels = [];
+  }
+
   // --- ops (OpsBackend) ---------------------------------------------------------
 
   linear(x: Tensor, w: Tensor): Tensor {
     this.beginForwardOp();
+    this.curLabel = "linear";
     const [T, inDim] = x.shape;
     const [outDim, inDim2] = w.shape;
     if (inDim !== inDim2) throw new Error(`linear dim mismatch ${inDim} vs ${inDim2}`);
@@ -989,6 +1153,7 @@ export class WebGPUBackend implements OpsBackend {
     this.gemm("NT", false, T, outDim, inDim, ex.data, ew.data, eo.data);
     out._backward = () => {
       this.ensureBackwardBegun();
+      this.curLabel = "linear";
       this.gemm("NN", true, T, inDim, outDim, eo.grad, ew.data, ex.grad);
       this.gemm("TN", true, outDim, inDim, T, eo.grad, ex.data, ew.grad);
     };
@@ -997,6 +1162,7 @@ export class WebGPUBackend implements OpsBackend {
 
   add(a: Tensor, b: Tensor): Tensor {
     this.beginForwardOp();
+    this.curLabel = "add";
     const ea = this.entryFor(a);
     const eb = this.entryFor(b);
     const { t: out, e: eo } = this.makeOut(a.shape, [a, b]);
@@ -1012,6 +1178,7 @@ export class WebGPUBackend implements OpsBackend {
     );
     out._backward = () => {
       this.ensureBackwardBegun();
+      this.curLabel = "add";
       this.dispatch(
         srcElementwise(
           [
@@ -1031,6 +1198,7 @@ export class WebGPUBackend implements OpsBackend {
 
   mul(a: Tensor, b: Tensor): Tensor {
     this.beginForwardOp();
+    this.curLabel = "mul";
     const ea = this.entryFor(a);
     const eb = this.entryFor(b);
     const { t: out, e: eo } = this.makeOut(a.shape, [a, b]);
@@ -1046,6 +1214,7 @@ export class WebGPUBackend implements OpsBackend {
     );
     out._backward = () => {
       this.ensureBackwardBegun();
+      this.curLabel = "mul";
       this.dispatch(
         srcElementwise(
           [
@@ -1067,6 +1236,7 @@ export class WebGPUBackend implements OpsBackend {
 
   silu(x: Tensor): Tensor {
     this.beginForwardOp();
+    this.curLabel = "silu";
     const ex = this.entryFor(x);
     const { t: out, e: eo } = this.makeOut(x.shape, [x]);
     const n = out.size;
@@ -1081,6 +1251,7 @@ export class WebGPUBackend implements OpsBackend {
     );
     out._backward = () => {
       this.ensureBackwardBegun();
+      this.curLabel = "silu";
       // Recompute sigmoid from the saved input instead of stashing it — one
       // fewer buffer, and the input is alive in the graph anyway.
       this.dispatch(
@@ -1108,6 +1279,7 @@ export class WebGPUBackend implements OpsBackend {
 
   embedding(weight: Tensor, ids: number[]): Tensor {
     this.beginForwardOp();
+    this.curLabel = "embedding";
     const [V, d] = weight.shape;
     const T = ids.length;
     const ew = this.entryFor(weight);
@@ -1116,6 +1288,7 @@ export class WebGPUBackend implements OpsBackend {
     this.dispatch(srcEmbeddingFwd(T, d), [ew.data, idsBuf, eo.data], ceilDiv(T * d, 256));
     out._backward = () => {
       this.ensureBackwardBegun();
+      this.curLabel = "embedding";
       this.dispatch(srcEmbeddingBwd(T, d, V), [idsBuf, eo.grad, ew.grad], ceilDiv(V * d, 256));
     };
     return out;
@@ -1123,12 +1296,14 @@ export class WebGPUBackend implements OpsBackend {
 
   rope(x: Tensor, T: number, H: number, hd: number, base: number, posOffset: number): Tensor {
     this.beginForwardOp();
+    this.curLabel = "rope";
     const ex = this.entryFor(x);
     const { t: out, e: eo } = this.makeOut([T, H * hd], [x]);
     const n = T * H * (hd / 2);
     this.dispatch(srcRope(T, H, hd, base, posOffset, false), [ex.data, eo.data], ceilDiv(n, 256));
     out._backward = () => {
       this.ensureBackwardBegun();
+      this.curLabel = "rope";
       this.dispatch(srcRope(T, H, hd, base, posOffset, true), [eo.grad, ex.grad], ceilDiv(n, 256));
     };
     return out;
@@ -1144,6 +1319,7 @@ export class WebGPUBackend implements OpsBackend {
     hd: number,
   ): Tensor {
     this.beginForwardOp();
+    this.curLabel = "attention";
     const a: AttnDims = { T, Hq, Hkv, hd };
     const eq = this.entryFor(q);
     const ek = this.entryFor(k);
@@ -1161,6 +1337,7 @@ export class WebGPUBackend implements OpsBackend {
       );
       out._backward = () => {
         this.ensureBackwardBegun();
+        this.curLabel = "attention";
         const dRow = this.acquireTransient(Hq * T * 4);
         this.dispatch(srcAttnBwdD(a), [eo.grad, eo.data, dRow], ceilDiv(Hq * T, 64));
         this.dispatch(
@@ -1183,6 +1360,7 @@ export class WebGPUBackend implements OpsBackend {
       this.dispatch(srcAttnOut(a), [probs, ev.data, eo.data], ceilDiv(T * Hq * hd, 64));
       out._backward = () => {
         this.ensureBackwardBegun();
+        this.curLabel = "attention";
         const dScore = this.acquireTransient(Hq * T * T * 4);
         this.dispatch(srcAttnDScore(a), [eo.grad, ev.data, probs, dScore], ceilDiv(Hq * T, 64));
         this.dispatch(srcAttnDq(a), [dScore, ek.data, eq.grad], ceilDiv(T * Hq * hd, 64));
@@ -1195,6 +1373,7 @@ export class WebGPUBackend implements OpsBackend {
 
   crossEntropy(logits: Tensor, targets: number[]): Tensor {
     this.beginForwardOp();
+    this.curLabel = "crossEntropy";
     const [T, V] = logits.shape;
     const el = this.entryFor(logits);
     const tgtBuf = this.uploadU32(targets); // a target of -1 uploads as 0xffffffff (ignore)
@@ -1210,6 +1389,7 @@ export class WebGPUBackend implements OpsBackend {
       // backward(loss, seed) already wrote the seed into the HOST grad array;
       // push it into the GPU-side loss grad after the grad clears are flushed.
       this.ensureBackwardBegun();
+      this.curLabel = "crossEntropy";
       this.queue.writeBuffer(eo.grad, 0, loss.grad);
       this.dispatch(srcCeBwd(T, V), [probs, tgtBuf, eo.grad, divBuf, el.grad], ceilDiv(T * V, 256));
     };
@@ -1303,19 +1483,10 @@ export class WebGPUBackend implements OpsBackend {
    * dispatches every step, so this removes the dominant per-step encode cost
    * (measured: bind-group/source rebuilding was ~85% of the optimizer step).
    */
-  prepareDispatch(code: string, buffers: GpuBuffer[], x: number, y = 1): () => void {
+  prepareDispatch(code: string, buffers: GpuBuffer[], x: number, y = 1, label = ""): () => void {
     const p = this.pipeline(code);
-    const group = this.device.createBindGroup({
-      layout: p.getBindGroupLayout(0),
-      entries: buffers.map((buf, i) => ({ binding: i, resource: { buffer: buf } })),
-    });
-    return () => {
-      if (!this.enc) this.enc = this.device.createCommandEncoder();
-      if (!this.pass) this.pass = this.enc.beginComputePass();
-      this.pass.setPipeline(p);
-      this.pass.setBindGroup(0, group);
-      this.pass.dispatchWorkgroups(x, y, 1);
-    };
+    const group = this.bindGroup(p, buffers);
+    return () => this.recordDispatch(p, group, x, y, 1, label);
   }
 
   /** prepareDispatch for the tiled GEMM (flavors as in srcGemm). */
@@ -1328,12 +1499,14 @@ export class WebGPUBackend implements OpsBackend {
     a: GpuBuffer,
     b: GpuBuffer,
     c: GpuBuffer,
+    label = "",
   ): () => void {
     return this.prepareDispatch(
       srcGemm(kind, accum, M, N, K),
       [a, b, c],
-      ceilDiv(N, 16),
-      ceilDiv(M, 16),
+      ceilDiv(N, GEMM_BN),
+      ceilDiv(M, GEMM_BM),
+      label,
     );
   }
 
@@ -1417,7 +1590,12 @@ export class WebGPUBackend implements OpsBackend {
     b: GpuBuffer,
     c: GpuBuffer,
   ) {
-    this.dispatch(srcGemm(kind, accum, M, N, K), [a, b, c], ceilDiv(N, 16), ceilDiv(M, 16));
+    this.dispatch(
+      srcGemm(kind, accum, M, N, K),
+      [a, b, c],
+      ceilDiv(N, GEMM_BN),
+      ceilDiv(M, GEMM_BM),
+    );
   }
 
   private rmsNormRows(
@@ -1429,6 +1607,7 @@ export class WebGPUBackend implements OpsBackend {
     outShape: number[],
   ): Tensor {
     this.beginForwardOp();
+    this.curLabel = "rmsnorm";
     const ex = this.entryFor(x);
     const ew = this.entryFor(weight);
     const { t: out, e: eo } = this.makeOut(outShape, [x, weight]);
@@ -1436,6 +1615,7 @@ export class WebGPUBackend implements OpsBackend {
     this.dispatch(srcRmsNormFwd(d, eps), [ex.data, ew.data, eo.data, rInv], rows);
     out._backward = () => {
       this.ensureBackwardBegun();
+      this.curLabel = "rmsnorm";
       this.dispatch(srcRmsNormBwdX(d), [ex.data, ew.data, eo.grad, rInv, ex.grad], rows);
       this.dispatch(
         srcRmsNormBwdW(rows, d),
@@ -1458,14 +1638,57 @@ export class WebGPUBackend implements OpsBackend {
     return p;
   }
 
-  private dispatch(code: string, buffers: GpuBuffer[], x: number, y = 1, z = 1) {
-    const p = this.pipeline(code);
-    if (!this.enc) this.enc = this.device.createCommandEncoder();
-    if (!this.pass) this.pass = this.enc.beginComputePass();
-    const group = this.device.createBindGroup({
+  private bindGroup(p: GpuPipeline, buffers: GpuBuffer[]): unknown {
+    return this.device.createBindGroup({
       layout: p.getBindGroupLayout(0),
       entries: buffers.map((buf, i) => ({ binding: i, resource: { buffer: buf } })),
     });
+  }
+
+  private dispatch(code: string, buffers: GpuBuffer[], x: number, y = 1, z = 1) {
+    const p = this.pipeline(code);
+    this.recordDispatch(p, this.bindGroup(p, buffers), x, y, z, this.curLabel);
+  }
+
+  /**
+   * Record one dispatch into the shared encoder. Normally many dispatches share
+   * one open compute pass (batched, minimal overhead). While profiling, each
+   * dispatch instead runs in its own pass carrying a begin/end timestamp pair,
+   * attributed to `label`; the kernels, buffers, and order are identical, so
+   * results are unchanged — only the pass batching differs.
+   */
+  private recordDispatch(
+    p: GpuPipeline,
+    group: unknown,
+    x: number,
+    y: number,
+    z: number,
+    label: string,
+  ) {
+    if (!this.enc) this.enc = this.device.createCommandEncoder();
+    const pr = this.prof;
+    if (pr) {
+      this.endPass();
+      let ts: TimestampWrites | undefined;
+      if (pr.idx + 2 <= pr.capPairs * 2) {
+        ts = {
+          querySet: pr.qs,
+          beginningOfPassWriteIndex: pr.idx,
+          endOfPassWriteIndex: pr.idx + 1,
+        };
+        pr.labels.push(label || "?");
+        pr.idx += 2;
+      } else {
+        pr.overflow = true;
+      }
+      const pass = this.enc.beginComputePass(ts ? { timestampWrites: ts } : undefined);
+      pass.setPipeline(p);
+      pass.setBindGroup(0, group);
+      pass.dispatchWorkgroups(x, y, z);
+      pass.end();
+      return;
+    }
+    if (!this.pass) this.pass = this.enc.beginComputePass();
     this.pass.setPipeline(p);
     this.pass.setBindGroup(0, group);
     this.pass.dispatchWorkgroups(x, y, z);
@@ -1516,6 +1739,9 @@ export async function initWebGPU(): Promise<WebGPUBackend | null> {
   // exceed what it supports; fall back to the default-limits device on the
   // rare adapter that still rejects it, so WebGPU availability itself never
   // regresses.
+  // Opt into timestamp-query when the adapter offers it, so per-kernel GPU-time
+  // profiling (startProfile) is available; absence just disables profiling.
+  const wantTimestamp = !!adapter.features?.has?.("timestamp-query");
   let device: GpuDevice;
   try {
     device = await adapter.requestDevice({
@@ -1523,10 +1749,11 @@ export async function initWebGPU(): Promise<WebGPUBackend | null> {
         maxBufferSize: adapter.limits.maxBufferSize,
         maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       },
+      requiredFeatures: wantTimestamp ? ["timestamp-query"] : [],
     });
   } catch {
     device = await adapter.requestDevice();
   }
   const name = adapter.info?.description || adapter.info?.vendor || "unknown adapter";
-  return new WebGPUBackend(device, String(name));
+  return new WebGPUBackend(device, String(name), !!device.features?.has?.("timestamp-query"));
 }

@@ -168,11 +168,13 @@ export class AdamWGpu {
         const part = gpu.createStateBuffer(groups * 4);
         const bufs = gpu.buffersFor(p); // uploads host weights once; grad on device
         reductions.push(
-          gpu.prepareDispatch(srcSsqPartial(p.size, groups), [bufs.grad, part], groups),
-          gpu.prepareDispatch(srcSsqStore(groups, i), [part, ssq!], 1),
+          gpu.prepareDispatch(srcSsqPartial(p.size, groups), [bufs.grad, part], groups, 1, "adamw"),
+          gpu.prepareDispatch(srcSsqStore(groups, i), [part, ssq!], 1, 1, "adamw"),
         );
       });
-      reductions.push(gpu.prepareDispatch(srcClipScale(params.length, o.clip), [ssq, scale], 1));
+      reductions.push(
+        gpu.prepareDispatch(srcClipScale(params.length, o.clip), [ssq, scale], 1, 1, "adamw"),
+      );
     }
 
     const adam: (() => void)[] = params.map((p) => {
@@ -184,6 +186,8 @@ export class AdamWGpu {
         srcAdam(p.size, o.beta1, o.beta2, o.eps, o.weightDecay),
         [bufs.grad, m, v, bufs.data, this.hyp, scale],
         ceilDiv(p.size, 256),
+        1,
+        "adamw",
       );
     });
 
