@@ -228,11 +228,20 @@ function srcGemm(
   M: number,
   N: number,
   K: number,
+  f16 = false,
 ): string {
   const [BM, BN, BK, TM, TN, WG] = [GEMM_BM, GEMM_BN, GEMM_BK, GEMM_TM, GEMM_TN, GEMM_WG];
   // gr = global row (m), gc = global col (n), gk = global k index.
   const aLoad = kind === "TN" ? "AB[gk * M + gr]" : "AB[gr * K + gk]";
   const bLoad = kind === "NT" ? "BB[gc * K + gk]" : "BB[gk * N + gc]";
+  // Mixed precision: stage the tiles as f16 and multiply in f16 (2x ALU on
+  // hardware with packed f16, e.g. Strix Halo), but ACCUMULATE in f32 so the
+  // K-length reduction keeps full precision. Operands (activations/weights/grads)
+  // round to f16 for the multiply only; buffers, grads, and the optimizer stay
+  // f32, so no loss scaling is needed. sh = shared-tile scalar type.
+  const sh = f16 ? "f16" : "f32";
+  const toSh = f16 ? "f16(v)" : "v";
+  const prod = (i: number, j: number) => f16 ? `f32(a${i} * b${j})` : `a${i} * b${j}`;
   // Unroll the tile so every accumulator/fragment is a compile-time-named
   // scalar (stays in registers) rather than a dynamically-indexed array.
   let decl = "", fragA = "", fragB = "", macs = "", stores = "";
@@ -241,20 +250,20 @@ function srcGemm(
   for (let i = 0; i < TM; i++) {
     for (let j = 0; j < TN; j++) {
       decl += `  var acc${i}_${j} = 0.0;\n`;
-      macs += `      acc${i}_${j} = acc${i}_${j} + a${i} * b${j};\n`;
+      macs += `      acc${i}_${j} = acc${i}_${j} + ${prod(i, j)};\n`;
       const idx = `(blockRow + tRow + ${i}u) * N + (blockCol + tCol + ${j}u)`;
       const rhs = accum ? `CB[ci] + acc${i}_${j}` : `acc${i}_${j}`;
       stores += `  if (blockRow + tRow + ${i}u < M && blockCol + tCol + ${j}u < N) ` +
         `{ let ci = ${idx}; CB[ci] = ${rhs}; }\n`;
     }
   }
-  return `
+  return `${f16 ? "enable f16;\n" : ""}
 ${bindF32(0, "AB", "read")}
 ${bindF32(1, "BB", "read")}
 ${bindF32(2, "CB", "read_write")}
 const M: u32 = ${M}u; const N: u32 = ${N}u; const K: u32 = ${K}u;
-var<workgroup> As: array<f32, ${BM * BK}>;
-var<workgroup> Bs: array<f32, ${BK * BN}>;
+var<workgroup> As: array<${sh}, ${BM * BK}>;
+var<workgroup> Bs: array<${sh}, ${BK * BN}>;
 @compute @workgroup_size(${WG})
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
   let blockRow = wg.y * ${BM}u;
@@ -272,7 +281,7 @@ ${decl}  var kk = 0u;
       let gk = kk + kc;
       var v = 0.0;
       if (gr < M && gk < K) { v = ${aLoad}; }
-      As[r * ${BK}u + kc] = v;
+      As[r * ${BK}u + kc] = ${toSh};
     }
     for (var t = lidx; t < ${BK * BN}u; t += ${WG}u) {
       let kc = t / ${BN}u;
@@ -281,7 +290,7 @@ ${decl}  var kk = 0u;
       let gc = blockCol + c;
       var v = 0.0;
       if (gk < K && gc < N) { v = ${bLoad}; }
-      Bs[kc * ${BN}u + c] = v;
+      Bs[kc * ${BN}u + c] = ${toSh};
     }
     workgroupBarrier();
     for (var kc = 0u; kc < ${BK}u; kc++) {
@@ -1003,6 +1012,8 @@ export class WebGPUBackend implements OpsBackend {
   /** Label attributed to dispatches recorded via dispatch() (profiling only). */
   private curLabel = "";
   private prof: Profiler | null = null;
+  /** Mixed-precision GEMM: f16 multiply, f32 accumulate (see setPrecision). */
+  private f16 = false;
 
   constructor(
     device: GpuDevice,
@@ -1026,6 +1037,25 @@ export class WebGPUBackend implements OpsBackend {
     } catch {
       // Runtime without onuncapturederror support; sync() still surfaces device loss.
     }
+  }
+
+  /**
+   * Select matmul precision. "f16" makes the GEMM multiply operands in f16 and
+   * accumulate in f32 (2x ALU throughput on packed-f16 hardware like Strix Halo;
+   * on Apple GPUs f16 and f32 ALU run at the same rate, so expect little change
+   * there). Buffers, gradients, and the optimizer stay f32, so no loss scaling
+   * is needed. Requires the shader-f16 device feature. Set before training.
+   */
+  setPrecision(p: "f16" | "f32") {
+    if (p === "f16" && !this.f16Supported) {
+      throw new Error("setPrecision('f16'): shader-f16 not available on this device");
+    }
+    this.f16 = p === "f16";
+  }
+
+  /** Current matmul precision. */
+  get precision(): "f16" | "f32" {
+    return this.f16 ? "f16" : "f32";
   }
 
   /** Route the autograd op set through this backend. */
@@ -1535,7 +1565,7 @@ export class WebGPUBackend implements OpsBackend {
     label = "",
   ): () => void {
     return this.prepareDispatch(
-      srcGemm(kind, accum, M, N, K),
+      srcGemm(kind, accum, M, N, K, this.f16),
       [a, b, c],
       ceilDiv(N, GEMM_BN),
       ceilDiv(M, GEMM_BM),
@@ -1624,7 +1654,7 @@ export class WebGPUBackend implements OpsBackend {
     c: GpuBuffer,
   ) {
     this.dispatch(
-      srcGemm(kind, accum, M, N, K),
+      srcGemm(kind, accum, M, N, K, this.f16),
       [a, b, c],
       ceilDiv(N, GEMM_BN),
       ceilDiv(M, GEMM_BM),

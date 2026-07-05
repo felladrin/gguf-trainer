@@ -174,6 +174,53 @@ async function flatOverflowGate(gpu: WebGPUBackend) {
   }
 }
 
+/**
+ * Mixed-precision GEMM: with precision "f16" the matmul rounds operands to f16
+ * and accumulates in f32. Validate against the f32 CPU reference at a loose
+ * tolerance (f16 keeps ~10 mantissa bits; the K reduction stays f32). Guards the
+ * correctness of the f16 path; the throughput win itself is on packed-f16 GPUs.
+ */
+async function f16GemmCheck(gpu: WebGPUBackend) {
+  if (!gpu.f16Supported) {
+    console.log("  skip f16 GEMM (shader-f16 unavailable)");
+    return;
+  }
+  const rng = mulberry32(0xf16);
+  const x = randTensor([40, 48], rng);
+  const w = randTensor([32, 48], rng);
+  x.zeroGrad();
+  w.zeroGrad();
+  const cpu = linear(x, w); // f32 reference
+  const r = new Float32Array(cpu.data.length);
+  const rr = mulberry32(1);
+  for (let i = 0; i < r.length; i++) r[i] = rr() * 2 - 1;
+  cpu.grad.set(r);
+  cpu._backward();
+  const cData = cpu.data.slice(), cdx = x.grad.slice(), cdw = w.grad.slice();
+
+  x.zeroGrad();
+  w.zeroGrad();
+  gpu.setPrecision("f16");
+  gpu.install();
+  let ok = true;
+  try {
+    const y = linear(x, w);
+    y.grad.set(r);
+    gpu.seedGradFromHost(y);
+    y._backward();
+    await gpu.sync([y]);
+    const tol = { atol: 1e-2, rtol: 2e-2 };
+    ok = compare("f16 linear.out", y.data, cData, tol) &&
+      compare("f16 linear.dX", x.grad, cdx, tol) &&
+      compare("f16 linear.dW", w.grad, cdw, tol);
+  } finally {
+    gpu.uninstall();
+    gpu.setPrecision("f32");
+  }
+  if (!ok) failures++;
+  console.log(`  ${ok ? "ok " : "FAIL"} f16 GEMM vs f32 CPU (linear, loose tol)`);
+}
+
 /** Finite differences straight against GPU forwards (samples a few elements). */
 async function gpuMatmulFdCheck(gpu: WebGPUBackend) {
   const rng = mulberry32(31337);
@@ -433,6 +480,7 @@ async function main() {
     await opCase(gpu, "linear (70x80 · 75x80ᵀ, multi-block)", [x, w], () => linear(x, w));
   }
   await gpuMatmulFdCheck(gpu);
+  await f16GemmCheck(gpu);
   await profilerSmoke(gpu);
   await flatOverflowGate(gpu);
   {

@@ -101,6 +101,12 @@ export interface TrainGpuResidentOpts {
    */
   checkpointEvery?: number;
   onCheckpoint?: (step: number) => void | Promise<void>;
+  /**
+   * Matmul precision. "f16" multiplies GEMM operands in f16 and accumulates in
+   * f32 (2x ALU on packed-f16 GPUs like Strix Halo; ~neutral on Apple). Requires
+   * the shader-f16 device feature. Defaults to f32.
+   */
+  precision?: "f16" | "f32";
 }
 
 /**
@@ -138,6 +144,7 @@ export async function trainLMGpuResident(
   const normTensors: Tensor[] = [];
   if (opts.qkClipTau) { for (const L of model.layers) normTensors.push(L.qNorm, L.kNorm); }
 
+  if (opts.precision) gpu.setPrecision(opts.precision);
   gpu.install();
   try {
     for (let step = 0; step < opts.steps; step++) {
