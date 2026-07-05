@@ -90,9 +90,29 @@ embeddings.
    GPU-resident Muon+AdamW, export+verify GGUF. Smoke-tested end-to-end (loss drops, parity exact,
    GGUF loads in llama-cli); the remaining work is the multi-hour run itself, not code. FineWeb-Edu
    drops into the same `pretokenize` → `train` path once TinyStories saturates.
-7. **ReLU² MLP / value-residuals / attention-window warmup** — speedrun tricks with real but smaller
-   gains. Note: ReLU² would diverge from the Qwen3 schema (SwiGLU), so keep it optional/off by
-   default to preserve llama.cpp loadability.
+7. **Speedrun tricks (ReLU² MLP / value-residuals / attention-window warmup)** — evaluated; decision
+   below. These are the nanoGPT-speedrun lineage's smaller-gain tricks. Measured against invariant
+   #1 (GGUF loadability), two of the three are architecture changes a `qwen3`-typed GGUF cannot
+   carry, so they stay documented-only, not built — the contract, not the effort, is what rules them
+   out:
+   - **ReLU² MLP** — replaces SwiGLU's `silu(gate)·up` with `relu(x)²`. Qwen3's FFN is SwiGLU by
+     definition (`ffn_gate` + `ffn_up` + `ffn_down`); an ReLU² block has no gate tensor, so
+     `llama.cpp` would not load the export as `qwen3`. Adopting it means shipping a non-loadable
+     model or forking the GGUF arch. **Off, not built.**
+   - **Value residuals** — a learned per-layer mix of layer 0's value stream into deeper layers. Not
+     in the Qwen3 tensor schema, so the same problem: extra per-layer tensors the `qwen3` graph
+     won't read. **Off, not built.**
+   - **Attention-window warmup** — the one contract-safe trick: it is training-time only (restrict
+     each query to a sliding window of recent keys for the first N steps, then open to full causal),
+     so the exported weights and GGUF are byte-identical to a normal run. The cheapest correct form
+     here is a _sequence-length_ warmup (train short windows early, grow to full `seqLen`) — pure
+     loop/data logic, no kernel change, no new parity case, final model unchanged. Real but modest
+     wall-clock savings on long runs. **Not built yet; implementable on request** (a true sliding
+     window would instead need a masked-attention kernel plus a `tests/gpu_parity.ts` case).
+
+   Bottom line: if a non-`qwen3` research export is ever acceptable, revisit ReLU² first (largest of
+   the three gains). Otherwise attention-window warmup is the only one that fits, and it is a
+   training-speed optimization, not a quality one.
 
 **Deliberately deferred:** FP8/NVFP4 low-precision _training_ (Quartet, custom FP8 head). Big at
 cluster scale, but WebGPU targets f16/f32 compute — not worth the complexity here. Q4_0/Q8_0 remain
@@ -121,6 +141,38 @@ planned order:
 **Validation gate (in place):** `tests/gradcheck.ts` finite-difference-checks every CPU op;
 `tests/gpu_parity.ts` checks every kernel's forward and gradient against the CPU backend. Both ran
 green before the backend was swapped in.
+
+## WebGPU memory budget (what the "4 GB" limit really is)
+
+A recurring question: is training capped at 4 GB of VRAM? No. The 4 GiB figure is a _per-tensor
+binding_ cap, not a total-memory budget. Three different limits are in play, measured here on an M1
+Max with 32 GB unified memory:
+
+| Limit                         | M1 Max value                 | What it bounds                                          |
+| ----------------------------- | ---------------------------- | ------------------------------------------------------- |
+| `maxStorageBufferBindingSize` | 4.00 GiB (4,294,967,292 B)   | the largest _single_ storage buffer one kernel can bind |
+| `maxBufferSize`               | 18.72 GiB (20,100,448,256 B) | the largest _single_ allocation                         |
+| unified memory pool           | 32 GB                        | the sum of everything resident                          |
+
+`initWebGPU()` already requests the adapter's full limits (with a graceful fallback), so all three
+apply. The 4 GiB bound is per _binding_: no one tensor (a weight matrix, a gradient, a logit buffer)
+may exceed it, but a model is thousands of tensors and the total is bounded by the 32 GB pool, not
+by 4 GiB. Probed directly on this machine: allocating 8 GiB of concurrent `STORAGE` buffers succeeds
+with no OOM.
+
+**Training-state footprint.** With both optimizer groups device-resident, resident state is roughly
+**20 bytes per parameter**: Muon on the 2-D hidden matmuls keeps weight + grad + momentum +
+Newton–Schulz scratch; AdamW on the aux group keeps weight + grad + m + v (all f32). Parameter state
+for a 33M model is therefore ~0.66 GB, and even a 200M model's ~4 GB of state sits well inside 32
+GB. Activations add on top (scaling with `batch · seqLen · hidden · layers`), but at these sizes
+they are not the ceiling either.
+
+**The real limit is compute throughput, not memory.** On the M1 Max a 5.2M-param model runs ~0.9
+s/step and a 33M model ~5–6 s/step (device-resident, seqLen 256, small batch). Going bigger is a
+question of how many hours (or overnight epochs) you will wait, not whether the weights fit. Only a
+_single_ tensor larger than 4 GiB would need tiling to stay under the binding cap — and at
+WebGPU-realistic model sizes (single-digit to low-hundreds of millions of params) no individual
+tensor comes close.
 
 ## References
 

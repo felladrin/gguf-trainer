@@ -247,10 +247,60 @@ functional gate at T=3584 under spec-default limits.
      tweaks (see `docs/DESIGN.md`). The multi-step muP coordinate check on real data is already done
      (`deno task mup:check`, item 1 above).
 
+## Web UI (guided wizard) — `web/`
+
+A local browser wizard around the trainer. The browser is the control surface only; **training runs
+on the Deno WebGPU engine** in `src/`, unchanged. In-browser testing of the result uses wllama
+(llama.cpp in WASM). Run it with `deno task webui` (builds the client, then serves client + API on
+one origin at `:8787`).
+
+Architecture and the decisions behind it:
+
+- **Local Deno server, not a static site.** Training needs Deno's native WebGPU and the disk-backed
+  token loader, so the front end drives a local server rather than training in-tab (reuses the whole
+  engine, survives tab close, full unified memory). `web/server/main.ts` serves the built client
+  with the cross-origin-isolation headers wllama needs (`COOP: same-origin` + `COEP: require-corp`),
+  a JSON API, an SSE progress stream, and GGUF download/serve.
+- **Engine stays dependency-free.** New npm deps (`@huggingface/jinja` for chat-template rendering,
+  `hyparquet` for Parquet parsing) live **only** in `web/` — the server declares them in the root
+  `deno.json` import map; the client has its own `web/client/package.json`. `src/` gains no
+  dependency. The one shared, dependency-free addition is `src/data/chat.ts` (dataset-schema
+  normalization + the verbatim Qwen3 chat template constant), imported by the engine, server, and
+  client.
+- **Data path.** Preview uses the HF Datasets Server JSON API (`web/server/hf.ts`); training
+  downloads the actual data files — the auto-converted Parquet the Datasets Server exposes, or a
+  direct file URL — and parses them locally (`web/server/parse.ts`: Parquet/JSONL/JSON/CSV/TXT).
+  `web/server/corpus.ts` renders conversational rows through the chat template, trains the BPE (with
+  ChatML specials for chat types), and writes a `.tokens` file the existing `diskTokenSource`
+  streams. `web/server/train_job.ts` is the config-driven twin of `examples/train_tinystories.ts`.
+- **Chat contract additions.** `BPETokenizer.encode()` now emits special tokens atomically (ChatML
+  turns tokenize as single ids, not shredded bytes) — gated by a case in `tests/gradcheck.ts`.
+  `buildGGUF()` writes `tokenizer.chat_template` when given one, and chat models set eos to
+  `<|im_end|>`. Both are llama.cpp-contract-relevant; validated by loading the export in `llama-cli`
+  (with `--jinja`, llama.cpp engages the Qwen3 chat parser from the embedded template).
+- **Artifacts** land in `web/.data/` (gitignored): downloaded corpora, `.tokens`, and exported
+  `.gguf` models (`web/.data/models/`, served to wllama and for download).
+
+Not built (intentional): assistant-only loss masking (from-scratch runs use full-sequence LM loss),
+mid-training sampling (weights are device-resident; a final greedy sample is emitted), and a
+non-Parquet repo-tree file downloader (Parquet + direct file URLs cover the common cases). Only one
+training job runs at a time (single GPU).
+
+`deno fmt`/`deno lint`/`deno task test` exclude `web/client` (its own toolchain: `tsc` + Vite); the
+server and shared code are held to the same Deno gates as the engine.
+
 ## Hard limits and known nuances (not bugs)
 
 - You **cannot train in Q4_0**; keep float master weights and quantize at export. Rationale in
   `docs/DESIGN.md`.
+- **The "4 GB" is a per-binding cap, not total VRAM.** `maxStorageBufferBindingSize` (4.00 GiB on M1
+  Max) limits any _single_ storage buffer a kernel binds; `maxBufferSize` (18.72 GiB) limits any
+  _single_ allocation; total resident memory is bounded only by the unified pool (32 GB here).
+  `initWebGPU()` requests all three. Resident training state is ~20 B/param (Muon:
+  weight+grad+momentum+NS-scratch; AdamW aux: weight+grad+m+v, f32), so a 33M model is ~0.66 GB of
+  state — memory is not the ceiling; compute throughput is (~0.9 s/step at 5.2M, ~5–6 s/step at 33M
+  on the M1 Max). Only a single tensor over 4 GiB would need tiling, and no tensor at realistic
+  sizes reaches it. Full probed numbers in `docs/DESIGN.md` ("WebGPU memory budget").
 - Realistic scale on JS/WebGPU is small models (single-digit to low-tens of millions of params), not
   a CUDA-cluster 100M+ run.
 - WGSL kernels bake shapes as constants (pipelines cache per shape). Training reuses shapes, so
@@ -281,6 +331,8 @@ tests/         gradcheck.ts (FD gradient gate), gpu_parity.ts (GPU-vs-CPU gate)
 examples/      demo.ts (CPU end-to-end), demo_gpu.ts (WebGPU), train_streaming.ts (disk-streaming),
                pretokenize.ts (corpus -> .tokens + vocab), train_tinystories.ts (real GPU run),
                mup_coord_check.ts (muP width sweep on the real corpus)
+web/           the training wizard: server/ (Deno API+SSE, HF ingestion, corpus, job),
+               client/ (Vite+React), shared/types.ts; see web/README.md
 docs/          DESIGN.md (rationale + technique research), HANDOFF.md (this file)
 ```
 
@@ -294,6 +346,8 @@ deno task streaming   # disk-streaming corpus training (synthetic corpus, any ru
 deno task pretokenize # corpus/tinystories-valid.txt -> examples/tinystories.tokens + vocab
 deno task train:tinystories  # real GPU run on the pretokenized corpus -> GGUF (Deno)
 deno task mup:check   # muP coordinate check: width sweep on the real corpus (Deno)
+deno task webui       # build the React client + serve the training wizard at :8787 (Deno)
+deno task webui:dev   # client hot-reload (Vite :5173); run webui:server alongside it
 deno task test        # gradcheck + GPU parity
 deno task test:node   # gradcheck on Node (parity prints SKIP: no WebGPU)
 ```

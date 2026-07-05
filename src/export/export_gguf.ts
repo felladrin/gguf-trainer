@@ -35,7 +35,7 @@ export function buildGGUF(
   model: Qwen3Model,
   tok: TokenizerData,
   cfg: Qwen3Config,
-  opts: { quant: QuantName; name?: string } = { quant: "f16" },
+  opts: { quant: QuantName; name?: string; chatTemplate?: string } = { quant: "f16" },
 ): Uint8Array {
   const w = new GGUFWriter();
   const arch = "qwen3";
@@ -73,6 +73,9 @@ export function buildGGUF(
   w.meta_u32("tokenizer.ggml.eos_token_id", tok.eosId);
   w.meta_bool("tokenizer.ggml.add_bos_token", false);
   w.meta_bool("tokenizer.ggml.add_eos_token", false);
+  // Chat template (Jinja): llama.cpp/wllama read this to format turns at
+  // inference. Only written for chat-format models; base models omit it.
+  if (opts.chatTemplate) w.meta_string("tokenizer.chat_template", opts.chatTemplate);
 
   // ---- tensors ----
   const q = opts.quant;

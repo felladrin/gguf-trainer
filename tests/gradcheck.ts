@@ -492,6 +492,34 @@ async function main() {
     );
   }
 
+  // Special-token encoding: ChatML control tokens must encode atomically (one id
+  // each), not shred into bytes, so a chat model learns real turn boundaries.
+  // Ordinary text (no specials) must be unaffected, and export()/fromData() must
+  // preserve the behavior.
+  {
+    const tok = new BPETokenizer();
+    tok.train(
+      "the cat sat on the mat. the dog ran to the cat and the ball.".repeat(6),
+      320,
+      ["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+    );
+    const imStart = tok.idOf("<|im_start|>");
+    const imEnd = tok.idOf("<|im_end|>");
+    let ok = imStart !== undefined && imEnd !== undefined;
+    const chat = "<|im_start|>user\nthe cat<|im_end|>\n<|im_start|>assistant\nthe dog<|im_end|>\n";
+    const ids = tok.encode(chat);
+    if (ids.filter((id) => id === imStart || id === imEnd).length !== 4) ok = false;
+    if (ids[0] !== imStart) ok = false; // leading special is one id, not bytes
+    // Ordinary text round-trips and matches the special-free path.
+    const plain = "the dog ran";
+    if (tok.decode(tok.encode(plain)) !== plain) ok = false;
+    // export/fromData preserves the special encoding exactly.
+    const rebuilt = BPETokenizer.fromData(JSON.parse(JSON.stringify(tok.export())));
+    if (rebuilt.encode(chat).join(",") !== ids.join(",")) ok = false;
+    if (!ok) failures++;
+    console.log(`  ${ok ? "ok " : "FAIL"} special-token encoding (ChatML atomic + roundtrip)`);
+  }
+
   // muP coordinate check: the standard muP diagnostic. Sweep width at fixed
   // base width and measure the readout logit RMS at init. Standard init grows
   // ~sqrt(width) (the blow-up that breaks LR transfer); muP init pins it flat.

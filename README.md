@@ -45,6 +45,23 @@ deno run -A examples/demo_gpu.ts                 # the same, trained on the GPU
 deno task test                                   # gradient checks + GPU parity
 ```
 
+## Web UI (guided wizard)
+
+Prefer clicking to CLI flags? A local web app walks you through training a model end to end: pick a
+model type, point at any Hugging Face dataset (with a live preview), set the size and training
+knobs, watch the loss curve stream live, then chat with the result right in the browser.
+
+```
+deno task webui        # builds the React client, then serves at http://localhost:8787
+```
+
+The browser is only the control panel — training runs on the local **WebGPU engine** (this repo,
+unchanged), and in-browser testing uses [wllama](https://github.com/ngxson/wllama) (llama.cpp in
+WASM). It covers **Base** (pretraining), **Instruct**, **Reasoning**, and **tool-calling** models,
+with the Qwen3 chat template embedded into the exported GGUF so llama.cpp/wllama format turns
+correctly. Any HF dataset works (text or conversational — `messages`/ShareGPT/Alpaca are
+auto-detected). Details in [`web/README.md`](web/README.md).
+
 ## Use as a library
 
 ```ts

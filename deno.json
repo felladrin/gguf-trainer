@@ -2,6 +2,10 @@
   "name": "gguf-trainer",
   "version": "0.1.0",
   "exports": "./src/index.ts",
+  "imports": {
+    "@huggingface/jinja": "npm:@huggingface/jinja@0.3.3",
+    "hyparquet": "npm:hyparquet@1.17.1"
+  },
   "tasks": {
     "demo": "deno run -A examples/demo.ts",
     "demo:node": "node --experimental-strip-types examples/demo.ts",
@@ -10,11 +14,19 @@
     "pretokenize": "deno run -A examples/pretokenize.ts corpus/tinystories-valid.txt examples/tinystories 8192 10",
     "train:tinystories": "deno run -A examples/train_tinystories.ts",
     "mup:check": "deno run -A examples/mup_coord_check.ts",
+    "webui": "deno task webui:build && deno task webui:server",
+    "webui:build": "cd web/client && npm install && npm run build",
+    "webui:server": "deno run -A web/server/main.ts",
+    "webui:dev": "cd web/client && npm run dev",
     "test": "deno run -A tests/gradcheck.ts && deno run tests/gpu_parity.ts",
     "test:node": "node --experimental-strip-types tests/gradcheck.ts && node --experimental-strip-types tests/gpu_parity.ts"
   },
   "fmt": {
-    "lineWidth": 100
+    "lineWidth": 100,
+    "exclude": ["web/client", "web/.data"]
+  },
+  "lint": {
+    "exclude": ["web/client", "web/.data"]
   },
   "compilerOptions": {
     "strict": true,

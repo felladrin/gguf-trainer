@@ -1,0 +1,21 @@
+{
+  "version": "5",
+  "specifiers": {
+    "npm:@huggingface/jinja@0.3.3": "0.3.3",
+    "npm:hyparquet@1.17.1": "1.17.1"
+  },
+  "npm": {
+    "@huggingface/jinja@0.3.3": {
+      "integrity": "sha512-vQQr2JyWvVFba3Lj9es4q9vCl1sAc74fdgnEMoX8qHrXtswap9ge9uO3ONDzQB0cQ0PUyaKY2N6HaVbTBvSXvw=="
+    },
+    "hyparquet@1.17.1": {
+      "integrity": "sha512-79NqDEkWF3VHbjiUuefexuZLtiwD/j43eSc7kKbrcI8f4V8owLBw6P8Eg6k0VaCeB0KpmJVDW3ZewlsW18h8fQ=="
+    }
+  },
+  "workspace": {
+    "dependencies": [
+      "npm:@huggingface/jinja@0.3.3",
+      "npm:hyparquet@1.17.1"
+    ]
+  }
+}
