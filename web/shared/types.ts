@@ -59,5 +59,7 @@ export type TrainEvent =
   | { type: "model"; params: number; summary: string }
   | { type: "step"; step: number; steps: number; loss: number; stepsPerSec: number }
   | { type: "sample"; step: number; text: string }
+  | { type: "checkpoint"; step: number; file: string; sizeMB: number }
   | { type: "done"; file: string; sizeMB: number; tensors: number; sample: string }
+  | { type: "stopped"; file?: string; sizeMB?: number; tensors?: number; sample?: string }
   | { type: "error"; message: string };

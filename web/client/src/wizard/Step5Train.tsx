@@ -25,7 +25,14 @@ export function Step5Train({ state, set, onDone }: StepProps & { onDone: () => v
   const closeRef = useRef<null | (() => void)>(null);
   const logRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => () => closeRef.current?.(), []);
+  useEffect(() => {
+    // If we return to this step with a job already running, re-attach: the server
+    // replays event history, so the chart and log rebuild and live updates resume.
+    if (state.jobId && !closeRef.current) {
+      closeRef.current = subscribeEvents(state.jobId, onEvent);
+    }
+    return () => closeRef.current?.();
+  }, []);
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [live.log]);
@@ -47,8 +54,13 @@ export function Step5Train({ state, set, onDone }: StepProps & { onDone: () => v
 
   function onEvent(e: TrainEvent) {
     setLive((prev) => reduce(prev, e));
-    if (e.type === "done") {
-      set({ doneFile: e.file });
+    // A checkpoint, a stop, or completion all leave a loadable GGUF: make it the
+    // default to test/download and refresh the model list (for resume in step 1).
+    const file = e.type === "checkpoint" || e.type === "done" || e.type === "stopped"
+      ? e.file
+      : undefined;
+    if (file) {
+      set({ doneFile: file });
       listModels().then((models) => set({ models })).catch(() => {});
     }
   }
@@ -101,19 +113,20 @@ export function Step5Train({ state, set, onDone }: StepProps & { onDone: () => v
 
           <div className="actions">
             {running
-              ? <button className="danger" onClick={stop}>Stop</button>
+              ? <button className="danger" onClick={stop}>Stop &amp; save</button>
               : <span className="muted">
                 {live.terminal === "done"
                   ? <span className="ok">Training complete.</span>
                   : live.terminal === "stopped"
-                  ? "Stopped."
+                  ? <span className="ok">Stopped — latest checkpoint saved.</span>
                   : live.terminal === "error"
                   ? <span className="err">{live.message}</span>
                   : ""}
               </span>}
             <button
               className="primary"
-              disabled={live.terminal !== "done"}
+              disabled={!state.doneFile}
+              title={state.doneFile ? "" : "Available once the first checkpoint is saved"}
               onClick={onDone}
             >
               Test model →
@@ -151,6 +164,11 @@ function reduce(s: Live, e: TrainEvent): Live {
       };
     case "sample":
       return { ...s, sample: e.text };
+    case "checkpoint":
+      return {
+        ...s,
+        log: [...s.log, `checkpoint @ step ${e.step}: saved ${e.file} (${e.sizeMB.toFixed(1)} MB)`],
+      };
     case "done":
       return {
         ...s,
@@ -158,12 +176,19 @@ function reduce(s: Live, e: TrainEvent): Live {
         status: "done",
         log: [...s.log, `done: ${e.file} (${e.sizeMB.toFixed(1)} MB, ${e.tensors} tensors)`],
       };
-    case "error":
+    case "stopped":
       return {
         ...s,
-        terminal: e.message.startsWith("Training stopped") ? "stopped" : "error",
-        message: e.message,
-        log: [...s.log, `! ${e.message}`],
+        terminal: "stopped",
+        status: "stopped",
+        log: [
+          ...s.log,
+          e.file
+            ? `stopped: saved ${e.file} (${(e.sizeMB ?? 0).toFixed(1)} MB) — test or resume it`
+            : "stopped (no checkpoint saved yet)",
+        ],
       };
+    case "error":
+      return { ...s, terminal: "error", message: e.message, log: [...s.log, `! ${e.message}`] };
   }
 }

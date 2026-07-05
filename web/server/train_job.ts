@@ -252,60 +252,83 @@ export async function runJob(job: Job, modelsDir: string, jobDir: string): Promi
       minScale: 0.1,
     });
 
+    // GGUF export, reused for mid-run checkpoints, stop, and the final write, so
+    // the model file always reflects the latest weights and a run is never lost
+    // to an interruption. Stable filename -> one file per model name, latest state.
+    const chatTemplate = cfg.modelType !== "base" ? cfg.chatTemplate : undefined;
+    const file = `${safeName(cfg.name)}-${cfg.training.quant}.gguf`;
+    const exportModel = async (): Promise<{ sizeMB: number; tensors: number }> => {
+      const bytes = buildGGUF(model!, built.tok.export(), modelCfg!, {
+        quant: cfg.training.quant,
+        name: cfg.name,
+        chatTemplate,
+      });
+      await writeFileBytes(`${modelsDir}/${file}`, bytes);
+      const g = readGGUF(bytes);
+      if (g.metadata.get("general.architecture") !== "qwen3") {
+        throw new Error("export arch != qwen3");
+      }
+      job.file = file;
+      return { sizeMB: bytes.length / 1e6, tensors: g.tensors.length };
+    };
+
     status("train", `Training ${steps} steps`);
-    let firstLoss = 0, lastLoss = 0;
+    let firstLoss = 0, lastLoss = 0, stopped = false;
     const t0 = Date.now();
-    await trainLMGpuResident(model, gpu, {
-      tokens: src,
-      supervised,
-      seqLen: cfg.training.seqLen,
-      steps,
-      batchPerStep: cfg.training.batch,
-      optimizer: opt,
-      schedule,
-      logEvery: Math.max(1, Math.round(steps / 100)),
-      rng: mulberry32(7),
-      onLog: (step, loss) => {
-        if (job.stopRequested) throw new StopSignal();
-        if (step === 0) firstLoss = loss;
-        lastLoss = loss;
-        const secs = (Date.now() - t0) / 1000;
-        emit(job, { type: "step", step, steps, loss, stepsPerSec: step > 0 ? step / secs : 0 });
-      },
-    });
+    // Checkpoint ~10 times over the run (at least every 500 steps).
+    const checkpointEvery = Math.min(500, Math.max(1, Math.round(steps / 10)));
+    try {
+      await trainLMGpuResident(model, gpu, {
+        tokens: src,
+        supervised,
+        seqLen: cfg.training.seqLen,
+        steps,
+        batchPerStep: cfg.training.batch,
+        optimizer: opt,
+        schedule,
+        logEvery: Math.max(1, Math.round(steps / 100)),
+        rng: mulberry32(7),
+        checkpointEvery,
+        onCheckpoint: async (step) => {
+          const { sizeMB } = await exportModel(); // weights already synced to host
+          emit(job, { type: "checkpoint", step, file, sizeMB });
+        },
+        onLog: (step, loss) => {
+          if (job.stopRequested) throw new StopSignal();
+          if (step === 0) firstLoss = loss;
+          lastLoss = loss;
+          const secs = (Date.now() - t0) / 1000;
+          emit(job, { type: "step", step, steps, loss, stepsPerSec: step > 0 ? step / secs : 0 });
+        },
+      });
+    } catch (e) {
+      if (!(e instanceof StopSignal)) throw e; // real errors -> outer catch
+      stopped = true;
+      await opt.syncWeightsToHost(); // pull the weights trained up to the stop point
+    }
     src.close();
     supervised?.close();
     void firstLoss;
 
+    // Finalize (both a completed run and a user stop): sample, export, terminal event.
     status("sample", "Sampling from the trained model");
     const sample = await generateGpu(gpu, model, built.tok, samplePrompt(cfg.modelType), 48);
     emit(job, { type: "sample", step: steps, text: sample });
 
-    status("export", "Exporting GGUF");
-    const chatTemplate = cfg.modelType !== "base" ? cfg.chatTemplate : undefined;
-    const bytes = buildGGUF(model, built.tok.export(), modelCfg!, {
-      quant: cfg.training.quant,
-      name: cfg.name,
-      chatTemplate,
-    });
-    const file = `${safeName(cfg.name)}-${cfg.training.quant}.gguf`;
-    await writeFileBytes(`${modelsDir}/${file}`, bytes);
-    const g = readGGUF(bytes);
-    if (g.metadata.get("general.architecture") !== "qwen3") throw new Error("export arch != qwen3");
-    job.file = file;
-    job.status = "done";
-    emit(job, {
-      type: "done",
-      file,
-      sizeMB: bytes.length / 1e6,
-      tensors: g.tensors.length,
-      sample,
-    });
+    status("export", stopped ? "Exporting stopped checkpoint" : "Exporting GGUF");
+    const { sizeMB, tensors } = await exportModel();
+    job.status = stopped ? "stopped" : "done";
+    emit(
+      job,
+      stopped
+        ? { type: "stopped", file, sizeMB, tensors, sample }
+        : { type: "done", file, sizeMB, tensors, sample },
+    );
     void lastLoss;
   } catch (e) {
-    if (e instanceof StopSignal) {
+    if (e instanceof StopSignal) { // safety net: stop that escaped the inner catch
       job.status = "stopped";
-      emit(job, { type: "error", message: "Training stopped by user." });
+      emit(job, { type: "stopped" });
     } else {
       job.status = "error";
       emit(job, { type: "error", message: e instanceof Error ? e.message : String(e) });
