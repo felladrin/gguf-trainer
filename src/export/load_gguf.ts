@@ -15,11 +15,13 @@
 // pieces line up: configFromGGUF reads the standard qwen3.* metadata,
 // tokenizerFromGGUF imports the gpt2/BPE vocab + merges + control tokens (via
 // tokenizer.ggml.token_type), and loadWeightsFromGGUF dequantizes per tensor.
-// Two known gaps remain for real quantized releases: (1) dequantize() decodes
-// F32/F16/Q8_0/Q4_0 only — a k-quant file (Q4_K/Q6_K/…) now throws a clear
+// Two things are intentionally out of scope (this is a train-from-scratch
+// project, not a full llama.cpp reader): (1) dequantize() decodes
+// F32/F16/BF16/Q8_0/Q4_0 only — a k-quant file (Q4_K/Q6_K/…) throws a clear
 // error rather than loading garbage; (2) tokenization uses our GPT-2 split
-// regex, so token boundaries may differ slightly from Qwen's own pre-tokenizer.
-// Fine-tuning an external F16/Q8_0/Q4_0 Qwen3 works today; see docs/HANDOFF.md.
+// regex, so byte-exact parity with Qwen's own pre-tokenizer isn't guaranteed.
+// Both only matter for loading someone else's quantized release; fine-tuning an
+// external F16/BF16/Q8_0/Q4_0 Qwen3 works today. See docs/HANDOFF.md.
 
 import { readGGUF } from "../gguf/gguf.ts";
 import type { GGUFFile } from "../gguf/gguf.ts";

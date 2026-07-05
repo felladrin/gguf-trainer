@@ -133,8 +133,9 @@ functional gate at T=3584 under spec-default limits.
   from `tokenizer.ggml.token_type` (also fixes our own chat-model resume, which was silently losing
   atomic ChatML); `dequantize` gained BF16 and now throws a clear error on unsupported k-quants
   instead of returning silent zeros. F16/BF16/Q8_0/Q4_0 external Qwen3 GGUFs load for fine-tune.
-  Remaining for arbitrary Alibaba releases: k-quant super-block dequant + Qwen's exact pre-tokenizer
-  regex (roadmap task #26).
+  Out of scope by design (this is a train-from-scratch project, not a llama.cpp reimplementation):
+  k-quant super-block dequant and Qwen's exact pre-tokenizer regex — both matter only for byte-exact
+  loading of someone else's quantized release. A k-quant file fails loud rather than silently.
 - **Mid-run checkpointing.** `trainLMGpuResident` takes `checkpointEvery` + `onCheckpoint`; it syncs
   device-resident weights to the host and fires the callback so long runs export a loadable GGUF
   periodically (used by `examples/train_tinystories.ts`). Measured ~6.46 s/step for the 29.4M config
