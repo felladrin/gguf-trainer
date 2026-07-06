@@ -78,9 +78,12 @@ async function main() {
   const layers = a[1] ? Number(a[1]) : 12;
   const steps = a[2] ? Number(a[2]) : 20000;
   const seqLen = a[3] ? Number(a[3]) : 2048;
-  const batch = a[4] ? Number(a[4]) : 2;
+  const batch = a[4] ? Number(a[4]) : 4;
   const window = a[5] ? Number(a[5]) : 1024;
-  const muonLr = 0.02, auxLr = 3e-3, baseWidth = 128;
+  // Small-batch single-sequence gradients (one long, internally-correlated
+  // reasoning trace) are noisy, so the LR is conservative and warmup long — a
+  // hotter LR (0.02) destabilized past warmup. Tune via args if needed.
+  const muonLr = a[6] ? Number(a[6]) : 0.01, auxLr = a[7] ? Number(a[7]) : 2e-3, baseWidth = 128;
 
   console.log("=== gemma3 reasoning model: train-from-scratch -> GGUF ===\n");
   const gpu = await initWebGPU();
@@ -158,8 +161,8 @@ async function main() {
     aux: { lr: auxLr, weightDecay: 0.0, clip: 1.0 },
   });
   const schedule = wsdSchedule({
-    warmupSteps: Math.max(1, Math.round(steps * 0.05)),
-    stableSteps: Math.max(0, steps - Math.round(steps * 0.05) - Math.round(steps * 0.2)),
+    warmupSteps: Math.max(1, Math.round(steps * 0.1)),
+    stableSteps: Math.max(0, steps - Math.round(steps * 0.1) - Math.round(steps * 0.2)),
     cooldownSteps: Math.max(1, Math.round(steps * 0.2)),
     minScale: 0.1,
   });
