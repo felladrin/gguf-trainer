@@ -45,6 +45,49 @@ train/inference mismatch. Key facts (see `docs/DESIGN.md`, and the memory files)
   on a cluster vs ~1.9M tok/hr here). The deliverable is a correct fast arch + a healthy descending
   run + the reasoning-token format.
 
+## Curriculum training (pretrain → instruct → reasoning → tool-calling)
+
+Coherence comes from PRETRAINING on broad unlabeled text, NOT from SFT (an early SFT-from-scratch
+reasoning run produced incoherent output; the fix is a base LM first, then fine-tune). Each stage
+resumes the previous checkpoint via `loadGemma3FromGGUF`:
+
+1. PRETRAIN a base LM (no chat template, full-sequence loss) on unlabeled English —
+   `examples/pretrain.ts`.
+2. INSTRUCT SFT (ChatML) on an instruct set (`HuggingFaceTB/smol-smoltalk`, built for small models).
+3. REASONING SFT with `<think>` traces (`examples/prepare_reasoning.ts` + `train_reasoning.ts`;
+   OpenThoughts-114k, short-trace-filtered).
+4. TOOL-CALLING SFT (deferred; e.g. `Salesforce/xlam-function-calling-60k`).
+
+First model — a proof the engine trains a coherent Gemma3 from scratch, NOT a SmolLM2 competitor:
+~28-31M gemma3 (hidden 512 × 6, headDim 64), pretrained on TinyStories (coherent from tiny models).
+
+**Frozen-vocab rule (important).** The tokenizer vocab and embedding matrix freeze the moment
+pretraining starts, so EVERY special any later stage needs must be reserved up front; a stage cannot
+grow the vocab without discarding trained embeddings. `CURRICULUM_SPECIALS` in `src/data/chat.ts` is
+the complete set (11 tokens: ChatML `<|im_start|>`/`<|im_end|>`/`<|endoftext|>`,
+`<think>`/`</think>`, and the six `<tool_call>`/`<tools>`/`<tool_response>` tags). `pretrain.ts`
+trains ONE shared tokenizer (`examples/curriculum.tokenizer.json`, vocab ~16k) with all of them
+reserved; pretraining never emits them (raw text), so their embedding rows sit at init until their
+stage's data first uses them (a handful of dormant rows, ~free).
+
+**token_type split (metadata, not frozen; refine per stage).** `<|...|>` turn tokens export as
+CONTROL (3) — stop/handled, not shown; the visible `<...>` reasoning/tool tags export as
+USER_DEFINED (4) so llama.cpp keeps them in the output text where its `--jinja` tool parser and
+reasoning parser can see them (marking a visible tag CONTROL would let llama.cpp suppress it and
+break parsing). Done in `tokenTypes()` (export_gguf.ts) and `tokenizerFromGGUF()` (recovers both
+types), gated by a gradcheck assertion. Because token_type is metadata (not weights), it round-trips
+independently of the frozen embeddings and can be re-tuned before the reasoning/tool stages; verify
+end-to-end via `llama-server` on build 9850 when a stage first emits these tags.
+
+**Throughput / precision reality.** ~3.5M tok/hr @58M on Strix (~7M @31M with f16). A 100-300M-token
+pretrain is ~1-2 days; full SmolLM2/Minueza scale (100B+ tokens) is not reachable on one APU, and no
+precision flag closes it — bf16 is not exposed by WebGPU (see `docs/DESIGN.md` "Precision: f16, and
+why not bf16"), and the real ~1000x lever is a native ROCm/PyTorch path, not this trainer.
+
+**Corpus caveat.** `pretrain.ts` reads the corpus whole (`readFileText`, V8's ~512 MB string cap),
+so use a sub-500 MB slice or add chunked reading before pointing it at the full multi-GB TinyStories
+/ FineWeb train split.
+
 ## Current state (working and verified)
 
 Both backends are complete and pass end-to-end:

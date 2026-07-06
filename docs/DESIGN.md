@@ -120,6 +120,27 @@ attention.
 cluster scale, but WebGPU targets f16/f32 compute — not worth the complexity here. Q4_0/Q8_0 remain
 **export-time** only.
 
+## Precision: f16, and why not bf16
+
+Training runs f16-operand GEMM with f32 accumulate (`setPrecision("f16")`), on top of f32 master
+weights and f32 gradients/optimizer state. Only the matmul operands are rounded to f16.
+
+A fair question on AMD Strix Halo (RDNA 3.5, RADV GFX1151), whose silicon has native bf16: why not
+bf16? Because WebGPU cannot reach it. WGSL's only reduced-precision scalar is `f16` (IEEE half),
+gated by the `shader-f16` feature; there is no `bf16` WGSL type and no `shader-bf16` WebGPU feature,
+and Deno's wgpu/naga shader compiler has no bf16 either. So the backend physically cannot emit a
+bf16 kernel (`setPrecision` accepts only `"f16" | "f32"`), and the hardware's bf16 units are
+unreachable from this path. Same story for f16 matrix cores (WMMA): not exposed to WebGPU here, so
+f16 buys packed-ALU throughput (~2x over f32 on Strix), not matrix-core acceleration.
+
+Does f16 hurt training? Not at these sizes. bf16's advantage is its f32-like exponent range (it
+avoids activation/gradient overflow/underflow) at the cost of mantissa bits; we sidestep f16's
+narrower range structurally instead (f32 master weights + f32 accumulate + f16 only on operands),
+and RMSNorm keeps activations O(1) well inside f16's range. Evidence: the CPU-f32 vs GPU-f16 parity
+probe that gates every run agrees to ~1e-6 relative (e.g. 9.6941 vs 9.6941 at init on the 31M
+pretrain). So f16 is loss-free here. bf16 would pay off only on a native ROCm/PyTorch path that taps
+the matrix cores, which is a different engine (and the real throughput lever, not a precision flag).
+
 ## WebGPU backend bring-up
 
 **Done (items 1–5)** — the CPU op set (`src/model/autograd.ts`) is implemented as WGSL compute
