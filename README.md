@@ -115,18 +115,19 @@ and the exported GGUF loads and runs in `llama-cli`.
 
 ## Roadmap
 
-What we set out to do is done for the CPU reference path; the throughput path and niceties are next.
-In rough priority order (details and rationale in [`docs/DESIGN.md`](docs/DESIGN.md)):
+The core is done end to end on both backends. Shipped since the first cut: **GPU-resident Muon +
+AdamW** (the optimizer is no longer CPU-bound), **muP** init transfer, the **WSD** schedule,
+**MuonClip**, **GGUF checkpoint resume**, flash-style + **sliding-window attention**, and the
+**Gemma3** architecture — SWA is a ~1.9× training speedup at 8K and llama.cpp honors the window at
+inference. Details and rationale in [`docs/DESIGN.md`](docs/DESIGN.md).
 
-1. **Optimizer as GPU kernels** — Muon's Newton–Schulz runs on the CPU today and dominates GPU-demo
-   step time (measured 1276 ms vs 36 ms for the whole GPU forward+backward). Port it to the existing
-   GEMM kernels and keep parameters device-resident. See `docs/HANDOFF.md`.
-2. **muP parametrization** — tune hyperparameters on a tiny proxy model and transfer to the full
-   size without re-tuning.
-3. **WSD learning-rate schedule** (warmup → stable → cooldown) — cheap, reliable.
-4. **MuonClip / attention-logit control** — for stability when scaling up.
-5. **GGUF checkpoint loader** — dequant already exists; wiring it back into a model (resume training
-   / round-trip) is TODO.
+Next, in rough priority order:
+
+1. **Curriculum training** — pretrain (unlabeled) → instruct → reasoning → tool-calling, chaining
+   each stage's checkpoint through the Gemma3 resume loader. Coherence needs a real pretraining
+   phase; the reasoning/tool stages graft onto that base.
+2. **Throughput** — vec4-vectorized elementwise kernels, full f16 activation storage (a bigger batch
+   at 8K), and a fused online-softmax cross-entropy (large-vocab memory).
 
 ## Architecture
 
