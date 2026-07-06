@@ -17,6 +17,7 @@ import {
   backward,
   crossEntropy,
   embedding,
+  gelu,
   linear,
   mul,
   mulberry32,
@@ -24,11 +25,13 @@ import {
   rmsNorm,
   rmsNormHeads,
   rope,
+  scale,
   silu,
   Tensor,
 } from "../src/model/autograd.ts";
 import { Qwen3Model } from "../src/model/qwen3.ts";
-import type { Qwen3Config } from "../src/model/config.ts";
+import { Gemma3Model } from "../src/model/gemma3.ts";
+import type { Gemma3Config, Qwen3Config } from "../src/model/config.ts";
 import { Muon, newtonSchulz } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
@@ -347,6 +350,72 @@ async function modelParity(gpu: WebGPUBackend) {
   );
 }
 
+/**
+ * Gemma3 whole-model parity: exercises the arch's distinctive path (sqrt(hidden)
+ * embed scale, sandwich norms, GeGLU, per-layer SWA + local/global RoPE). The
+ * config mixes SWA layers (0,1,3) with a global layer (2) and T > slidingWindow
+ * so the window genuinely restricts, matching the CPU windowed reference.
+ */
+async function gemma3ModelParity(gpu: WebGPUBackend) {
+  const cfg: Gemma3Config = {
+    vocabSize: 50,
+    hiddenSize: 32,
+    nLayers: 4,
+    nHeads: 4,
+    nKVHeads: 2,
+    headDim: 8,
+    ffnDim: 64,
+    ropeBase: 1_000_000,
+    ropeBaseLocal: 10_000,
+    rmsEps: 1e-6,
+    maxSeq: 32,
+    tieEmbeddings: true,
+    slidingWindow: 5,
+    swaPattern: 3,
+  };
+  const model = new Gemma3Model(cfg, mulberry32(5));
+  const rng = mulberry32(11);
+  const T = 14;
+  const ids = Array.from({ length: T }, () => Math.floor(rng() * cfg.vocabSize));
+  const targets = Array.from({ length: T }, () => Math.floor(rng() * cfg.vocabSize));
+  const params = model.params();
+
+  for (const p of params) p.zeroGrad();
+  const cpuLogits = model.forward(ids);
+  const cpuLoss = crossEntropy(cpuLogits, targets);
+  backward(cpuLoss, 1);
+  const cpuLogitsData = cpuLogits.data.slice();
+  const cpuLossVal = cpuLoss.data[0];
+  const cpuGrads = params.map((p) => p.grad.slice());
+
+  for (const p of params) p.zeroGrad();
+  gpu.install();
+  let ok = true;
+  try {
+    const logits = model.forward(ids);
+    const loss = crossEntropy(logits, targets);
+    backward(loss, 1);
+    await gpu.sync([logits, loss]);
+    ok = compare("gemma3.logits", logits.data, cpuLogitsData, { atol: 5e-4, rtol: 1e-2 }) && ok;
+    const lossAbs = Math.abs(loss.data[0] - cpuLossVal);
+    if (lossAbs > 1e-3 + 1e-3 * Math.abs(cpuLossVal)) {
+      console.log(`    MISMATCH loss: gpu=${loss.data[0]} cpu=${cpuLossVal}`);
+      ok = false;
+    }
+    for (let i = 0; i < params.length; i++) {
+      ok = compare(`gemma3.dParam${i}`, params[i].grad, cpuGrads[i], BWD) && ok;
+    }
+  } finally {
+    gpu.uninstall();
+  }
+  if (!ok) failures++;
+  console.log(
+    `  ${
+      ok ? "ok " : "FAIL"
+    } gemma3 model forward + full backward (${params.length} param tensors)`,
+  );
+}
+
 /** Two micro-batches accumulated before one sync must match CPU accumulation. */
 async function accumulationParity(gpu: WebGPUBackend) {
   const cfg = microConfig();
@@ -513,6 +582,14 @@ async function main() {
     const x = randTensor([5, 7], rng, 1.5);
     await opCase(gpu, "silu", [x], () => silu(x));
   }
+  {
+    const x = randTensor([5, 7], rng, 1.5);
+    await opCase(gpu, "gelu", [x], () => gelu(x));
+  }
+  {
+    const x = randTensor([4, 6], rng);
+    await opCase(gpu, "scale", [x], () => scale(x, 2.5));
+  }
 
   // 3. reductions
   {
@@ -565,6 +642,7 @@ async function main() {
 
   // 5. graph-level
   await modelParity(gpu);
+  await gemma3ModelParity(gpu);
   await accumulationParity(gpu);
 
   // 6. Attention kernels (appended by the tiling task):

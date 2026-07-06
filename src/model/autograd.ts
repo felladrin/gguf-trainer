@@ -101,6 +101,8 @@ export interface OpsBackend {
   add(a: Tensor, b: Tensor): Tensor;
   mul(a: Tensor, b: Tensor): Tensor;
   silu(x: Tensor): Tensor;
+  gelu(x: Tensor): Tensor;
+  scale(x: Tensor, c: number): Tensor;
   rmsNorm(x: Tensor, weight: Tensor, eps: number): Tensor;
   rmsNormHeads(x: Tensor, weight: Tensor, T: number, H: number, hd: number, eps: number): Tensor;
   embedding(weight: Tensor, ids: number[]): Tensor;
@@ -208,6 +210,46 @@ export function silu(x: Tensor): Tensor {
       const s = sig[i];
       x.grad[i] += out.grad[i] * (s + x.data[i] * s * (1 - s));
     }
+  };
+  return out;
+}
+
+// GELU (tanh approximation), matching ggml's GGML_UNARY_OP_GELU used by
+// llama.cpp's GeGLU FFN: g(x) = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³))).
+const GELU_K = 0.7978845608028654; // √(2/π)
+const GELU_A = 0.044715;
+
+/** GELU (tanh approx). Gemma3's FFN is gelu(gate)·up (GeGLU). */
+export function gelu(x: Tensor): Tensor {
+  if (opsBackend) return opsBackend.gelu(x);
+  const out = Tensor.zeros(x.shape);
+  for (let i = 0; i < x.data.length; i++) {
+    const v = x.data[i];
+    out.data[i] = 0.5 * v * (1 + Math.tanh(GELU_K * (v + GELU_A * v * v * v)));
+  }
+  out._prev = [x];
+  out._backward = () => {
+    for (let i = 0; i < x.data.length; i++) {
+      const v = x.data[i];
+      const v2 = v * v;
+      const u = GELU_K * (v + GELU_A * v * v2);
+      const th = Math.tanh(u);
+      const dudx = GELU_K * (1 + 3 * GELU_A * v2);
+      const g = 0.5 * (1 + th) + 0.5 * v * (1 - th * th) * dudx;
+      x.grad[i] += out.grad[i] * g;
+    }
+  };
+  return out;
+}
+
+/** Multiply by a compile-time constant (e.g. Gemma3's √(hidden) embedding scale). */
+export function scale(x: Tensor, c: number): Tensor {
+  if (opsBackend) return opsBackend.scale(x, c);
+  const out = Tensor.zeros(x.shape);
+  for (let i = 0; i < x.data.length; i++) out.data[i] = x.data[i] * c;
+  out._prev = [x];
+  out._backward = () => {
+    for (let i = 0; i < x.data.length; i++) x.grad[i] += out.grad[i] * c;
   };
   return out;
 }

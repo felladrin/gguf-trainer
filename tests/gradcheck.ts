@@ -18,6 +18,7 @@ import {
   backward,
   crossEntropy,
   embedding,
+  gelu,
   linear,
   mul,
   mulberry32,
@@ -25,6 +26,7 @@ import {
   rmsNorm,
   rmsNormHeads,
   rope,
+  scale,
   silu,
   Tensor,
 } from "../src/model/autograd.ts";
@@ -178,6 +180,14 @@ async function main() {
   {
     const x = randTensor([5, 7], rng, 1.5); // wider spread exercises both tails
     fdCheck("silu", [x], () => silu(x));
+  }
+  {
+    const x = randTensor([5, 7], rng, 1.5);
+    fdCheck("gelu", [x], () => gelu(x));
+  }
+  {
+    const x = randTensor([4, 6], rng);
+    fdCheck("scale", [x], () => scale(x, 2.5));
   }
   {
     const x = randTensor([3, 5], rng);

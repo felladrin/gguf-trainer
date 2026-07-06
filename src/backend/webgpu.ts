@@ -30,6 +30,7 @@ import type { OpsBackend } from "../model/autograd.ts";
 import {
   bindF32,
   ceilDiv,
+  f32lit,
   GEMM_BM,
   GEMM_BN,
   MAX_WG,
@@ -546,6 +547,74 @@ export class WebGPUBackend implements OpsBackend {
           "let s = 1.0 / (1.0 + exp(-XB[i])); DX[i] = DX[i] + GB[i] * (s + XB[i] * s * (1.0 - s));",
         ),
         [eo.grad, ex.data, ex.grad],
+        ceilDiv(n, 256),
+      );
+    };
+    return out;
+  }
+
+  gelu(x: Tensor): Tensor {
+    this.beginForwardOp();
+    this.curLabel = "gelu";
+    const ex = this.entryFor(x);
+    const { t: out, e: eo } = this.makeOut(x.shape, [x]);
+    const n = out.size;
+    // tanh-approx GELU (ggml GGML_UNARY_OP_GELU): 0.5·x·(1+tanh(K·(x+A·x³))).
+    this.dispatch(
+      srcElementwise(
+        [bindF32(0, "XB", "read"), bindF32(1, "YB", "read_write")],
+        n,
+        "let x = XB[i]; let u = 0.7978845608028654 * (x + 0.044715 * x*x*x);" +
+          " YB[i] = 0.5 * x * (1.0 + tanh(u));",
+      ),
+      [ex.data, eo.data],
+      ceilDiv(n, 256),
+    );
+    out._backward = () => {
+      this.ensureBackwardBegun();
+      this.curLabel = "gelu";
+      this.dispatch(
+        srcElementwise(
+          [bindF32(0, "GB", "read"), bindF32(1, "XB", "read"), bindF32(2, "DX", "read_write")],
+          n,
+          "let x = XB[i]; let x2 = x*x; let u = 0.7978845608028654 * (x + 0.044715 * x*x2);" +
+            " let th = tanh(u); let dudx = 0.7978845608028654 * (1.0 + 0.134145 * x2);" +
+            " let g = 0.5 * (1.0 + th) + 0.5 * x * (1.0 - th*th) * dudx;" +
+            " DX[i] = DX[i] + GB[i] * g;",
+        ),
+        [eo.grad, ex.data, ex.grad],
+        ceilDiv(n, 256),
+      );
+    };
+    return out;
+  }
+
+  scale(x: Tensor, c: number): Tensor {
+    this.beginForwardOp();
+    this.curLabel = "scale";
+    const ex = this.entryFor(x);
+    const { t: out, e: eo } = this.makeOut(x.shape, [x]);
+    const n = out.size;
+    const cl = f32lit(c);
+    this.dispatch(
+      srcElementwise(
+        [bindF32(0, "XB", "read"), bindF32(1, "YB", "read_write")],
+        n,
+        `YB[i] = XB[i] * ${cl};`,
+      ),
+      [ex.data, eo.data],
+      ceilDiv(n, 256),
+    );
+    out._backward = () => {
+      this.ensureBackwardBegun();
+      this.curLabel = "scale";
+      this.dispatch(
+        srcElementwise(
+          [bindF32(0, "GB", "read"), bindF32(1, "DX", "read_write")],
+          n,
+          `DX[i] = DX[i] + GB[i] * ${cl};`,
+        ),
+        [eo.grad, ex.grad],
         ceilDiv(n, 256),
       );
     };
