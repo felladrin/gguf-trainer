@@ -144,7 +144,10 @@ functional gate at T=3584 under spec-default limits.
 
 ## Performance work (WebGPU backend)
 
-All below are committed and gated by `tests/gpu_parity.ts`. Measured on an M1 Max.
+All below are committed and gated by `tests/gpu_parity.ts`. Measured on an M1 Max and an AMD Strix
+Halo (Ryzen AI Max+ 395, Radeon 8060S = RADV GFX1151). The **entire backend runs green on GFX1151**
+(all parity checks incl. f16 GEMM), the first time this Deno/WebGPU path has run on the AMD target —
+so training the way this repo does works on the intended 24/7 APU.
 
 - **Per-kernel profiler.** `WebGPUBackend.startProfile()/stopProfile()` time each dispatch in its
   own compute pass via the `timestamp-query` feature (opted into by `initWebGPU` when the adapter
@@ -168,22 +171,35 @@ All below are committed and gated by `tests/gpu_parity.ts`. Measured on an M1 Ma
   `trainLMGpuResident` / `GGUF_F16=1` on `train_tinystories`: the GEMM multiplies operands in f16
   and accumulates the K reduction in f32 (the tensor-core pattern). Buffers, gradients, and the
   optimizer stay f32, so **no loss scaling is needed**. Requires `shader-f16`
-  (`backend.f16Supported`; host transfer helpers in `f16.ts`). This is the **Strix Halo** win (2×
-  packed-f16 ALU on the dominant kernel); Apple GPUs run f16 and f32 ALU at the same rate, so M1 Max
-  is ~neutral. Validated: f16 GEMM matches the f32 CPU reference within a loose tolerance, and a
-  60-step run tracks the f32 loss trajectory (6.24→0.02 vs 6.24→0.015).
+  (`backend.f16Supported`; host transfer helpers in `f16.ts`). This is the **Strix Halo** win; Apple
+  GPUs run f16 and f32 ALU at the same rate, so M1 Max is ~neutral. **Measured on Strix Halo:**
+  **1.54×** at a GEMM-heavy shape (45.6M params, seqLen 512: 997→1537 tok/s), loss curve identical
+  to f32. Validated: f16 GEMM matches the f32 CPU reference within a loose tolerance, and multi-step
+  runs track the f32 loss trajectory.
 
-**Remaining perf roadmap (priority order):**
+**Key empirical finding (measured on Strix Halo — do not re-tread):** f16 is a **GEMM lever, not an
+attention lever**. Both f16-compute (f16 multiply) and f16-storage (f16 Q/K/V, halving the O(T²)
+reads) were implemented for the flash-attention kernels and measured: **compute 0.98×, storage 1.06×
+at seqLen 4096 and only 1.02× at 8192** (the win _shrinks_ at longer context). The flash kernel is
+**not** ALU- or bandwidth-bound — it is occupancy/latency-bound (one thread per query row) with a
+serial online-softmax `exp` chain. Both attention f16 variants were reverted as not worth their
+complexity. To speed attention/long-context, the real lever is a **kernel-structure change** (more
+threads per query row / better tiling for occupancy), not precision.
 
-1. **Full f16 _storage_** — activations/weights/grads in f16 buffers (halves memory → bigger batch
-   at 8K on a 128 GB APU; f16 bandwidth on elementwise/attention; f16 attention compute). Needs f32
-   master weights + a f16 shadow, dynamic **loss scaling** (grads stored f16 underflow otherwise),
-   and per-buffer dtype. Largest, most delicate change; tune the loss-scale schedule on the target
-   (Strix Halo), and validate stability with a real run, not just init parity.
-2. **vec4 vectorization** of the elementwise/attention kernels (bandwidth-bound; measurable on M1).
-3. **Subgroup-matrix GEMM** (`chromium-experimental-subgroup-matrix`, Metal+Vulkan) behind a feature
+**Remaining perf roadmap (priority order, revised by the finding above):**
+
+1. **Attention occupancy** — restructure the flash kernel so a query row is shared by several
+   threads (split the key loop across a subgroup and reduce), raising GPU occupancy at long context.
+   This, not f16, is what unblocks 8K throughput. New `tests/gpu_parity.ts` case required.
+2. **vec4 vectorization** of the elementwise kernels (bandwidth-bound; cheap, measurable on M1).
+3. **Full f16 _storage_ for memory** — activations in f16 buffers to fit a **bigger batch** at 8K on
+   the 128 GB APU (bigger batch → better GEMM occupancy → indirect throughput). Note the direct
+   attention throughput benefit is now known to be marginal, so the motivation is memory/batch, not
+   attention speed. Needs dynamic **loss scaling** + per-buffer dtype; validate stability on Strix
+   Halo. Weigh against the attention-occupancy work, which is likely higher ROI.
+4. **Subgroup-matrix GEMM** (`chromium-experimental-subgroup-matrix`, Metal+Vulkan) behind a feature
    check with the register-tile kernel as fallback — highest ceiling, most portability caveats.
-4. **Cross-entropy memory at large vocab.** CE materializes `PROBS`/`DLOG` `[T,V]`; at 8K × 32k
+5. **Cross-entropy memory at large vocab.** CE materializes `PROBS`/`DLOG` `[T,V]`; at 8K × 32k
    vocab that is ~1 GB each. A fused online-softmax CE (like the flash attention path) would remove
    it.
 
