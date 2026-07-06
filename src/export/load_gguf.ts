@@ -55,7 +55,9 @@ export function configFromGGUF(g: GGUFFile): Gemma3Config {
   };
 }
 
-const TOKEN_TYPE_CONTROL = 3; // llama.cpp: NORMAL=1, UNKNOWN=2, CONTROL=3, USER_DEFINED=4
+// llama.cpp: NORMAL=1, UNKNOWN=2, CONTROL=3, USER_DEFINED=4
+const TOKEN_TYPE_CONTROL = 3;
+const TOKEN_TYPE_USER_DEFINED = 4;
 
 /** Reconstruct the tokenizer data from the GGUF's tokenizer.ggml.* metadata. */
 export function tokenizerFromGGUF(g: GGUFFile): TokenizerData {
@@ -65,14 +67,18 @@ export function tokenizerFromGGUF(g: GGUFFile): TokenizerData {
     throw new Error("GGUF missing tokenizer.ggml.tokens/merges");
   }
   const toks = tokens as string[];
-  // Recover the control/special tokens so they re-encode atomically (ChatML,
-  // <think>/</think>, <|endoftext|>, …). Prefer the token_type array (how
-  // llama.cpp and our own exporter flag control tokens); fall back to the
-  // "<|…|>" shape when a GGUF omits token_type. Without this, a resumed chat
-  // model would shred its special tokens back into bytes.
+  // Recover the atomic special tokens so they re-encode as single ids (ChatML,
+  // <think>/</think>, <tool_call>…). Both CONTROL (turn/stop tokens) and
+  // USER_DEFINED (visible reasoning/tool tags) are atomic specials that must be
+  // recovered; the exporter splits them by shape (see export_gguf.ts). Fall back
+  // to the "<|…|>" shape when a GGUF omits token_type. Without this, a resumed
+  // chat model would shred its special tokens back into bytes.
   const types = g.metadata.get("tokenizer.ggml.token_type");
   let specials: string[] = Array.isArray(types)
-    ? toks.filter((_, i) => (types as number[])[i] === TOKEN_TYPE_CONTROL)
+    ? toks.filter((_, i) => {
+      const ty = (types as number[])[i];
+      return ty === TOKEN_TYPE_CONTROL || ty === TOKEN_TYPE_USER_DEFINED;
+    })
     : [];
   if (specials.length === 0) specials = toks.filter((t) => /^<\|.*\|>$/.test(t));
   return {

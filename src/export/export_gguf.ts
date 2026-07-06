@@ -12,6 +12,7 @@ import type { TokenizerData } from "../tokenizer/bpe.ts";
 // llama.cpp token types
 const TOKEN_TYPE_NORMAL = 1;
 const TOKEN_TYPE_CONTROL = 3;
+const TOKEN_TYPE_USER_DEFINED = 4;
 
 /**
  * Weight matrices are stored [out, in] row-major in our Tensors, so ggml's
@@ -32,18 +33,27 @@ function addVector(w: GGUFWriter, name: string, t: Tensor) {
 }
 
 /**
- * Per-token ggml token_type: CONTROL for atomic special tokens (the tokenizer's
- * declared `specials`, e.g. ChatML turns and `<think>`/`</think>`, plus the
- * `<|...|>` convention as a fallback), NORMAL otherwise. Marking specials
- * CONTROL is what makes llama.cpp treat them as single non-printable tokens.
+ * Per-token ggml token_type. Two kinds of atomic special are distinguished by
+ * shape, because llama.cpp renders them differently:
+ *   - CONTROL (3): the `<|...|>` turn/stop tokens (ChatML `<|im_start|>` /
+ *     `<|im_end|>` / `<|endoftext|>`). Handled by the chat machinery and NOT
+ *     emitted as visible text.
+ *   - USER_DEFINED (4): any other declared special (the `<...>` reasoning and
+ *     tool tags — `<think>`, `<tool_call>`, …). Atomic in tokenization but kept
+ *     VISIBLE in output, which is required for llama.cpp's `--jinja` tool parser
+ *     and reasoning parser to see them in the generated text.
+ *   - NORMAL (1): everything else.
+ * Marking a visible tag CONTROL would let llama.cpp suppress it from output and
+ * break parsing, so the split matters. token_type is metadata (not weights), so
+ * it round-trips independently of the frozen embeddings.
  */
 function tokenTypes(tok: TokenizerData): number[] {
   const special = new Set(tok.specials ?? []);
-  return tok.tokens.map((t) =>
-    special.has(t) || (t.startsWith("<|") && t.endsWith("|>"))
-      ? TOKEN_TYPE_CONTROL
-      : TOKEN_TYPE_NORMAL
-  );
+  return tok.tokens.map((t) => {
+    if (t.startsWith("<|") && t.endsWith("|>")) return TOKEN_TYPE_CONTROL;
+    if (special.has(t)) return TOKEN_TYPE_USER_DEFINED;
+    return TOKEN_TYPE_NORMAL;
+  });
 }
 
 // ggml LLAMA_FTYPE values used for reporting.

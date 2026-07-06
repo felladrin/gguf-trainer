@@ -36,6 +36,7 @@ import { wsdSchedule } from "../src/train/schedule.ts";
 import { applyQKClip, qkLogitScale } from "../src/train/qk_clip.ts";
 import { buildGemma3GGUF } from "../src/export/export_gguf.ts";
 import { loadGemma3FromGGUF } from "../src/export/load_gguf.ts";
+import { readGGUF } from "../src/gguf/gguf.ts";
 import { dequantize } from "../src/gguf/quantize.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { Muon } from "../src/train/muon.ts";
@@ -526,17 +527,19 @@ async function main() {
     );
   }
 
-  // Resumed chat model + dequantizer guards: control tokens must survive the
+  // Resumed chat model + dequantizer guards: atomic specials must survive the
   // GGUF round-trip (buildGemma3GGUF writes token_type; tokenizerFromGGUF
-  // recovers the specials) so a resumed chat model still tokenizes ChatML
-  // atomically. The dequantizer must also decode BF16 and reject unsupported
-  // (k-quant) types loudly rather than silently returning zeros.
+  // recovers them) so a resumed chat model still tokenizes ChatML + reasoning
+  // tags atomically. The token_type SPLIT matters: `<|...|>` turn tokens export
+  // as CONTROL (3), visible `<...>` tags (<think>) as USER_DEFINED (4) so
+  // llama.cpp keeps them in output — both must recover as specials. The
+  // dequantizer must also decode BF16 and reject unsupported (k-quant) types.
   {
     const tok = new BPETokenizer();
     tok.train(
       "the cat sat on the mat. the dog ran to the cat.".repeat(8),
       320,
-      ["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+      ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "</think>"],
     );
     const cfg: Gemma3Config = {
       vocabSize: tok.vocabSize,
@@ -555,17 +558,31 @@ async function main() {
       swaPattern: 2,
     };
     const model = new Gemma3Model(cfg, mulberry32(9));
-    const chat = "<|im_start|>user\nthe cat<|im_end|>\n";
+    const chat = "<|im_start|>assistant\n<think>ok</think>the cat<|im_end|>\n";
     const before = tok.encode(chat);
-    const { tokenizer: tok2 } = loadGemma3FromGGUF(
-      buildGemma3GGUF(model, tok.export(), cfg, { quant: "f16" }),
-    );
+    const bytes = buildGemma3GGUF(model, tok.export(), cfg, { quant: "f16" });
+
+    // token_type split: <|im_end|> is CONTROL (3), <think> is USER_DEFINED (4).
+    const g = readGGUF(bytes);
+    const gToks = g.metadata.get("tokenizer.ggml.tokens") as string[];
+    const gTypes = g.metadata.get("tokenizer.ggml.token_type") as number[];
+    let ok = gTypes[gToks.indexOf("<|im_end|>")] === 3 &&
+      gTypes[gToks.indexOf("<|endoftext|>")] === 3 &&
+      gTypes[gToks.indexOf("<think>")] === 4 &&
+      gTypes[gToks.indexOf("</think>")] === 4;
+
+    const { tokenizer: tok2 } = loadGemma3FromGGUF(bytes);
     const imStart = tok2.idOf("<|im_start|>");
     const imEnd = tok2.idOf("<|im_end|>");
-    let ok = imStart !== undefined && imEnd !== undefined;
+    const think = tok2.idOf("<think>");
+    if (imStart === undefined || imEnd === undefined || think === undefined) ok = false;
     const after = tok2.encode(chat);
     if (after.join(",") !== before.join(",")) ok = false; // specials still atomic post-load
-    if (after.filter((id) => id === imStart || id === imEnd).length !== 2) ok = false;
+    // <|im_start|> x1, <|im_end|> x1, <think> x1, </think> x1 => 4 atomic special ids.
+    const closeThink = tok2.idOf("</think>");
+    if (after.filter((id) => [imStart, imEnd, think, closeThink].includes(id)).length !== 4) {
+      ok = false;
+    }
     // BF16 dequant path: the high-16-bits float format. These values are exactly
     // bf16-representable, so dequant is exact.
     const bfVals = [1.5, -2.25, 0, 3];

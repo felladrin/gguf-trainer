@@ -86,6 +86,31 @@ export const DEFAULT_CHAT_TEMPLATE = String.raw`{%- if tools -%}
 export const CHATML_SPECIALS = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"];
 
 /**
+ * The COMPLETE special-token set reserved up front for the whole curriculum
+ * (pretrain → instruct → reasoning → tool-calling). The tokenizer vocab and the
+ * embedding matrix freeze the moment pretraining starts, so every special any
+ * later stage needs must exist from step 1 — a stage cannot grow the vocab
+ * without discarding trained embeddings. Pretraining never emits these (it sees
+ * raw text); their rows sit at init until their stage's data first uses them,
+ * which costs only a handful of dormant embedding rows. On export, the `<|...|>`
+ * turn tokens are CONTROL (stop/handled) while the `<...>` reasoning and tool
+ * tags are USER_DEFINED so they stay visible in the model's output text for
+ * llama.cpp's `--jinja` tool parser and any reasoning parser (see
+ * export_gguf.ts `tokenTypes`).
+ */
+export const CURRICULUM_SPECIALS = [
+  ...CHATML_SPECIALS,
+  "<think>",
+  "</think>",
+  "<tool_call>",
+  "</tool_call>",
+  "<tools>",
+  "</tools>",
+  "<tool_response>",
+  "</tool_response>",
+];
+
+/**
  * How to read a dataset's columns. `kind` picks the shape; the field names say
  * which columns carry the data (auto-detected, overridable in the wizard).
  */
