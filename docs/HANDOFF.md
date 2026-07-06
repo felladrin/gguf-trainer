@@ -7,6 +7,43 @@ A TypeScript framework that trains a **Qwen3ForCausalLM** model **from scratch**
 and trains on **any GPU — AMD, Apple Silicon, NVIDIA — via WebGPU** (Deno ships WebGPU natively;
 Node/Bun fall back to CPU).
 
+## Architecture update — Gemma3 (SWA) is now the trained arch for real runs
+
+Qwen3 stays as the reference backbone (and the shared-kernel parity gate), but real training now
+targets **Gemma3** because sliding-window attention (SWA) is a measured **~1.9× training speedup at
+8K** — and, unlike Qwen3, llama.cpp's gemma3 build path _honors_ the window at inference, so there's
+no train/inference mismatch. Key facts (see `docs/DESIGN.md` if expanded, and the memory files):
+
+- **SWA is a real lever; the naive kernel is a trap.** A per-thread windowed lower bound
+  (`s = t-W+1`) is _0.78× (slower)_ at W=1024 on GFX1151 — it destroys the wave K/V broadcast (the
+  split-K failure mode). Fix: block-align the flash kernel's lower key bound to the 64-query wave
+  (`winStartBlock` in `wgsl.ts`) and mask per-row, so K[s] is read in lockstep. That gives **W=1024
+  3.74×, W=512 6.38×, W=2048 2.11×** (attention fwd+bwd, T=8192, on Strix). The Gemma3 5:1
+  SWA:global blend ≈ 2.57× attention ⇒ ~1.9× whole step.
+- **Gemma3 arch is implemented and validated end-to-end in llama.cpp (build 9850):** loads, reports
+  `is_swa_any=1`/`n_swa`, applies both RoPE bases, and a memorization round-trip reproduces trained
+  output (the forward matches llama.cpp). Files: `src/model/gemma3.ts`,
+  `gemma3Config`/`gemma3ParamCount`/ `isGlobalLayer` in `config.ts`, `buildGemma3GGUF` in
+  `export_gguf.ts`. New ops: `gelu` (tanh-approx, for GeGLU) + `scale` (const-mul, for the √hidden
+  embed scale) in `autograd.ts`/`webgpu.ts`. Windowed `attention(…, window)`.
+- **Gemma3 deltas from Qwen3** (all matched to llama.cpp's gemma3 graph): sandwich norms
+  (`post_attention_norm` + `post_ffw_norm`, applied pre-residual), GeGLU (gelu·up), √hidden
+  embedding scale (runtime; raw embeds exported), per-layer SWA window + local RoPE base (1e4) on
+  SWA layers / global base (1e6) on the every-6th global layer, QK-norm kept (len head_dim), tied
+  output. Norm weights export **gain-frame** (no HF-style +1 — llama.cpp `build_norm` is a plain
+  `rms_norm·w`).
+- **gemma4 rejected:** still standard SWA (same speed — the win is the kernel, not the arch), adds
+  heavy per-layer-embedding machinery, may not be in build 9850, and ships multimodal variants (we
+  want text-only). Trivial future swap (only the export mapping changes) if ever wanted.
+- **Reasoning run pipeline:** `examples/prepare_reasoning.ts` (OpenThoughts-114k → ChatML with
+  `<think>`/`</think>` atomic specials → BPE → `.tokens`) then `examples/train_reasoning.ts`
+  (device-resident Muon+AdamW, WSD, `GGUF_F16=1`, mid-run gemma3 GGUF checkpoints). Test checkpoints
+  with **`llama-server`** (OpenAI `/v1`) or `llama-simple` — build 9850's `llama-cli` is an
+  interactive REPL that hangs on piped stdin.
+- **Honest scale note:** matching SmolLM2-135M from scratch on one APU is not reachable (~2T tokens
+  on a cluster vs ~1.9M tok/hr here). The deliverable is a correct fast arch + a healthy descending
+  run + the reasoning-token format.
+
 ## Current state (working and verified)
 
 Both backends are complete and pass end-to-end:
@@ -180,28 +217,59 @@ so training the way this repo does works on the intended 24/7 APU.
 **Key empirical finding (measured on Strix Halo — do not re-tread):** f16 is a **GEMM lever, not an
 attention lever**. Both f16-compute (f16 multiply) and f16-storage (f16 Q/K/V, halving the O(T²)
 reads) were implemented for the flash-attention kernels and measured: **compute 0.98×, storage 1.06×
-at seqLen 4096 and only 1.02× at 8192** (the win _shrinks_ at longer context). The flash kernel is
-**not** ALU- or bandwidth-bound — it is occupancy/latency-bound (one thread per query row) with a
-serial online-softmax `exp` chain. Both attention f16 variants were reverted as not worth their
-complexity. To speed attention/long-context, the real lever is a **kernel-structure change** (more
-threads per query row / better tiling for occupancy), not precision.
+at seqLen 4096 and only 1.02× at 8192** (the win _shrinks_ at longer context). Both were reverted.
 
-**Remaining perf roadmap (priority order, revised by the finding above):**
+**Attention is at its practical floor — three restructurings tried, all reverted (do not
+re-tread).** Where the step actually goes, profiled on Strix Halo
+(`hidden=768, 4 layers, seqLen=4096`): **attention 77.9%**, linear 9.3%, muon 5.6%, rmsnorm 4.4%, CE
+1.0%, everything else <1%. Attention dominates long context, so it got three independent kernel
+rewrites — each measured on-target, each net-negative or neutral, each reverted:
 
-1. **Attention occupancy** — restructure the flash kernel so a query row is shared by several
-   threads (split the key loop across a subgroup and reduce), raising GPU occupancy at long context.
-   This, not f16, is what unblocks 8K throughput. New `tests/gpu_parity.ts` case required.
-2. **vec4 vectorization** of the elementwise kernels (bandwidth-bound; cheap, measurable on M1).
-3. **Full f16 _storage_ for memory** — activations in f16 buffers to fit a **bigger batch** at 8K on
-   the 128 GB APU (bigger batch → better GEMM occupancy → indirect throughput). Note the direct
-   attention throughput benefit is now known to be marginal, so the motivation is memory/batch, not
-   attention speed. Needs dynamic **loss scaling** + per-buffer dtype; validate stability on Strix
-   Halo. Weigh against the attention-occupancy work, which is likely higher ROI.
-4. **Subgroup-matrix GEMM** (`chromium-experimental-subgroup-matrix`, Metal+Vulkan) behind a feature
-   check with the register-tile kernel as fallback — highest ceiling, most portability caveats.
-5. **Cross-entropy memory at large vocab.** CE materializes `PROBS`/`DLOG` `[T,V]`; at 8K × 32k
+1. **f16 precision** (compute + storage): 0.98×–1.06×, shrinks to 1.02× @8192. Not ALU- or
+   bandwidth-bound. (details above.)
+2. **Split-K** (R=32 threads share one query row, merge partial `m,l,acc` in shared memory):
+   **0.4–0.7× slower** @2048–8192 on both GPUs. It destroys the free K/V **broadcast** — in the base
+   kernel a wave is consecutive query rows of one KV head all reading the same `K[s]`/`V[s]` address
+   in lockstep; splitting keys across threads makes each read a different key, multiplying memory
+   traffic.
+3. **FA2 query-register tiling** (each thread owns QT query rows, reusing each `K[s]`/`V[s]` across
+   them — the analog of the register-tiled GEMM, preserving broadcast): still **slower on target** —
+   QT=2 gave 0.80× @2048, 0.87× @4096, 0.94× @8192; QT=3 collapsed to 0.48–0.68× (register pressure
+   halves occupancy faster than the K/V-reuse + ILP pays back). Neutral on M1 (cache already serves
+   the reuse). Kernel `srcAttnFwdTiled`, the `attnTiledFwd`/`attnTiledQt` toggles, its parity case,
+   and `bench_attn.ts` were reverted.
+
+**Conclusion:** the base one-thread-per-query-row flash kernel is the right structure for this
+hardware — the wave broadcast handles K/V reuse and its occupancy is well-balanced. The remaining
+cost is the fundamental **O(T²)** work; no constant-factor kernel change beats it. Real
+8K-throughput levers are elsewhere: **GEMM** (where the FLOPs are; WMMA is unavailable in Deno's
+wgpu — see below), a **memory** play for bigger batches, or an **algorithmic** change
+(sliding-window / local attention) that breaks O(T²) — the last one changes model semantics, so it's
+the user's call.
+
+**WMMA is unavailable in this runtime:** Deno's wgpu exposes 15 adapter features on GFX1151
+(`shader-f16`, `timestamp-query`, …) but **no `subgroups` or `subgroup-matrix`** — so
+`chromium-experimental-subgroup-matrix` GEMM is a non-starter here. (Useful limits found on the same
+probe: `maxComputeWorkgroupStorageSize` = 64 KiB, `maxComputeInvocationsPerWorkgroup` = 1024 — more
+shared-memory/workgroup headroom than the 16 KiB / 256 spec defaults, if a future tiling kernel
+wants it.)
+
+**Remaining perf roadmap (priority order, revised by the findings above):**
+
+1. **vec4 vectorization** of the elementwise kernels (bandwidth-bound; cheap, measurable on M1).
+   Small absolute win (<5% of the step) but low-risk.
+2. **Full f16 _storage_ for memory** — activations in f16 buffers to fit a **bigger batch** at 8K on
+   the 128 GB APU (bigger batch → better GEMM occupancy → indirect throughput). The direct attention
+   throughput benefit is known to be marginal, so the motivation is memory/batch, not attention
+   speed. Needs dynamic **loss scaling** + per-buffer dtype; validate stability on Strix Halo.
+3. **Cross-entropy memory at large vocab.** CE materializes `PROBS`/`DLOG` `[T,V]`; at 8K × 32k
    vocab that is ~1 GB each. A fused online-softmax CE (like the flash attention path) would remove
    it.
+4. **Sliding-window / local attention** (algorithmic, breaks O(T²) → O(T·W)) — the only change that
+   makes 8K genuinely faster rather than a constant factor, but it changes model semantics; gated on
+   a user decision.
+
+_(Subgroup-matrix GEMM is dropped from the roadmap: unavailable in Deno's wgpu, see above.)_
 
 ## Non-negotiable invariants (do not break these)
 
