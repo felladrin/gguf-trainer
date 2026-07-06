@@ -110,25 +110,38 @@ console.log(
     `think ids=${THINK.map((t) => tok.idOf(t)).join(",")}`,
 );
 
-// Encode conversation-by-conversation into one id stream (avoids the giant
-// string; specials stay atomic within each conversation).
+// Encode conversation-by-conversation into a growable Uint16Array (vocab fits
+// u16). A plain number[] would hit V8's max fast-array length past ~100M
+// tokens; a typed array with doubling growth does not, and a giant joined
+// string would exceed V8's ~512MB string cap. Specials stay atomic per convo.
+if (tokenBytes(tok.vocabSize) !== 2) {
+  throw new Error(`vocab ${tok.vocabSize} needs u32 tokens; widen this encoder path`);
+}
 console.log("encoding corpus (per conversation) …");
 const t0 = performance.now();
-const ids: number[] = [];
+let ids = new Uint16Array(1 << 24);
+let len = 0;
 for (let i = 0; i < convos.length; i++) {
-  for (const x of tok.encode(convos[i])) ids.push(x);
+  const e = tok.encode(convos[i]);
+  if (len + e.length > ids.length) {
+    const grown = new Uint16Array(Math.max(ids.length * 2, len + e.length));
+    grown.set(ids.subarray(0, len));
+    ids = grown;
+  }
+  ids.set(e, len);
+  len += e.length;
   if (i > 0 && i % 4000 === 0) {
-    console.log(`  ${i}/${convos.length} convos, ${(ids.length / 1e6).toFixed(1)}M tokens`);
+    console.log(`  ${i}/${convos.length} convos, ${(len / 1e6).toFixed(1)}M tokens`);
   }
 }
+const stream = ids.subarray(0, len);
 console.log(
-  `encoded ${(ids.length / 1e6).toFixed(2)}M tokens in ${
-    ((performance.now() - t0) / 1000).toFixed(0)
-  }s ` +
-    `(${(ids.length / convos.length).toFixed(0)} tok/convo)`,
+  `encoded ${(len / 1e6).toFixed(2)}M tokens in ${((performance.now() - t0) / 1000).toFixed(0)}s (${
+    (len / convos.length).toFixed(0)
+  } tok/convo)`,
 );
 
-await writeTokenFile(`${outPrefix}.tokens`, ids, tokenBytes(vocab));
+await writeTokenFile(`${outPrefix}.tokens`, stream, tokenBytes(tok.vocabSize));
 await writeFileBytes(
   `${outPrefix}.tokenizer.json`,
   new TextEncoder().encode(JSON.stringify(tok.export())),
@@ -137,4 +150,4 @@ await writeFileBytes(`${outPrefix}.template.txt`, new TextEncoder().encode(CHAT_
 console.log(
   `\nwrote ${outPrefix}.tokens (${tokenBytes(vocab)}B/token), .tokenizer.json, .template.txt`,
 );
-console.log(`sample decode:\n${tok.decode(ids.slice(0, 80))}`);
+console.log(`sample decode:\n${tok.decode(Array.from(stream.subarray(0, 80)))}`);
