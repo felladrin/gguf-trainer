@@ -19,7 +19,7 @@
 // every param's update then reads, matching AdamW's clip-then-step order.
 
 import type { Tensor } from "../model/autograd.ts";
-import { bindF32, ceilDiv, f32lit, grid2D } from "./webgpu.ts";
+import { bindF32, ceilDiv, f32lit, grid2D } from "./wgsl.ts";
 import type { GpuBuffer, WebGPUBackend } from "./webgpu.ts";
 import type { AdamOpts } from "../train/adam.ts";
 

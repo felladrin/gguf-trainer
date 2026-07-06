@@ -21,7 +21,7 @@
 import { Tensor } from "../model/autograd.ts";
 import type { AdamOpts } from "../train/adam.ts";
 import { AdamWGpu } from "./adamw_gpu.ts";
-import { bindF32, ceilDiv, f32lit, grid2D } from "./webgpu.ts";
+import { bindF32, ceilDiv, f32lit, grid2D } from "./wgsl.ts";
 import type { GpuBuffer, WebGPUBackend } from "./webgpu.ts";
 
 export interface MuonGpuOpts {
