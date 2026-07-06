@@ -603,6 +603,34 @@ async function main() {
     );
     gpu.attnFlashMinT = 2048;
   }
+
+  //    (e) Sliding-window attention (Gemma3 SWA layers): each query t attends
+  //        keys [t-W+1, t]. Window chosen < T (and not tile-aligned) so it
+  //        genuinely restricts. Both paths must match the CPU windowed ref.
+  const windowCases: [number, number, number, number, number, string][] = [
+    [193, 4, 2, 24, 48, "T=193, hd=24, group=2, W=48"],
+    [130, 3, 3, 6, 40, "T=130, hd=6, group=1, W=40"],
+    [67, 4, 2, 32, 20, "T=67, hd=32, group=2, W=20"],
+  ];
+  for (const [T, Hq, Hkv, hd, W, label] of windowCases) {
+    const q = randTensor([T, Hq * hd], rng);
+    const k = randTensor([T, Hkv * hd], rng);
+    const v = randTensor([T, Hkv * hd], rng);
+    await opCase(
+      gpu,
+      `attention(${label}) mat`,
+      [q, k, v],
+      () => attention(q, k, v, T, Hq, Hkv, hd, W),
+    );
+    gpu.attnFlashMinT = 1;
+    await opCase(
+      gpu,
+      `attention(${label}) flash`,
+      [q, k, v],
+      () => attention(q, k, v, T, Hq, Hkv, hd, W),
+    );
+    gpu.attnFlashMinT = 2048;
+  }
   await flashLargeTCheck();
 
   // 7. GPU-resident Muon optimizer (src/backend/muon_gpu.ts): Newton–Schulz

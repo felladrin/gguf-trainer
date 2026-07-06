@@ -602,10 +602,11 @@ export class WebGPUBackend implements OpsBackend {
     Hq: number,
     Hkv: number,
     hd: number,
+    window = 0,
   ): Tensor {
     this.beginForwardOp();
     this.curLabel = "attention";
-    const a: AttnDims = { T, Hq, Hkv, hd };
+    const a: AttnDims = { T, Hq, Hkv, hd, window };
     const eq = this.entryFor(q);
     const ek = this.entryFor(k);
     const ev = this.entryFor(v);

@@ -342,6 +342,7 @@ export interface AttnDims {
   Hq: number;
   Hkv: number;
   hd: number;
+  window?: number; // sliding-window size (keys [t-window+1, t]); 0/undefined = full causal
 }
 
 function attnConsts(a: AttnDims): string {
@@ -349,7 +350,20 @@ function attnConsts(a: AttnDims): string {
   return `const T: u32 = ${a.T}u; const HQ: u32 = ${a.Hq}u; const HKV: u32 = ${a.Hkv}u;
 const HD: u32 = ${a.hd}u; const GROUP: u32 = ${a.Hq / a.Hkv}u;
 const QS: u32 = ${a.Hq * a.hd}u; const KS: u32 = ${a.Hkv * a.hd}u;
-const SCALE: f32 = ${f32lit(scale)};`;
+const SCALE: f32 = ${f32lit(scale)}; const WINDOW: u32 = ${a.window ?? 0}u;
+// First key attended by query row t under the sliding window (0 = full causal).
+fn winStart(t: u32) -> u32 { if (WINDOW == 0u || t + 1u <= WINDOW) { return 0u; } return t + 1u - WINDOW; }
+// Block-aligned window start for the flash kernels: the lower key bound is made
+// uniform across a 64-query block so every thread in a wave reads the same K[s]
+// in lockstep (the free broadcast the full-causal kernel relies on — a per-thread
+// lower bound offset by the query index destroys it, making SWA slower than full;
+// keys before a row's own window [t-WINDOW+1,t] are read but masked out below).
+fn winStartBlock(t: u32) -> u32 {
+  if (WINDOW == 0u) { return 0u; }
+  let blk = (t / 64u) * 64u;
+  if (blk + 1u <= WINDOW) { return 0u; }
+  return blk + 1u - WINDOW;
+}`;
 }
 
 // --- Attention, small-T regime: materialized [Hq,T,T] probabilities ----------
@@ -378,20 +392,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let t = i % T;
   let kv = h / GROUP;
   var maxS = -3.0e38;
-  for (var si = 0u; si <= t; si++) {
+  for (var si = winStart(t); si <= t; si++) {
     var dot = 0.0;
     for (var d = 0u; d < HD; d++) { dot = dot + QB[t * QS + h * HD + d] * KB[si * KS + kv * HD + d]; }
     maxS = max(maxS, dot * SCALE);
   }
   var sum = 0.0;
-  for (var si = 0u; si <= t; si++) {
+  for (var si = winStart(t); si <= t; si++) {
     var dot = 0.0;
     for (var d = 0u; d < HD; d++) { dot = dot + QB[t * QS + h * HD + d] * KB[si * KS + kv * HD + d]; }
     let e = exp(dot * SCALE - maxS);
     PB[(h * T + t) * T + si] = e;
     sum = sum + e;
   }
-  for (var si = 0u; si <= t; si++) {
+  for (var si = winStart(t); si <= t; si++) {
     PB[(h * T + t) * T + si] = PB[(h * T + t) * T + si] / sum;
   }
 }`;
@@ -414,7 +428,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let t = th / HQ;
   let kv = h / GROUP;
   var a = 0.0;
-  for (var si = 0u; si <= t; si++) {
+  for (var si = winStart(t); si <= t; si++) {
     a = a + PB[(h * T + t) * T + si] * VB[si * KS + kv * HD + d];
   }
   YB[t * QS + h * HD + d] = a;
@@ -442,12 +456,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let t = i % T;
   let kv = h / GROUP;
   var dot = 0.0;
-  for (var si = 0u; si <= t; si++) {
+  for (var si = winStart(t); si <= t; si++) {
     var dp = 0.0;
     for (var d = 0u; d < HD; d++) { dp = dp + GB[t * QS + h * HD + d] * VB[si * KS + kv * HD + d]; }
     dot = dot + PB[(h * T + t) * T + si] * dp;
   }
-  for (var si = 0u; si <= t; si++) {
+  for (var si = winStart(t); si <= t; si++) {
     var dp = 0.0;
     for (var d = 0u; d < HD; d++) { dp = dp + GB[t * QS + h * HD + d] * VB[si * KS + kv * HD + d]; }
     DS[(h * T + t) * T + si] = PB[(h * T + t) * T + si] * (dp - dot) * SCALE;
@@ -472,7 +486,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let t = th / HQ;
   let kv = h / GROUP;
   var a = 0.0;
-  for (var si = 0u; si <= t; si++) {
+  for (var si = winStart(t); si <= t; si++) {
     a = a + DS[(h * T + t) * T + si] * KB[si * KS + kv * HD + d];
   }
   DQ[t * QS + h * HD + d] = DQ[t * QS + h * HD + d] + a;
@@ -500,8 +514,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let kv = skv % HKV;
   let si = skv / HKV;
   var a = 0.0;
+  let tEnd = select(T, min(T, si + WINDOW), WINDOW != 0u);
   for (var h = kv * GROUP; h < kv * GROUP + GROUP; h++) {
-    for (var t = si; t < T; t++) {
+    for (var t = si; t < tEnd; t++) {
       a = a + ${lhs}[(h * T + t) * T + si] * SRC[t * QS + h * HD + d];
     }
   }
@@ -551,9 +566,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   var m = -3.0e38;
   var l = 0.0;
-  for (var s = 0u; s <= t; s++) {
+  for (var s = winStartBlock(t); s <= t; s++) {
     var dot = 0.0;
     for (var d = 0u; d < HD; d++) { dot = dot + qr[d] * KB[s * KS + kv * HD + d]; }
+    if (WINDOW != 0u && s + WINDOW <= t) { continue; } // key before this row's window
     let sc = dot * SCALE;
     let mNew = max(m, sc);
     let corr = exp(m - mNew);
@@ -626,13 +642,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   let lse = LSE[h * T + t];
   let dRow = DB[h * T + t];
-  for (var s = 0u; s <= t; s++) {
+  for (var s = winStartBlock(t); s <= t; s++) {
     var dot = 0.0;
     var dp = 0.0;
     for (var d = 0u; d < HD; d++) {
       dot = dot + qr[d] * KB[s * KS + kv * HD + d];
       dp = dp + go[d] * VB[s * KS + kv * HD + d];
     }
+    if (WINDOW != 0u && s + WINDOW <= t) { continue; } // key before this row's window
     let ds = exp(dot * SCALE - lse) * (dp - dRow) * SCALE;
     for (var d = 0u; d < HD; d++) { dq[d] = dq[d] + ds * KB[s * KS + kv * HD + d]; }
   }
@@ -691,8 +708,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: 
       dv[d] = 0.0;
     }
   }
+  // Under a sliding window, keys in this 64-block [wg.x*64, wg.x*64+63] are only
+  // attended by queries up to (lastKey)+WINDOW-1, so stop the tile scan there.
+  let t0End = select(T, min(T, wg.x * 64u + 64u + WINDOW), WINDOW != 0u);
   for (var h = kv * GROUP; h < kv * GROUP + GROUP; h++) {
-    for (var t0 = wg.x * 64u; t0 < T; t0 += BT) {
+    for (var t0 = wg.x * 64u; t0 < t0End; t0 += BT) {
       for (var j = li.x; j < BT * HD; j += 64u) {
         let t = t0 + j / HD;
         let d = j % HD;
@@ -718,7 +738,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: 
       }
       workgroupBarrier();
       if (live) {
-        let tEnd = min(t0 + BT, T);
+        var tEnd = min(t0 + BT, T);
+        if (WINDOW != 0u) { tEnd = min(tEnd, s + WINDOW); }
         for (var t = max(t0, s); t < tEnd; t++) {
           let b = (t - t0) * HD;
           var dot = 0.0;

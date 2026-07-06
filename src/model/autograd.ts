@@ -113,6 +113,7 @@ export interface OpsBackend {
     Hq: number,
     Hkv: number,
     hd: number,
+    window: number,
   ): Tensor;
   crossEntropy(logits: Tensor, targets: number[]): Tensor;
 }
@@ -369,6 +370,8 @@ export function rope(
 /**
  * Fused causal multi-head attention with grouped-query (GQA).
  * q:[T,Hq*hd], k:[T,Hkv*hd], v:[T,Hkv*hd] -> [T,Hq*hd].
+ * `window` > 0 restricts each query t to keys [t-window+1, t] (sliding window,
+ * as in Gemma3's SWA layers); 0 = full causal.
  */
 export function attention(
   q: Tensor,
@@ -378,12 +381,14 @@ export function attention(
   Hq: number,
   Hkv: number,
   hd: number,
+  window = 0,
 ): Tensor {
-  if (opsBackend) return opsBackend.attention(q, k, v, T, Hq, Hkv, hd);
+  if (opsBackend) return opsBackend.attention(q, k, v, T, Hq, Hkv, hd, window);
   const group = Hq / Hkv;
   const scale = 1 / Math.sqrt(hd);
+  const winStart = (t: number) => (window > 0 && t + 1 > window ? t + 1 - window : 0);
   const out = Tensor.zeros([T, Hq * hd]);
-  // probs[h][t] = Float32Array of length (t+1)
+  // probs[h][t] = Float32Array of length (t+1); entries below winStart(t) stay 0.
   const probs: Float32Array[][] = [];
   const qStride = Hq * hd;
   const kvStride = Hkv * hd;
@@ -392,10 +397,11 @@ export function attention(
     const kv = Math.floor(h / group);
     probs[h] = [];
     for (let t = 0; t < T; t++) {
+      const s0 = winStart(t);
       const scores = new Float32Array(t + 1);
       let maxS = -Infinity;
       const qb = t * qStride + h * hd;
-      for (let s = 0; s <= t; s++) {
+      for (let s = s0; s <= t; s++) {
         const kb = s * kvStride + kv * hd;
         let dot = 0;
         for (let d = 0; d < hd; d++) dot += q.data[qb + d] * k.data[kb + d];
@@ -404,16 +410,16 @@ export function attention(
         if (dot > maxS) maxS = dot;
       }
       let sum = 0;
-      for (let s = 0; s <= t; s++) {
+      for (let s = s0; s <= t; s++) {
         const e = Math.exp(scores[s] - maxS);
         scores[s] = e;
         sum += e;
       }
-      for (let s = 0; s <= t; s++) scores[s] /= sum;
+      for (let s = s0; s <= t; s++) scores[s] /= sum;
       probs[h][t] = scores;
 
       const ob = t * qStride + h * hd;
-      for (let s = 0; s <= t; s++) {
+      for (let s = s0; s <= t; s++) {
         const p = scores[s];
         const vb = s * kvStride + kv * hd;
         for (let d = 0; d < hd; d++) out.data[ob + d] += p * v.data[vb + d];
@@ -426,12 +432,13 @@ export function attention(
     for (let h = 0; h < Hq; h++) {
       const kv = Math.floor(h / group);
       for (let t = 0; t < T; t++) {
+        const s0 = winStart(t);
         const p = probs[h][t];
         const ob = t * qStride + h * hd;
         const qb = t * qStride + h * hd;
         // dP[s] = sum_d dOut[t,h,d]*V[s,kv,d]; also accumulate dV.
         const dP = new Float32Array(t + 1);
-        for (let s = 0; s <= t; s++) {
+        for (let s = s0; s <= t; s++) {
           const vb = s * kvStride + kv * hd;
           let acc = 0;
           for (let d = 0; d < hd; d++) {
@@ -442,8 +449,8 @@ export function attention(
         }
         // softmax backward -> dscore, then scale.
         let dot = 0;
-        for (let s = 0; s <= t; s++) dot += p[s] * dP[s];
-        for (let s = 0; s <= t; s++) {
+        for (let s = s0; s <= t; s++) dot += p[s] * dP[s];
+        for (let s = s0; s <= t; s++) {
           const dscore = p[s] * (dP[s] - dot) * scale;
           const kb = s * kvStride + kv * hd;
           for (let d = 0; d < hd; d++) {
