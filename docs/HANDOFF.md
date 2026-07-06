@@ -121,25 +121,71 @@ functional gate at T=3584 under spec-default limits.
 ## Also added (later session)
 
 - **Assistant-only loss masking (chat/instruct SFT).** `crossEntropy` (CPU `src/model/autograd.ts`
-  and the GPU kernels in `src/backend/webgpu.ts`) now treats a target of `-1` as an ignore-index:
-  no loss, no gradient, mean over kept rows (`divBuf` uniform; `-1` uploads as `0xffffffff`). With no
+  and the GPU kernels in `src/backend/webgpu.ts`) now treats a target of `-1` as an ignore-index: no
+  loss, no gradient, mean over kept rows (`divBuf` uniform; `-1` uploads as `0xffffffff`). With no
   masked rows it is bit-identical to the old full-sequence mean, so existing parity holds — plus a
-  new `crossEntropy (ignore-index)` parity case. `chat.assistantLossMask()` builds the per-token mask
-  over rendered ChatML (supervise assistant content + its `<|im_end|>`, skip the `assistant\n`
+  new `crossEntropy (ignore-index)` parity case. `chat.assistantLossMask()` builds the per-token
+  mask over rendered ChatML (supervise assistant content + its `<|im_end|>`, skip the `assistant\n`
   header, system/user, and scaffolding); the web corpus builder writes a parallel `.mask`, and both
   trainers take an optional `supervised` TokenSource (`maskWindow()` applies it). On by default for
   chat models (wizard toggle in step 4). Self-check in `tests/gradcheck.ts`.
-- **External Qwen3 GGUF import (Tier-2 loader).** `tokenizerFromGGUF` recovers control/special tokens
-  from `tokenizer.ggml.token_type` (also fixes our own chat-model resume, which was silently losing
-  atomic ChatML); `dequantize` gained BF16 and now throws a clear error on unsupported k-quants
-  instead of returning silent zeros. F16/BF16/Q8_0/Q4_0 external Qwen3 GGUFs load for fine-tune.
-  Out of scope by design (this is a train-from-scratch project, not a llama.cpp reimplementation):
-  k-quant super-block dequant and Qwen's exact pre-tokenizer regex — both matter only for byte-exact
-  loading of someone else's quantized release. A k-quant file fails loud rather than silently.
+- **External Qwen3 GGUF import (Tier-2 loader).** `tokenizerFromGGUF` recovers control/special
+  tokens from `tokenizer.ggml.token_type` (also fixes our own chat-model resume, which was silently
+  losing atomic ChatML); `dequantize` gained BF16 and now throws a clear error on unsupported
+  k-quants instead of returning silent zeros. F16/BF16/Q8_0/Q4_0 external Qwen3 GGUFs load for
+  fine-tune. Out of scope by design (this is a train-from-scratch project, not a llama.cpp
+  reimplementation): k-quant super-block dequant and Qwen's exact pre-tokenizer regex — both matter
+  only for byte-exact loading of someone else's quantized release. A k-quant file fails loud rather
+  than silently.
 - **Mid-run checkpointing.** `trainLMGpuResident` takes `checkpointEvery` + `onCheckpoint`; it syncs
   device-resident weights to the host and fires the callback so long runs export a loadable GGUF
   periodically (used by `examples/train_tinystories.ts`). Measured ~6.46 s/step for the 29.4M config
   (hidden 512 × 8 layers) on an M1 Max.
+
+## Performance work (WebGPU backend)
+
+All below are committed and gated by `tests/gpu_parity.ts`. Measured on an M1 Max.
+
+- **Per-kernel profiler.** `WebGPUBackend.startProfile()/stopProfile()` time each dispatch in its
+  own compute pass via the `timestamp-query` feature (opted into by `initWebGPU` when the adapter
+  offers it; `backend.timestampSupported`), attributed to an op label. Run
+  `deno run -A --unstable-webgpu examples/profile_gpu.ts [hidden] [layers] [seqLen] [steps]`. Note
+  it serializes dispatches, so read the _relative_ split, not absolute ms. What it showed: at seqLen
+  ~1024 the GEMM family (linear + Muon's Newton–Schulz) dominates; past ~2K, attention's O(T²) takes
+  over. That ranking drove the work below.
+- **Register-tiled GEMM.** `srcGemm` computes a 64×64 output tile with each thread owning a 4×4
+  micro-tile of accumulators, **unrolled into named scalars** (a loop-indexed WGSL array does not
+  promote to registers and spills — the rolled version measured ~3× _slower_). Since `linear` and
+  Newton–Schulz share the kernel, this lifted both: **1.9–3.3× end-to-end** (bigger/GEMM-heavier
+  models gain more).
+- **2-D dispatch fold (enables 8K context).** A flat `ceilDiv(n,256)` dispatch overflows WebGPU's
+  65535-workgroups-per-dimension cap past ~16.7M elements, which crashed training at seqLen≥4096
+  (cross-entropy backward) and blocks SwiGLU/`[T,ffn]`, per-head RMSNorm (`rows=T·H`), and a large
+  embedding. `recordDispatch` now folds `x>65535` into a 2-D grid at one point; the overflow-capable
+  kernels bake the matching gridX (`grid2D`/`gridRows`) to rebuild their index. Training runs at
+  seqLen 4096 and 8192.
+- **f16 mixed precision (compute).** `backend.setPrecision("f16")` / the `precision` option on
+  `trainLMGpuResident` / `GGUF_F16=1` on `train_tinystories`: the GEMM multiplies operands in f16
+  and accumulates the K reduction in f32 (the tensor-core pattern). Buffers, gradients, and the
+  optimizer stay f32, so **no loss scaling is needed**. Requires `shader-f16`
+  (`backend.f16Supported`; host transfer helpers in `f16.ts`). This is the **Strix Halo** win (2×
+  packed-f16 ALU on the dominant kernel); Apple GPUs run f16 and f32 ALU at the same rate, so M1 Max
+  is ~neutral. Validated: f16 GEMM matches the f32 CPU reference within a loose tolerance, and a
+  60-step run tracks the f32 loss trajectory (6.24→0.02 vs 6.24→0.015).
+
+**Remaining perf roadmap (priority order):**
+
+1. **Full f16 _storage_** — activations/weights/grads in f16 buffers (halves memory → bigger batch
+   at 8K on a 128 GB APU; f16 bandwidth on elementwise/attention; f16 attention compute). Needs f32
+   master weights + a f16 shadow, dynamic **loss scaling** (grads stored f16 underflow otherwise),
+   and per-buffer dtype. Largest, most delicate change; tune the loss-scale schedule on the target
+   (Strix Halo), and validate stability with a real run, not just init parity.
+2. **vec4 vectorization** of the elementwise/attention kernels (bandwidth-bound; measurable on M1).
+3. **Subgroup-matrix GEMM** (`chromium-experimental-subgroup-matrix`, Metal+Vulkan) behind a feature
+   check with the register-tile kernel as fallback — highest ceiling, most portability caveats.
+4. **Cross-entropy memory at large vocab.** CE materializes `PROBS`/`DLOG` `[T,V]`; at 8K × 32k
+   vocab that is ~1 GB each. A fused online-softmax CE (like the flash attention path) would remove
+   it.
 
 ## Non-negotiable invariants (do not break these)
 
@@ -347,13 +393,15 @@ src/tokenizer/ byte-level BPE (train + export/fromData round-trip)
 src/model/     config (+ scaleConfig), autograd (CPU op set + OpsBackend hook), qwen3 forward, mup
 src/train/     optimizer iface, adamw, muon, trainer (CPU), schedule (WSD), qk_clip (MuonClip)
 src/data/      tokens.ts (TokenSource: in-memory + disk-streaming corpus access)
-src/backend/   webgpu.ts (WGSL kernels, buffers, sync), train_gpu.ts,
+src/backend/   wgsl.ts (pure WGSL kernel-source generators + codegen/dispatch helpers),
+               webgpu.ts (backend: buffers, sync, dispatch, timestamp-query profiler),
+               f16.ts (host f16<->f32 for mixed precision), train_gpu.ts,
                muon_gpu.ts + adamw_gpu.ts (GPU-resident optimizers)
 src/export/    export_gguf (model -> GGUF, the llama.cpp contract), load_gguf (GGUF -> model)
 tests/         gradcheck.ts (FD gradient gate), gpu_parity.ts (GPU-vs-CPU gate)
 examples/      demo.ts (CPU end-to-end), demo_gpu.ts (WebGPU), train_streaming.ts (disk-streaming),
                pretokenize.ts (corpus -> .tokens + vocab), train_tinystories.ts (real GPU run),
-               mup_coord_check.ts (muP width sweep on the real corpus)
+               profile_gpu.ts (per-kernel GPU-time breakdown), mup_coord_check.ts (muP width sweep)
 web/           the training wizard: server/ (Deno API+SSE, HF ingestion, corpus, job),
                client/ (Vite+React), shared/types.ts; see web/README.md
 docs/          DESIGN.md (rationale + technique research), HANDOFF.md (this file)

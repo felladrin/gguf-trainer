@@ -124,7 +124,10 @@ cluster scale, but WebGPU targets f16/f32 compute — not worth the complexity h
 shaders behind the same `Tensor` interface in `src/backend/webgpu.ts`, forward and backward, in the
 planned order:
 
-1. `matmul`/`linear` (tiled GEMM) — throughput-critical, built first. ✓
+1. `matmul`/`linear` (tiled GEMM) — throughput-critical, built first. ✓ Later register-tiled (4×4
+   micro-tile per thread, unrolled to stay in registers; 1.9–3.3× end-to-end) and made f16-capable
+   (f16 multiply, f32 accumulate via `setPrecision("f16")`). Kernel sources now live in
+   `src/backend/wgsl.ts`; see the performance-work section in `docs/HANDOFF.md`.
 2. elementwise `add`, `mul`, `silu`. ✓
 3. `rmsnorm`, `rmsnorm_heads` (QK-norm) — workgroup reductions. ✓
 4. `rope`, causal `attention`, `cross_entropy`. ✓ Attention uses a hybrid dispatch: materialized
