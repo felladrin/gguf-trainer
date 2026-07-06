@@ -1,4 +1,4 @@
-// End-to-end WebGPU demo: train Qwen3 from scratch on the GPU and write a
+// End-to-end WebGPU demo: train Gemma3 from scratch on the GPU and write a
 // llama.cpp-loadable GGUF. Same pipeline as demo.ts, but every autograd op
 // runs as a WGSL compute shader via src/backend/webgpu.ts.
 //
@@ -10,10 +10,10 @@ import { readGGUF } from "../src/gguf/gguf.ts";
 import { dequantize } from "../src/gguf/quantize.ts";
 import { writeFileBytes } from "../src/io.ts";
 import { crossEntropy, mulberry32 } from "../src/model/autograd.ts";
-import { paramCount, tinyConfig } from "../src/model/config.ts";
-import { Qwen3Model } from "../src/model/qwen3.ts";
+import { gemma3Config, gemma3ParamCount } from "../src/model/config.ts";
+import { Gemma3Model } from "../src/model/gemma3.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
-import { buildGGUF } from "../src/export/export_gguf.ts";
+import { buildGemma3GGUF } from "../src/export/export_gguf.ts";
 import { initWebGPU } from "../src/backend/webgpu.ts";
 import type { WebGPUBackend } from "../src/backend/webgpu.ts";
 import { MuonGpu } from "../src/backend/muon_gpu.ts";
@@ -35,7 +35,7 @@ function argmax(row: Float32Array): number {
 /** Greedy sampling with the forward pass on the GPU (one sync per token). */
 async function generateGpu(
   gpu: WebGPUBackend,
-  model: Qwen3Model,
+  model: Gemma3Model,
   tok: BPETokenizer,
   prompt: string,
   n: number,
@@ -77,14 +77,19 @@ async function main() {
   const tokens = tok.encode(CORPUS);
   console.log(`Tokenizer: vocab=${tok.vocabSize}, corpus encoded to ${tokens.length} tokens`);
 
-  // 2. The full tinyConfig — larger than the CPU demo's cut-down model, which
-  //    is the point of having a GPU backend.
-  const cfg = tinyConfig(tok.vocabSize);
-  const model = new Qwen3Model(cfg, mulberry32(1234));
+  // 2. A tiny Gemma3 shaped to exercise the arch's distinctive paths on the GPU:
+  //    swaPattern=3 over 4 layers makes layer 2 a full-attention (global) layer
+  //    and 0/1/3 sliding-window, and window=16 < seqLen=32 so the SWA genuinely
+  //    restricts (both the global and local RoPE bases and both attention masks
+  //    get exercised — a real arch-contract check, not just a size bump).
+  const cfg = gemma3Config(tok.vocabSize, 128, 4, 32, 32, 16);
+  cfg.swaPattern = 3;
+  const model = new Gemma3Model(cfg, mulberry32(1234));
   console.log(
-    `Model: qwen3, ${cfg.nLayers} layers, hidden=${cfg.hiddenSize}, ` +
+    `Model: gemma3, ${cfg.nLayers} layers, hidden=${cfg.hiddenSize}, ` +
       `heads=${cfg.nHeads}/${cfg.nKVHeads}, headDim=${cfg.headDim}, ` +
-      `~${(paramCount(cfg) / 1e3).toFixed(1)}K params`,
+      `window=${cfg.slidingWindow}, pattern=${cfg.swaPattern}, ` +
+      `~${(gemma3ParamCount(cfg) / 1e3).toFixed(1)}K params`,
   );
 
   // 3. Trust gate: at init, the GPU forward+loss must match the CPU reference
@@ -183,15 +188,16 @@ async function main() {
   // 6. Export GGUF. Parameters live on the host (the optimizer steps them
   //    there), so the export path is byte-identical to the CPU demo's.
   const outDir = new URL(".", import.meta.url).pathname;
-  const bytes = buildGGUF(model, tok.export(), cfg, { quant: "f16", name: "tinyqwen3-gpu" });
-  const path = `${outDir}tinyqwen3-gpu-f16.gguf`;
+  const bytes = buildGemma3GGUF(model, tok.export(), cfg, { quant: "f16", name: "tinygemma3-gpu" });
+  const path = `${outDir}tinygemma3-gpu-f16.gguf`;
   await writeFileBytes(path, bytes);
   console.log(`\nWrote ${path}  (${(bytes.length / 1024).toFixed(1)} KiB)`);
 
   const g = readGGUF(bytes);
   const arch = g.metadata.get("general.architecture");
-  if (arch !== "qwen3") throw new Error(`arch mismatch: ${arch}`);
-  const expectedTensors = 2 + (cfg.tieEmbeddings ? 0 : 1) + cfg.nLayers * 11;
+  if (arch !== "gemma3") throw new Error(`arch mismatch: ${arch}`);
+  // Gemma3: 13 tensors/layer (11 + the two sandwich norms post_attention/post_ffw).
+  const expectedTensors = 2 + (cfg.tieEmbeddings ? 0 : 1) + cfg.nLayers * 13;
   if (g.tensors.length !== expectedTensors) {
     throw new Error(`tensor count ${g.tensors.length} != expected ${expectedTensors}`);
   }
@@ -201,7 +207,11 @@ async function main() {
   for (let i = 0; i < de.length; i++) {
     if (!Number.isFinite(de[i])) throw new Error("dequantized embedding has non-finite values");
   }
-  console.log(`  verify[f16]: ${g.tensors.length} tensors, arch=qwen3 ✓`);
+  console.log(
+    `  verify[f16]: ${g.tensors.length} tensors, arch=gemma3, sliding_window=` +
+      `${g.metadata.get("gemma3.attention.sliding_window")}, pattern=` +
+      `${g.metadata.get("gemma3.attention.sliding_window_pattern")} ✓`,
+  );
 
   console.log("\n=== all checks passed (WebGPU) ===");
 }

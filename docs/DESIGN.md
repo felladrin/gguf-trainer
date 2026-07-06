@@ -24,14 +24,15 @@ trainer is agnostic.
 ## Techniques worth adopting (prioritized)
 
 Sourced from the nanoGPT speedrun lineage and 2025 large-scale training reports. Ranked by payoff
-for a small from-scratch Qwen3 on a WebGPU budget.
+for a small from-scratch Gemma3 on a WebGPU budget.
 
-**Already in this repo (they're part of Qwen3):** QK-norm, RoPE, SwiGLU, GQA, RMSNorm, tied
-embeddings.
+**Already in this repo (they're part of Gemma3):** QK-norm, dual local/global RoPE, GeGLU, GQA,
+RMSNorm + sandwich norms (post-attention / post-FFN), tied embeddings, and per-layer sliding-window
+attention.
 
 1. **Muon optimizer** — done. Biggest single win; ~2× compute efficiency.
 2. **muP (maximal-update parametrization)** — init part done (`src/model/mup.ts`), contract-safe.
-   `Qwen3Model(cfg, rng, { baseWidth })` scales the embedding/head init by `sqrt(baseWidth/width)`
+   `Gemma3Model(cfg, rng, { baseWidth })` scales the embedding/head init by `sqrt(baseWidth/width)`
    so the tied-readout logits stay O(1) across widths; hidden matmuls keep `1/sqrt(fan_in)` and
    attention keeps `1/sqrt(headDim)` (both already width-correct and the llama.cpp contract), and
    there are no forward multipliers — so the forward pass and GGUF are unchanged. LR transfer: the
@@ -61,9 +62,9 @@ embeddings.
    `applyQKClip(model, tau)` caps each layer's logit-scale proxy
    `s = (1/√headDim)·√Σ_d(qNorm[d]·kNorm[d])²` at `tau` by rescaling `qNorm`/`kNorm` (each by
    `√(tau/s)`, so the product scales by `tau/s` and `s → tau`). Moonshot's original clips the q/k
-   _projection_ weights, but Qwen3's QK-RMSNorm renormalizes those away, so the norm weights are the
-   real lever (per-layer, since `qNorm`/`kNorm` are shared across a layer's heads). The proxy is the
-   std of a QK-normed logit; measured (T=128) the observed causal max tracks ~3.3–4.4× it and is
+   _projection_ weights, but Gemma3's QK-RMSNorm renormalizes those away, so the norm weights are
+   the real lever (per-layer, since `qNorm`/`kNorm` are shared across a layer's heads). The proxy is
+   the std of a QK-normed logit; measured (T=128) the observed causal max tracks ~3.3–4.4× it and is
    monotone, so bounding `s` bounds the max. Opt-in via `qkClipTau` on all three training loops;
    host-side weight math, so CPU and GPU apply it identically. Gated by `qkClipTrajectoryParity` in
    `tests/gpu_parity.ts` and a unit check in `tests/gradcheck.ts`. Off by default — QK-norm is the
@@ -81,7 +82,7 @@ embeddings.
    quality-filtered from FineWeb's 15T, the corpus behind the SmolLM family) is the step up once a
    model needs to know things beyond storytelling. Start with the former to validate the pipeline at
    real (non-toy) scale, move to a slice of the latter once it saturates. Pipeline is ready and
-   wired to a real corpus: `scaleConfig()` for 10–50M sizes, a disk-streaming token loader
+   wired to a real corpus: `gemma3Config()` for 10–50M sizes, a disk-streaming token loader
    (`src/data/tokens.ts`, so the corpus needn't fit in memory), `examples/pretokenize.ts` to turn
    any text file into a `.tokens` binary + reusable vocab (run against the TinyStories validation
    slice: 5.4M tokens, vocab 8192), and `examples/train_tinystories.ts`
@@ -90,29 +91,30 @@ embeddings.
    GPU-resident Muon+AdamW, export+verify GGUF. Smoke-tested end-to-end (loss drops, parity exact,
    GGUF loads in llama-cli); the remaining work is the multi-hour run itself, not code. FineWeb-Edu
    drops into the same `pretokenize` → `train` path once TinyStories saturates.
-7. **Speedrun tricks (ReLU² MLP / value-residuals / attention-window warmup)** — evaluated; decision
-   below. These are the nanoGPT-speedrun lineage's smaller-gain tricks. Measured against invariant
-   #1 (GGUF loadability), two of the three are architecture changes a `qwen3`-typed GGUF cannot
-   carry, so they stay documented-only, not built — the contract, not the effort, is what rules them
-   out:
-   - **ReLU² MLP** — replaces SwiGLU's `silu(gate)·up` with `relu(x)²`. Qwen3's FFN is SwiGLU by
-     definition (`ffn_gate` + `ffn_up` + `ffn_down`); an ReLU² block has no gate tensor, so
-     `llama.cpp` would not load the export as `qwen3`. Adopting it means shipping a non-loadable
+7. **Speedrun tricks (ReLU² MLP / value-residuals / sliding-window attention)** — evaluated;
+   decision below. These are the nanoGPT-speedrun lineage's smaller-gain tricks. Measured against
+   invariant #1 (GGUF loadability): two are architecture changes a `gemma3`-typed GGUF cannot carry
+   (so they stay documented-only), while the third — sliding-window attention — is now **built**,
+   because it is part of the Gemma3 architecture this repo trains:
+   - **ReLU² MLP** — replaces GeGLU's `gelu(gate)·up` with `relu(x)²`. Gemma3's FFN is GeGLU by
+     definition (`ffn_gate` + `ffn_up` + `ffn_down`); a ReLU² block has no gate tensor, so
+     `llama.cpp` would not load the export as `gemma3`. Adopting it means shipping a non-loadable
      model or forking the GGUF arch. **Off, not built.**
    - **Value residuals** — a learned per-layer mix of layer 0's value stream into deeper layers. Not
-     in the Qwen3 tensor schema, so the same problem: extra per-layer tensors the `qwen3` graph
+     in the Gemma3 tensor schema, so the same problem: extra per-layer tensors the `gemma3` graph
      won't read. **Off, not built.**
-   - **Attention-window warmup** — the one contract-safe trick: it is training-time only (restrict
-     each query to a sliding window of recent keys for the first N steps, then open to full causal),
-     so the exported weights and GGUF are byte-identical to a normal run. The cheapest correct form
-     here is a _sequence-length_ warmup (train short windows early, grow to full `seqLen`) — pure
-     loop/data logic, no kernel change, no new parity case, final model unchanged. Real but modest
-     wall-clock savings on long runs. **Not built yet; implementable on request** (a true sliding
-     window would instead need a masked-attention kernel plus a `tests/gpu_parity.ts` case).
+   - **Sliding-window attention** — **built**, as a first-class Gemma3 feature (not just a
+     training-time warmup). Each SWA layer restricts query `t` to keys `[t-W+1, t]`; the
+     dense/global layers (every `swaPattern`-th) keep full causal attention, each with its own RoPE
+     base. The masked windowed kernel is broadcast-preserving (block-aligned lower key bound +
+     per-row mask), so it is a real throughput lever at long context rather than the slowdown a
+     naïve per-thread window causes; exercised by `tests/gpu_parity.ts` (windowed mat + flash) and
+     `tests/gradcheck.ts` (`attention(SWA)`). A training-time _window warmup_ (shrink the window
+     early, open it later) could still layer on top as pure loop logic — **not built yet;
+     implementable on request.**
 
-   Bottom line: if a non-`qwen3` research export is ever acceptable, revisit ReLU² first (largest of
-   the three gains). Otherwise attention-window warmup is the only one that fits, and it is a
-   training-speed optimization, not a quality one.
+   Bottom line: sliding-window attention is in and validated. If a non-`gemma3` research export is
+   ever acceptable, revisit ReLU² first (largest remaining gain).
 
 **Deliberately deferred:** FP8/NVFP4 low-precision _training_ (Quartet, custom FP8 head). Big at
 cluster scale, but WebGPU targets f16/f32 compute — not worth the complexity here. Q4_0/Q8_0 remain

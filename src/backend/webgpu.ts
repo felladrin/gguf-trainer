@@ -2,7 +2,7 @@
 // shaders, forward AND backward, behind the same Tensor interface.
 //
 // How it plugs in: WebGPUBackend implements OpsBackend and registers itself via
-// setOpsBackend() (install()/uninstall()). ../model/qwen3.ts and the autograd
+// setOpsBackend() (install()/uninstall()). ../model/gemma3.ts and the autograd
 // backward() walk run unchanged — op calls route here, return ordinary Tensor
 // objects, and _backward closures encode GPU dispatches instead of CPU loops.
 //

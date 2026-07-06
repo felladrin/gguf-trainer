@@ -1,8 +1,8 @@
 // QK-logit control ("MuonClip"), adapted for a QK-normed model.
 //
 // Kimi K2's MuonClip caps attention-logit growth by rescaling the query/key
-// PROJECTION weights after each optimizer step. That lever is inert here: Qwen3
-// applies QK-RMSNorm after the q/k projections, so the projection scale is
+// PROJECTION weights after each optimizer step. That lever is inert here:
+// Gemma3 applies QK-RMSNorm after the q/k projections, so the projection scale is
 // renormalized away and the logit magnitude is set entirely by the per-head-dim
 // norm weights (qNorm/kNorm, shape [headDim], shared across heads). So we
 // control the logit scale directly through them — a per-layer clip, since the
@@ -22,10 +22,10 @@
 // the projection-weight version is a no-op, and reading the true per-step max
 // would mean instrumenting the (parity-delicate) attention kernels on both
 // backends. The norm-based control is data-independent, host-side, identical on
-// CPU and GPU, and off by default — Qwen3's QK-norm is already the primary
+// CPU and GPU, and off by default — Gemma3's QK-norm is already the primary
 // explosion guard; this is the belt-and-suspenders for scaling up.
 
-import type { Qwen3Model } from "../model/qwen3.ts";
+import type { Gemma3Model } from "../model/gemma3.ts";
 
 /** Std-scale of a QK-normed attention logit for one layer's norm weights. */
 export function qkLogitScale(qNorm: Float32Array, kNorm: Float32Array, headDim: number): number {
@@ -43,7 +43,7 @@ export function qkLogitScale(qNorm: Float32Array, kNorm: Float32Array, headDim: 
  * already under `tau` is untouched. Host-side weight math — the training loop
  * uploads the updated norms on the next step (they are aux/AdamW params).
  */
-export function applyQKClip(model: Qwen3Model, tau: number): number {
+export function applyQKClip(model: Gemma3Model, tau: number): number {
   if (!(tau > 0)) throw new Error("qk-clip tau must be > 0");
   const hd = model.cfg.headDim;
   let clipped = 0;

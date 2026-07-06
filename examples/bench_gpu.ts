@@ -9,8 +9,8 @@
 import { initWebGPU } from "../src/backend/webgpu.ts";
 import { MuonGpu } from "../src/backend/muon_gpu.ts";
 import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
-import { paramCount, scaleConfig } from "../src/model/config.ts";
-import { Qwen3Model } from "../src/model/qwen3.ts";
+import { gemma3Config, gemma3ParamCount } from "../src/model/config.ts";
+import { Gemma3Model } from "../src/model/gemma3.ts";
 import { mulberry32 } from "../src/model/autograd.ts";
 
 // deno-lint-ignore no-explicit-any
@@ -26,10 +26,10 @@ const maybeGpu = await initWebGPU();
 if (!maybeGpu) throw new Error("no WebGPU (run under Deno with --unstable-webgpu)");
 const gpu = maybeGpu; // non-null for use inside run()
 console.log(`adapter: ${gpu.adapterName} | f16Supported: ${gpu.f16Supported}`);
-const cfg = scaleConfig(vocab, hidden, layers, Math.max(512, seqLen));
+const cfg = gemma3Config(vocab, hidden, layers, Math.max(512, seqLen));
 console.log(
   `model: hidden=${hidden} layers=${layers} seqLen=${seqLen} batch=${batch} steps=${steps} ` +
-    `~${(paramCount(cfg) / 1e6).toFixed(1)}M params\n`,
+    `~${(gemma3ParamCount(cfg) / 1e6).toFixed(1)}M params\n`,
 );
 
 // A small repeating pattern so loss visibly drops (learnable), shared by both runs.
@@ -39,7 +39,7 @@ const base = Array.from({ length: 96 }, () => Math.floor(rng() * vocab));
 const toks = Array.from({ length: need }, (_, i) => base[i % base.length]);
 
 async function run(precision: "f32" | "f16") {
-  const model = new Qwen3Model(cfg, mulberry32(1234), { baseWidth: 128 });
+  const model = new Gemma3Model(cfg, mulberry32(1234), { baseWidth: 128 });
   const g = model.paramGroups();
   const opt = new MuonGpu(gpu, g.muon, g.aux, {
     lr: 0.02,

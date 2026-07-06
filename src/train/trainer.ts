@@ -3,7 +3,7 @@
 // Optimizer-agnostic — pass an AdamW or Muon instance.
 
 import { backward, crossEntropy } from "../model/autograd.ts";
-import type { Qwen3Model } from "../model/qwen3.ts";
+import type { Gemma3Model } from "../model/gemma3.ts";
 import type { Optimizer } from "./optimizer.ts";
 import { applyQKClip } from "./qk_clip.ts";
 import { toTokenSource } from "../data/tokens.ts";
@@ -37,7 +37,7 @@ export function maskWindow(targetIds: number[], supervised: TokenSource, start: 
   return targetIds;
 }
 
-export function trainLM(model: Qwen3Model, opts: TrainOpts): { step: number; loss: number }[] {
+export function trainLM(model: Gemma3Model, opts: TrainOpts): { step: number; loss: number }[] {
   const opt = opts.optimizer;
   const rng = opts.rng ?? Math.random;
   const logEvery = opts.logEvery ?? 20;

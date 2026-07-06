@@ -7,7 +7,7 @@
 //   deno run -A web/server/main.ts [port]
 
 import { mkdirSync, readdirSync, statSync } from "node:fs";
-import { DEFAULT_QWEN3_CHAT_TEMPLATE, detectMapping } from "../../src/data/chat.ts";
+import { DEFAULT_CHAT_TEMPLATE, detectMapping } from "../../src/data/chat.ts";
 import { readFileBytes } from "../../src/io.ts";
 import { fetchFirstRows, fetchNumRows, fetchSplits, resolveDataset } from "./hf.ts";
 import { parseDataFile } from "./parse.ts";
@@ -232,7 +232,7 @@ async function handler(req: Request): Promise<Response> {
   try {
     if (req.method === "OPTIONS") return withCorsPreflight();
     if (p === "/api/health") return json({ ok: true });
-    if (p === "/api/config") return json({ defaultChatTemplate: DEFAULT_QWEN3_CHAT_TEMPLATE });
+    if (p === "/api/config") return json({ defaultChatTemplate: DEFAULT_CHAT_TEMPLATE });
     if (p === "/api/dataset/preview" && req.method === "POST") return await handlePreview(req);
     if (p === "/api/train/start" && req.method === "POST") {
       return handleStart(await readBody<TrainConfig>(req));

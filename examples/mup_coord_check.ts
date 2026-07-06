@@ -27,8 +27,8 @@
 
 import { readFileText } from "../src/io.ts";
 import { mulberry32 } from "../src/model/autograd.ts";
-import { scaleConfig } from "../src/model/config.ts";
-import { Qwen3Model } from "../src/model/qwen3.ts";
+import { gemma3Config } from "../src/model/config.ts";
+import { Gemma3Model } from "../src/model/gemma3.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import type { TokenizerData } from "../src/tokenizer/bpe.ts";
 import { diskTokenSource, tokenBytes } from "../src/data/tokens.ts";
@@ -123,8 +123,8 @@ async function main() {
   // loss trajectory IS the coordinate check across training; the final weight
   // sync back to host lets us re-measure the logit RMS after real training.
   const train = async (width: number, mup: boolean): Promise<Run> => {
-    const cfg = scaleConfig(tok.vocabSize, width, 2, 512);
-    const model = new Qwen3Model(
+    const cfg = gemma3Config(tok.vocabSize, width, 2, 512);
+    const model = new Gemma3Model(
       cfg,
       mulberry32(1234),
       mup ? { baseWidth: BASE_WIDTH } : undefined,

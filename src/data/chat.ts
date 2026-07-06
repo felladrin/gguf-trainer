@@ -1,4 +1,4 @@
-// Conversational-dataset normalization + the default Qwen3 chat template.
+// Conversational-dataset normalization + the default (ChatML) chat template.
 //
 // Hugging Face conversational datasets come in several shapes (OpenAI `messages`,
 // ShareGPT `conversations`, Alpaca `instruction/input/output`, plain
@@ -16,10 +16,13 @@ export interface ChatMessage {
 /** The four things a model can be trained to be; drives data + template use. */
 export type ModelType = "base" | "instruct" | "reasoning" | "tools";
 
-// The Qwen3-4B-Instruct-2507 chat template, verbatim. String.raw keeps the
-// Jinja source's `\n` and `\"` as literal backslash sequences (a normal string
-// literal would collapse `\n` into a real newline, corrupting the template).
-export const DEFAULT_QWEN3_CHAT_TEMPLATE = String.raw`{%- if tools -%}
+// The default ChatML chat template (with tool-calling), adopted verbatim from
+// Qwen3-4B-Instruct-2507 — it is arch-neutral ChatML (<|im_start|>/<|im_end|>),
+// so a Gemma3 model trained here with ChatML specials renders correctly under
+// it. String.raw keeps the Jinja source's `\n` and `\"` as literal backslash
+// sequences (a normal string literal would collapse `\n` into a real newline,
+// corrupting the template).
+export const DEFAULT_CHAT_TEMPLATE = String.raw`{%- if tools -%}
     {{- "<|im_start|>system\n" -}}
     {%- if messages[0].role == "system" -%}
         {{- messages[0].content + "\n\n" -}}

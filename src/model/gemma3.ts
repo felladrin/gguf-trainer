@@ -1,7 +1,7 @@
-// Gemma3ForCausalLM forward pass, built from the autograd ops. Shares the
-// Qwen3 backbone (GQA, QK-RMSNorm, NEOX RoPE, tied embeddings, Muon param
-// split) and adds Gemma3's pieces so the export loads and runs in llama.cpp's
-// `gemma3` arch (verified against llama.cpp master):
+// Gemma3ForCausalLM forward pass, built from the autograd ops. Uses a standard
+// GQA transformer backbone (GQA, QK-RMSNorm, NEOX RoPE, tied embeddings, Muon
+// param split) plus Gemma3's distinctive pieces so the export loads and runs in
+// llama.cpp's `gemma3` arch (verified against llama.cpp master):
 //
 //   - sqrt(hidden) embedding scale on the token input (llama.cpp applies this
 //     at runtime; the raw embeddings are exported unscaled),
@@ -31,8 +31,7 @@ import {
   Tensor,
 } from "./autograd.ts";
 import { type Gemma3Config, isGlobalLayer } from "./config.ts";
-import { muPEmbedStd } from "./mup.ts";
-import type { MuPOpts } from "./qwen3.ts";
+import { muPEmbedStd, type MuPOpts } from "./mup.ts";
 
 interface Layer {
   attnNorm: Tensor;

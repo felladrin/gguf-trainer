@@ -1,6 +1,6 @@
-// Real (non-toy) run: train a Qwen3 from scratch on the pretokenized TinyStories
+// Real (non-toy) run: train a Gemma3 from scratch on the pretokenized TinyStories
 // corpus and write a llama.cpp-loadable GGUF. This is the turnkey entry point the
-// roadmap hands off — everything it needs (streaming loader, scaleConfig, muP
+// roadmap hands off — everything it needs (streaming loader, gemma3Config, muP
 // init, GPU-resident Muon + AdamW, WSD schedule, GGUF export) is already in the
 // library; this wires them to a real corpus with sensible defaults.
 //
@@ -8,8 +8,8 @@
 //   deno run -A examples/pretokenize.ts corpus/tinystories-valid.txt examples/tinystories 8192 10
 //
 // Then train (Deno only — WebGPU):
-//   deno run -A examples/train_tinystories.ts                     # defaults below (~14M params)
-//   deno run -A examples/train_tinystories.ts 512 8 6000          # ~33M, 6000 steps
+//   deno run -A examples/train_tinystories.ts                     # defaults below (~16M params)
+//   deno run -A examples/train_tinystories.ts 512 8 6000          # ~36M, 6000 steps
 //   deno run -A examples/train_tinystories.ts 128 2 12 64 4       # fast smoke test
 // Positional args: [hidden=384] [layers=6] [steps=3000] [seqLen=256] [batch=16]
 //                  [muonLr=0.02] [auxLr=0.003] [baseWidth=128]
@@ -23,11 +23,11 @@ import { readGGUF } from "../src/gguf/gguf.ts";
 import { dequantize } from "../src/gguf/quantize.ts";
 import { readFileText, writeFileBytes } from "../src/io.ts";
 import { crossEntropy, mulberry32 } from "../src/model/autograd.ts";
-import { paramCount, scaleConfig } from "../src/model/config.ts";
-import { Qwen3Model } from "../src/model/qwen3.ts";
+import { gemma3Config, gemma3ParamCount } from "../src/model/config.ts";
+import { Gemma3Model } from "../src/model/gemma3.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import type { TokenizerData } from "../src/tokenizer/bpe.ts";
-import { buildGGUF } from "../src/export/export_gguf.ts";
+import { buildGemma3GGUF } from "../src/export/export_gguf.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
 import { diskTokenSource, tokenBytes } from "../src/data/tokens.ts";
 import type { TokenSource } from "../src/data/tokens.ts";
@@ -59,7 +59,7 @@ function argmax(row: Float32Array): number {
 /** Greedy sampling with the forward pass on the GPU (one sync per token). */
 async function generateGpu(
   gpu: WebGPUBackend,
-  model: Qwen3Model,
+  model: Gemma3Model,
   tok: BPETokenizer,
   prompt: string,
   n: number,
@@ -145,17 +145,19 @@ async function main() {
       `(${epochs.toFixed(1)} epochs)`,
   );
 
-  // 2. Real-shape model via scaleConfig with muP init (embedding scaled by
+  // 2. Real-shape model via gemma3Config with muP init (embedding scaled by
   //    sqrt(baseWidth/hidden); hidden matmuls and attention are already
   //    width-correct, so the forward pass and the GGUF contract are unchanged).
-  const cfg = scaleConfig(tok.vocabSize, hidden, layers, 512);
+  //    At seqLen <= 512 the default 1024 SWA window spans the whole sequence, so
+  //    every layer is effectively full attention here (SWA is the 8K lever).
+  const cfg = gemma3Config(tok.vocabSize, hidden, layers, 512);
   if (seqLen > cfg.maxSeq) die(`seqLen ${seqLen} exceeds context_length ${cfg.maxSeq}`);
   const mup = baseWidth === hidden ? undefined : { baseWidth };
-  const model = new Qwen3Model(cfg, mulberry32(1234), mup);
+  const model = new Gemma3Model(cfg, mulberry32(1234), mup);
   console.log(
-    `Model: qwen3, ${cfg.nLayers} layers, hidden=${cfg.hiddenSize}, ` +
+    `Model: gemma3, ${cfg.nLayers} layers, hidden=${cfg.hiddenSize}, ` +
       `heads=${cfg.nHeads}/${cfg.nKVHeads}, headDim=${cfg.headDim}, ffn=${cfg.ffnDim}, ` +
-      `~${(paramCount(cfg) / 1e6).toFixed(1)}M params` +
+      `~${(gemma3ParamCount(cfg) / 1e6).toFixed(1)}M params` +
       (mup ? `, muP init @ baseWidth ${baseWidth}` : ", standard init"),
   );
 
@@ -204,9 +206,12 @@ async function main() {
 
   // GGUF export, reused for mid-run checkpoints and the final write, so a long
   // run always leaves a loadable model on disk even if it is interrupted.
-  const outPath = `${dir}tinystories-qwen3-f16.gguf`;
+  const outPath = `${dir}tinystories-gemma3-f16.gguf`;
   const exportGGUF = async (): Promise<Uint8Array> => {
-    const b = buildGGUF(model, tok.export(), cfg, { quant: "f16", name: "tinystories-qwen3" });
+    const b = buildGemma3GGUF(model, tok.export(), cfg, {
+      quant: "f16",
+      name: "tinystories-gemma3",
+    });
     await writeFileBytes(outPath, b);
     return b;
   };
@@ -262,8 +267,8 @@ async function main() {
   // 6. Export GGUF (f16 for a faithful resume) and verify it parses.
   const bytes = await exportGGUF();
   const g = readGGUF(bytes);
-  if (g.metadata.get("general.architecture") !== "qwen3") die("exported arch != qwen3");
-  const expected = 2 + (cfg.tieEmbeddings ? 0 : 1) + cfg.nLayers * 11;
+  if (g.metadata.get("general.architecture") !== "gemma3") die("exported arch != gemma3");
+  const expected = 2 + (cfg.tieEmbeddings ? 0 : 1) + cfg.nLayers * 13;
   if (g.tensors.length !== expected) die(`tensor count ${g.tensors.length} != ${expected}`);
   const emb = g.tensors.find((t) => t.name === "token_embd.weight");
   if (!emb) die("token_embd.weight missing from export");
@@ -272,7 +277,7 @@ async function main() {
   console.log(
     `\nWrote ${outPath} (${
       (bytes.length / 1e6).toFixed(1)
-    } MB, ${g.tensors.length} tensors, arch=qwen3 ✓)`,
+    } MB, ${g.tensors.length} tensors, arch=gemma3 ✓)`,
   );
   console.log(
     `Try it:  llama-cli -m ${outPath} -p "Once upon a time" -n 64 -st --simple-io --temp 0 </dev/null`,

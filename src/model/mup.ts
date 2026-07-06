@@ -12,8 +12,8 @@
 //     IN. We're free to choose it for the output side.
 //   - Hidden matmuls: init 1/sqrt(fan_in) already makes each linear's output
 //     O(1) at any width (variance fan_in * (1/fan_in) * 1). No change needed.
-//   - Attention: 1/sqrt(headDim) keeps scores O(1). Unchanged (and it's the
-//     Qwen3 contract).
+//   - Attention: 1/sqrt(headDim) keeps scores O(1). Unchanged (it's part of the
+//     llama.cpp-loadable contract this repo keeps).
 //   - Output (tied) side: logits = normed (RMS ~1) @ token_embd^T, so their
 //     scale is sqrt(hidden) * embed_std. Standard init (const 0.02) makes logits
 //     grow like sqrt(hidden) with width — the thing that breaks LR transfer.
@@ -30,6 +30,12 @@
 // recipe for this repo is: muP init + keep the tuned LRs. If a future change
 // (e.g. non-width-scaling ffnDim, or an untied head) breaks that, add an
 // explicit per-group LR scale here and re-run the coord check.
+
+/** muP transfer settings: init embeddings/head relative to a base width. */
+export interface MuPOpts {
+  baseWidth: number; // the proxy width the hyperparameters were tuned at
+  baseEmbedStd?: number; // embedding init std at baseWidth (default 0.02)
+}
 
 /**
  * muP embedding/readout init std at `width`, given the value `baseStd` that was

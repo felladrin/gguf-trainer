@@ -5,7 +5,7 @@
 // scalar loss and calls each recorded closure once.
 //
 // This is the CPU reference backend. It implements exactly the ops a
-// Qwen3ForCausalLM forward pass needs — no more. A WebGPU backend (see
+// Gemma3ForCausalLM forward pass needs — no more. A WebGPU backend (see
 // ../backend/webgpu.ts) is meant to implement the same op set with GPU
 // kernels behind the same Tensor interface.
 
@@ -286,7 +286,7 @@ export function rmsNorm(x: Tensor, weight: Tensor, eps: number): Tensor {
   return out;
 }
 
-/** Per-head RMSNorm (Qwen3 QK-norm): x:[T, H*hd], weight:[hd]. */
+/** Per-head RMSNorm (Gemma3 QK-norm): x:[T, H*hd], weight:[hd]. */
 export function rmsNormHeads(
   x: Tensor,
   weight: Tensor,
@@ -351,7 +351,7 @@ export function embedding(weight: Tensor, ids: number[]): Tensor {
 }
 
 /**
- * NEOX-style RoPE (as used by qwen) applied to x:[T, H*hd].
+ * NEOX-style RoPE (as used by gemma3) applied to x:[T, H*hd].
  * Pairs dim j with j+hd/2. positions are 0..T-1 plus posOffset.
  */
 export function rope(

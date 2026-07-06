@@ -4,7 +4,7 @@
 // For every op: build small random inputs, take loss = sum(r ⊙ f(x)) with fixed
 // random weights r, backprop the analytic gradient, then perturb each input
 // element by ±ε and compare (f(x+ε) − f(x−ε)) / 2ε against it. A whole-model
-// check does the same on sampled Qwen3 parameter elements through the real
+// check does the same on sampled Gemma3 parameter elements through the real
 // forward + crossEntropy. A negative control with a deliberately wrong backward
 // proves the harness actually rejects bad gradients.
 //
@@ -30,12 +30,12 @@ import {
   silu,
   Tensor,
 } from "../src/model/autograd.ts";
-import { Qwen3Model } from "../src/model/qwen3.ts";
-import type { Qwen3Config } from "../src/model/config.ts";
+import { Gemma3Model } from "../src/model/gemma3.ts";
+import type { Gemma3Config } from "../src/model/config.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
 import { applyQKClip, qkLogitScale } from "../src/train/qk_clip.ts";
-import { buildGGUF } from "../src/export/export_gguf.ts";
-import { loadQwen3FromGGUF } from "../src/export/load_gguf.ts";
+import { buildGemma3GGUF } from "../src/export/export_gguf.ts";
+import { loadGemma3FromGGUF } from "../src/export/load_gguf.ts";
 import { dequantize } from "../src/gguf/quantize.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { Muon } from "../src/train/muon.ts";
@@ -226,6 +226,16 @@ async function main() {
     fdCheck("attention(GQA)", [q, k, v], () => attention(q, k, v, T, Hq, Hkv, hd));
   }
   {
+    // Sliding-window attention (Gemma3 SWA layers): window < T so it genuinely
+    // restricts each query's key range. Validates the windowed CPU backward
+    // against finite differences (gpu_parity checks GPU-vs-CPU separately).
+    const T = 6, Hq = 4, Hkv = 2, hd = 6, W = 3;
+    const q = randTensor([T, Hq * hd], rng);
+    const k = randTensor([T, Hkv * hd], rng);
+    const v = randTensor([T, Hkv * hd], rng);
+    fdCheck("attention(SWA)", [q, k, v], () => attention(q, k, v, T, Hq, Hkv, hd, W));
+  }
+  {
     const T = 4, V = 9;
     const logits = randTensor([T, V], rng);
     const targets = [2, 7, 2, 0];
@@ -234,7 +244,9 @@ async function main() {
 
   // Whole model: sampled parameter elements through forward + crossEntropy.
   {
-    const cfg: Qwen3Config = {
+    // swaPattern 2 -> layer 0 sliding-window, layer 1 global (both paths + both
+    // RoPE bases exercised); slidingWindow 4 < seqLen 5 so the window restricts.
+    const cfg: Gemma3Config = {
       vocabSize: 13,
       hiddenSize: 8,
       nLayers: 2,
@@ -242,12 +254,15 @@ async function main() {
       nKVHeads: 1,
       headDim: 4,
       ffnDim: 16,
-      ropeBase: 10000,
+      ropeBase: 1_000_000,
+      ropeBaseLocal: 10_000,
       rmsEps: 1e-6,
       maxSeq: 16,
       tieEmbeddings: true,
+      slidingWindow: 4,
+      swaPattern: 2,
     };
-    const model = new Qwen3Model(cfg, mulberry32(99));
+    const model = new Gemma3Model(cfg, mulberry32(99));
     const ids = [1, 5, 2, 9, 5];
     const targets = [5, 2, 9, 5, 12];
 
@@ -264,7 +279,7 @@ async function main() {
       }
     }
     fdCheck(
-      "qwen3 full model",
+      "gemma3 full model",
       model.params(),
       () => crossEntropy(model.forward(ids), targets),
       { sample: 6, rtol: 2e-2, atol: 3e-3 },
@@ -274,7 +289,7 @@ async function main() {
     // along a random unit direction d and compare (L(θ+εd) − L(θ−εd)) / 2ε to
     // ⟨∇L, d⟩. The aggregate stays in the linear regime even for 0.02-scale
     // weights, and it exercises graph-level wiring (tied embeddings, fan-out).
-    const fresh = new Qwen3Model(cfg, mulberry32(99));
+    const fresh = new Gemma3Model(cfg, mulberry32(99));
     const params = fresh.params();
     const lossOf = () => crossEntropy(fresh.forward(ids), targets);
     for (const p of params) p.zeroGrad();
@@ -316,7 +331,7 @@ async function main() {
     }
     if (dirFails > 0) failures++;
     console.log(
-      `  ${dirFails === 0 ? "ok " : "FAIL"} qwen3 @ real init (directional, 4 trials)`,
+      `  ${dirFails === 0 ? "ok " : "FAIL"} gemma3 @ real init (directional, 4 trials)`,
     );
   }
 
@@ -384,7 +399,7 @@ async function main() {
   // logit-scale proxy at tau by rescaling qNorm/kNorm. Verifies the proxy math,
   // that clipping lands exactly on tau, symmetric q/k scaling, and no-op below.
   {
-    const cfg: Qwen3Config = {
+    const cfg: Gemma3Config = {
       vocabSize: 13,
       hiddenSize: 8,
       nLayers: 2,
@@ -392,12 +407,15 @@ async function main() {
       nKVHeads: 1,
       headDim: 4,
       ffnDim: 16,
-      ropeBase: 10000,
+      ropeBase: 1_000_000,
+      ropeBaseLocal: 10_000,
       rmsEps: 1e-6,
       maxSeq: 16,
       tieEmbeddings: true,
+      slidingWindow: 16,
+      swaPattern: 2,
     };
-    const model = new Qwen3Model(cfg, mulberry32(99));
+    const model = new Gemma3Model(cfg, mulberry32(99));
     let ok = true;
     // At init qNorm=kNorm=ones -> proxy = (1/sqrt(hd))*sqrt(hd) = 1. tau=0.5 clips.
     if (
@@ -433,15 +451,15 @@ async function main() {
   }
 
   // GGUF checkpoint round-trip: export a model+tokenizer, load it back with
-  // loadQwen3FromGGUF, and confirm config, tokenizer, weights, and the actual
-  // forward logits all survive. f32 is bit-exact; q8_0 is lossy so its weights
-  // (and logits) are checked within quant tolerance. Inner dims are multiples
-  // of 32 so q8_0 stores without the f16 fallback — exercising the loader's
-  // quantized dequant path.
+  // loadGemma3FromGGUF, and confirm config, tokenizer, weights, and the actual
+  // forward logits all survive. This is the resume path the curriculum stages
+  // chain through. f32 is bit-exact; q8_0 is lossy so its weights (and logits)
+  // are checked within quant tolerance. Inner dims are multiples of 32 so q8_0
+  // stores without the f16 fallback — exercising the loader's dequant path.
   {
     const tok = new BPETokenizer();
     tok.train("the cat sat on the mat. the dog ran to the cat and the ball.".repeat(6), 300);
-    const cfg: Qwen3Config = {
+    const cfg: Gemma3Config = {
       vocabSize: tok.vocabSize,
       hiddenSize: 32,
       nLayers: 2,
@@ -449,25 +467,28 @@ async function main() {
       nKVHeads: 1,
       headDim: 32,
       ffnDim: 64,
-      ropeBase: 10000,
+      ropeBase: 1_000_000,
+      ropeBaseLocal: 10_000,
       rmsEps: 1e-6,
       maxSeq: 32,
       tieEmbeddings: true,
+      slidingWindow: 16,
+      swaPattern: 2,
     };
-    const model = new Qwen3Model(cfg, mulberry32(77));
+    const model = new Gemma3Model(cfg, mulberry32(77));
     const ids = tok.encode("the cat sat").slice(0, 6);
     const refLogits = model.forward(ids).data.slice();
     const refParams = model.params().map((p) => p.data.slice());
 
     let ok = true;
     for (const [quant, wtol, ltol] of [["f32", 0, 0], ["q8_0", 0.05, 0.05]] as const) {
-      const bytes = buildGGUF(model, tok.export(), cfg, { quant });
-      const { model: m2, cfg: cfg2, tokenizer: tok2 } = loadQwen3FromGGUF(bytes);
+      const bytes = buildGemma3GGUF(model, tok.export(), cfg, { quant });
+      const { model: m2, cfg: cfg2, tokenizer: tok2 } = loadGemma3FromGGUF(bytes);
 
-      // Config round-trips: integer/bool fields exactly; rmsEps and ropeBase
-      // are stored as f32 metadata, so they match only to f32 precision.
-      const floatKeys = new Set<keyof Qwen3Config>(["rmsEps", "ropeBase"]);
-      for (const k of Object.keys(cfg) as (keyof Qwen3Config)[]) {
+      // Config round-trips: integer/bool fields exactly; rmsEps and the two RoPE
+      // bases are stored as f32 metadata, so they match only to f32 precision.
+      const floatKeys = new Set<keyof Gemma3Config>(["rmsEps", "ropeBase", "ropeBaseLocal"]);
+      for (const k of Object.keys(cfg) as (keyof Gemma3Config)[]) {
         const a = cfg2[k], b = cfg[k];
         const bad = floatKeys.has(k)
           ? Math.abs(Number(a) - Number(b)) > 1e-6 * Math.abs(Number(b))
@@ -505,11 +526,11 @@ async function main() {
     );
   }
 
-  // External / resumed tokenizer import: control tokens must survive the GGUF
-  // round-trip (buildGGUF writes token_type; tokenizerFromGGUF recovers the
-  // specials) so a resumed chat model still tokenizes ChatML atomically. And
-  // dequantize must reject unsupported (k-quant) types loudly, not silently
-  // return zeros. Both are the Tier-2 external-GGUF loader's guardrails.
+  // Resumed chat model + dequantizer guards: control tokens must survive the
+  // GGUF round-trip (buildGemma3GGUF writes token_type; tokenizerFromGGUF
+  // recovers the specials) so a resumed chat model still tokenizes ChatML
+  // atomically. The dequantizer must also decode BF16 and reject unsupported
+  // (k-quant) types loudly rather than silently returning zeros.
   {
     const tok = new BPETokenizer();
     tok.train(
@@ -517,7 +538,7 @@ async function main() {
       320,
       ["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
     );
-    const cfg: Qwen3Config = {
+    const cfg: Gemma3Config = {
       vocabSize: tok.vocabSize,
       hiddenSize: 32,
       nLayers: 1,
@@ -525,16 +546,19 @@ async function main() {
       nKVHeads: 1,
       headDim: 32,
       ffnDim: 64,
-      ropeBase: 10000,
+      ropeBase: 1_000_000,
+      ropeBaseLocal: 10_000,
       rmsEps: 1e-6,
       maxSeq: 32,
       tieEmbeddings: true,
+      slidingWindow: 16,
+      swaPattern: 2,
     };
-    const model = new Qwen3Model(cfg, mulberry32(9));
+    const model = new Gemma3Model(cfg, mulberry32(9));
     const chat = "<|im_start|>user\nthe cat<|im_end|>\n";
     const before = tok.encode(chat);
-    const { tokenizer: tok2 } = loadQwen3FromGGUF(
-      buildGGUF(model, tok.export(), cfg, { quant: "f16" }),
+    const { tokenizer: tok2 } = loadGemma3FromGGUF(
+      buildGemma3GGUF(model, tok.export(), cfg, { quant: "f16" }),
     );
     const imStart = tok2.idOf("<|im_start|>");
     const imEnd = tok2.idOf("<|im_end|>");
@@ -542,8 +566,8 @@ async function main() {
     const after = tok2.encode(chat);
     if (after.join(",") !== before.join(",")) ok = false; // specials still atomic post-load
     if (after.filter((id) => id === imStart || id === imEnd).length !== 2) ok = false;
-    // BF16 import path: the high-16-bits float format external Qwen3 base GGUFs
-    // ship in. These values are exactly bf16-representable, so dequant is exact.
+    // BF16 dequant path: the high-16-bits float format. These values are exactly
+    // bf16-representable, so dequant is exact.
     const bfVals = [1.5, -2.25, 0, 3];
     const bf = new Uint8Array(bfVals.length * 2);
     const bfdv = new DataView(bf.buffer);
@@ -564,7 +588,7 @@ async function main() {
     if (!threw) ok = false;
     if (!ok) failures++;
     console.log(
-      `  ${ok ? "ok " : "FAIL"} external GGUF import (specials + BF16 + unsupported-quant guard)`,
+      `  ${ok ? "ok " : "FAIL"} resume specials + dequant guards (atomic + BF16 + k-quant reject)`,
     );
   }
 
@@ -634,7 +658,7 @@ async function main() {
   {
     const baseWidth = 32, headDim = 8, vocab = 96;
     const widths = [32, 64, 128, 256];
-    const cfgFor = (h: number): Qwen3Config => ({
+    const cfgFor = (h: number): Gemma3Config => ({
       vocabSize: vocab,
       hiddenSize: h,
       nLayers: 2,
@@ -642,10 +666,13 @@ async function main() {
       nKVHeads: Math.max(1, h / headDim / 2),
       headDim,
       ffnDim: 4 * h,
-      ropeBase: 10000,
+      ropeBase: 1_000_000,
+      ropeBaseLocal: 10_000,
       rmsEps: 1e-6,
       maxSeq: 32,
       tieEmbeddings: true,
+      slidingWindow: 16,
+      swaPattern: 2,
     });
     const rms = (a: Float32Array) => {
       let s = 0;
@@ -657,8 +684,8 @@ async function main() {
     const stdRms: number[] = [], mupRms: number[] = [];
     for (const h of widths) {
       const cfg = cfgFor(h);
-      stdRms.push(rms(new Qwen3Model(cfg, mulberry32(1)).forward(ids).data));
-      mupRms.push(rms(new Qwen3Model(cfg, mulberry32(1), { baseWidth }).forward(ids).data));
+      stdRms.push(rms(new Gemma3Model(cfg, mulberry32(1)).forward(ids).data));
+      mupRms.push(rms(new Gemma3Model(cfg, mulberry32(1), { baseWidth }).forward(ids).data));
     }
     const ratio = (xs: number[]) => Math.max(...xs) / Math.min(...xs);
     let ok = true;
@@ -673,7 +700,7 @@ async function main() {
     const tokens = Array.from({ length: 400 }, () => Math.floor(rngTok() * vocab));
     for (const h of [32, 128]) {
       const cfg = cfgFor(h);
-      const model = new Qwen3Model(cfg, mulberry32(1), { baseWidth });
+      const model = new Gemma3Model(cfg, mulberry32(1), { baseWidth });
       const g = model.paramGroups();
       trainLM(model, {
         tokens,

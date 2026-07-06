@@ -1,7 +1,8 @@
 // Model-size presets + rough estimates, computed with the real engine config
-// math (scaleConfig/paramCount are dependency-free, so they bundle into the UI).
+// math (gemma3Config/gemma3ParamCount are dependency-free, so they bundle into
+// the UI).
 
-import { paramCount, scaleConfig } from "../../../../src/model/config.ts";
+import { gemma3Config, gemma3ParamCount } from "../../../../src/model/config.ts";
 
 export interface SizePreset {
   key: string;
@@ -10,7 +11,7 @@ export interface SizePreset {
   layers: number;
 }
 
-// hidden must be a multiple of headDim*2 = 128 (scaleConfig requirement).
+// hidden must be a multiple of headDim*2 = 128 (gemma3Config requirement).
 export const PRESETS: SizePreset[] = [
   { key: "tiny", label: "Tiny", hidden: 256, layers: 4 },
   { key: "small", label: "Small", hidden: 384, layers: 6 },
@@ -24,7 +25,7 @@ export function paramsFor(
   maxSeq: number,
 ): number | null {
   try {
-    return paramCount(scaleConfig(vocab, hidden, layers, maxSeq));
+    return gemma3ParamCount(gemma3Config(vocab, hidden, layers, maxSeq));
   } catch {
     return null;
   }

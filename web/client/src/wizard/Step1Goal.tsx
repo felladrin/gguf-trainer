@@ -53,7 +53,7 @@ export function Step1Goal({ state, set }: StepProps) {
       <label>Model type</label>
       <p className="hint" style={{ margin: "0 0 10px" }}>
         Type sets the training format and the recommended datasets. It does not change the export
-        format — every model exports as a llama.cpp-loadable Qwen3 GGUF.
+        format — every model exports as a llama.cpp-loadable Gemma3 GGUF.
       </p>
       <div className="cards">
         {MODEL_TYPES.map((t) => (
@@ -71,7 +71,7 @@ export function Step1Goal({ state, set }: StepProps) {
       <label>Model name</label>
       <input
         type="text"
-        placeholder={`qwen3-${state.modelType}`}
+        placeholder={`gemma3-${state.modelType}`}
         value={state.name}
         onChange={(e) => set({ name: e.target.value })}
       />

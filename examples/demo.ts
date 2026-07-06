@@ -1,4 +1,4 @@
-// End-to-end demo: train a tiny Qwen3 from scratch in TypeScript and write a
+// End-to-end demo: train a tiny Gemma3 from scratch in TypeScript and write a
 // llama.cpp-loadable GGUF — no HF, no Python, no PyTorch.
 //
 // Run (Deno):  deno run -A examples/demo.ts
@@ -9,13 +9,13 @@ import { readGGUF } from "../src/gguf/gguf.ts";
 import { dequantize, GGMLType } from "../src/gguf/quantize.ts";
 import { writeFileBytes } from "../src/io.ts";
 import { mulberry32 } from "../src/model/autograd.ts";
-import { paramCount, tinyConfig } from "../src/model/config.ts";
-import { Qwen3Model } from "../src/model/qwen3.ts";
+import { gemma3ParamCount, tinyGemma3Config } from "../src/model/config.ts";
+import { Gemma3Model } from "../src/model/gemma3.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { Muon } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
-import { buildGGUF } from "../src/export/export_gguf.ts";
-import { loadQwen3FromGGUF } from "../src/export/load_gguf.ts";
+import { buildGemma3GGUF } from "../src/export/export_gguf.ts";
+import { loadGemma3FromGGUF } from "../src/export/load_gguf.ts";
 
 // A small, repetitive corpus so a tiny model shows clear learning fast.
 const CORPUS = `
@@ -31,7 +31,7 @@ function argmax(row: Float32Array): number {
   return best;
 }
 
-function generate(model: Qwen3Model, tok: BPETokenizer, prompt: string, n: number): string {
+function generate(model: Gemma3Model, tok: BPETokenizer, prompt: string, n: number): string {
   const ids = tok.encode(prompt);
   for (let i = 0; i < n; i++) {
     const ctx = ids.slice(-model.cfg.maxSeq);
@@ -56,10 +56,10 @@ async function main() {
   console.log(`Tokenizer round-trip: "${rt}"`);
   if (rt !== "the cat sat on the mat.") throw new Error("Tokenizer round-trip failed");
 
-  // 2. Build a tiny Qwen3 model. (Smaller than tinyConfig so the demo finishes
-  //    in a few seconds on a CPU; scale up when running on the WebGPU backend.)
+  // 2. Build a tiny Gemma3 model. (Smaller than tinyGemma3Config so the demo
+  //    finishes in a few seconds on a CPU; scale up on the WebGPU backend.)
   const cfg = {
-    ...tinyConfig(tok.vocabSize),
+    ...tinyGemma3Config(tok.vocabSize),
     hiddenSize: 96,
     nLayers: 3,
     nHeads: 4,
@@ -67,11 +67,11 @@ async function main() {
     headDim: 24,
     ffnDim: 256,
   };
-  const model = new Qwen3Model(cfg, mulberry32(1234));
+  const model = new Gemma3Model(cfg, mulberry32(1234));
   console.log(
-    `\nModel: qwen3, ${cfg.nLayers} layers, hidden=${cfg.hiddenSize}, ` +
+    `\nModel: gemma3, ${cfg.nLayers} layers, hidden=${cfg.hiddenSize}, ` +
       `heads=${cfg.nHeads}/${cfg.nKVHeads}, headDim=${cfg.headDim}, ` +
-      `~${(paramCount(cfg) / 1e3).toFixed(1)}K params`,
+      `~${(gemma3ParamCount(cfg) / 1e3).toFixed(1)}K params`,
   );
 
   // 3. Train with Muon (hidden matmuls) + AdamW (embeddings/head/norms).
@@ -114,9 +114,9 @@ async function main() {
   const outDir = new URL(".", import.meta.url).pathname;
   let f16Bytes: Uint8Array | null = null;
   for (const quant of ["f16", "q8_0", "q4_0"] as const) {
-    const bytes = buildGGUF(model, tok.export(), cfg, { quant, name: "tinyqwen3" });
+    const bytes = buildGemma3GGUF(model, tok.export(), cfg, { quant, name: "tinygemma3" });
     if (quant === "f16") f16Bytes = bytes;
-    const path = `${outDir}tinyqwen3-${quant}.gguf`;
+    const path = `${outDir}tinygemma3-${quant}.gguf`;
     await writeFileBytes(path, bytes);
     console.log(`\nWrote ${path}  (${(bytes.length / 1024).toFixed(1)} KiB)`);
     verify(bytes, cfg, quant);
@@ -124,19 +124,20 @@ async function main() {
 
   // 6. Resume from the F16 checkpoint: rebuild model + tokenizer straight from
   //    the GGUF and confirm greedy sampling reproduces the pre-export output.
-  const resumed = loadQwen3FromGGUF(f16Bytes!);
+  const resumed = loadGemma3FromGGUF(f16Bytes!);
   const sample = generate(resumed.model, resumed.tokenizer, "the cat", 20);
   console.log(`\nResumed from GGUF -> greedy sample: "${sample}"`);
 
   console.log("\n=== all checks passed ===");
 }
 
-function verify(bytes: Uint8Array, cfg: ReturnType<typeof tinyConfig>, quant: string) {
+function verify(bytes: Uint8Array, cfg: ReturnType<typeof tinyGemma3Config>, quant: string) {
   const g = readGGUF(bytes);
   const arch = g.metadata.get("general.architecture");
-  if (arch !== "qwen3") throw new Error(`arch mismatch: ${arch}`);
+  if (arch !== "gemma3") throw new Error(`arch mismatch: ${arch}`);
 
-  const expectedTensors = 2 + (cfg.tieEmbeddings ? 0 : 1) + cfg.nLayers * 11;
+  // Gemma3: 13 tensors/layer (11 + the two sandwich norms post_attention/post_ffw).
+  const expectedTensors = 2 + (cfg.tieEmbeddings ? 0 : 1) + cfg.nLayers * 13;
   if (g.tensors.length !== expectedTensors) {
     throw new Error(`tensor count ${g.tensors.length} != expected ${expectedTensors}`);
   }

@@ -1,12 +1,11 @@
-// Serialize a trained Qwen3Model into a llama.cpp-loadable GGUF file.
-// Tensor names and metadata keys follow llama.cpp's "qwen3" architecture.
+// Serialize a trained Gemma3Model into a llama.cpp-loadable GGUF file.
+// Tensor names and metadata keys follow llama.cpp's "gemma3" architecture.
 
 import { GGUFWriter } from "../gguf/gguf.ts";
 import { serialize } from "../gguf/quantize.ts";
 import type { QuantName } from "../gguf/quantize.ts";
 import type { Tensor } from "../model/autograd.ts";
-import type { Gemma3Config, Qwen3Config } from "../model/config.ts";
-import type { Qwen3Model } from "../model/qwen3.ts";
+import type { Gemma3Config } from "../model/config.ts";
 import type { Gemma3Model } from "../model/gemma3.ts";
 import type { TokenizerData } from "../tokenizer/bpe.ts";
 
@@ -45,71 +44,6 @@ function tokenTypes(tok: TokenizerData): number[] {
       ? TOKEN_TYPE_CONTROL
       : TOKEN_TYPE_NORMAL
   );
-}
-
-export function buildGGUF(
-  model: Qwen3Model,
-  tok: TokenizerData,
-  cfg: Qwen3Config,
-  opts: { quant: QuantName; name?: string; chatTemplate?: string } = { quant: "f16" },
-): Uint8Array {
-  const w = new GGUFWriter();
-  const arch = "qwen3";
-
-  // ---- general.* ----
-  w.meta_string("general.architecture", arch);
-  w.meta_string("general.name", opts.name ?? "gguf-trainer-qwen3");
-  w.meta_u32("general.file_type", fileType(opts.quant));
-
-  // ---- qwen3.* hyperparameters ----
-  w.meta_u32(`${arch}.context_length`, cfg.maxSeq);
-  w.meta_u32(`${arch}.embedding_length`, cfg.hiddenSize);
-  w.meta_u32(`${arch}.block_count`, cfg.nLayers);
-  w.meta_u32(`${arch}.feed_forward_length`, cfg.ffnDim);
-  w.meta_u32(`${arch}.attention.head_count`, cfg.nHeads);
-  w.meta_u32(`${arch}.attention.head_count_kv`, cfg.nKVHeads);
-  w.meta_u32(`${arch}.attention.key_length`, cfg.headDim);
-  w.meta_u32(`${arch}.attention.value_length`, cfg.headDim);
-  w.meta_f32(`${arch}.attention.layer_norm_rms_epsilon`, cfg.rmsEps);
-  w.meta_f32(`${arch}.rope.freq_base`, cfg.ropeBase);
-  w.meta_u32(`${arch}.vocab_size`, cfg.vocabSize);
-
-  // ---- tokenizer.* ----
-  w.meta_string("tokenizer.ggml.model", "gpt2");
-  w.meta_string("tokenizer.ggml.pre", "qwen2");
-  w.meta_arr_str("tokenizer.ggml.tokens", tok.tokens);
-  w.meta_arr_i32("tokenizer.ggml.token_type", tokenTypes(tok));
-  w.meta_arr_str("tokenizer.ggml.merges", tok.merges);
-  w.meta_u32("tokenizer.ggml.bos_token_id", tok.bosId);
-  w.meta_u32("tokenizer.ggml.eos_token_id", tok.eosId);
-  w.meta_bool("tokenizer.ggml.add_bos_token", false);
-  w.meta_bool("tokenizer.ggml.add_eos_token", false);
-  // Chat template (Jinja): llama.cpp/wllama read this to format turns at
-  // inference. Only written for chat-format models; base models omit it.
-  if (opts.chatTemplate) w.meta_string("tokenizer.chat_template", opts.chatTemplate);
-
-  // ---- tensors ----
-  const q = opts.quant;
-  addMatrix(w, "token_embd.weight", model.tokenEmbd, q);
-  addVector(w, "output_norm.weight", model.outputNorm);
-  if (model.output) addMatrix(w, "output.weight", model.output, q);
-
-  model.layers.forEach((L, i) => {
-    const p = `blk.${i}`;
-    addVector(w, `${p}.attn_norm.weight`, L.attnNorm);
-    addMatrix(w, `${p}.attn_q.weight`, L.qProj, q);
-    addMatrix(w, `${p}.attn_k.weight`, L.kProj, q);
-    addMatrix(w, `${p}.attn_v.weight`, L.vProj, q);
-    addMatrix(w, `${p}.attn_output.weight`, L.oProj, q);
-    addVector(w, `${p}.attn_q_norm.weight`, L.qNorm);
-    addVector(w, `${p}.attn_k_norm.weight`, L.kNorm);
-    addVector(w, `${p}.ffn_norm.weight`, L.ffnNorm);
-    addMatrix(w, `${p}.ffn_gate.weight`, L.gate, q);
-    addMatrix(w, `${p}.ffn_up.weight`, L.up, q);
-    addMatrix(w, `${p}.ffn_down.weight`, L.down, q);
-  });
-
-  return w.build();
 }
 
 // ggml LLAMA_FTYPE values used for reporting.

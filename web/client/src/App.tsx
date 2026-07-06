@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getConfig, listModels } from "./api.ts";
-import { DEFAULT_QWEN3_CHAT_TEMPLATE } from "../../../src/data/chat.ts";
+import { DEFAULT_CHAT_TEMPLATE } from "../../../src/data/chat.ts";
 import { defaultState, type State } from "./wizard/state.ts";
 import { Step1Goal } from "./wizard/Step1Goal.tsx";
 import { Step2Dataset } from "./wizard/Step2Dataset.tsx";
@@ -12,7 +12,7 @@ import { Step6Test } from "./wizard/Step6Test.tsx";
 const STEPS = ["Goal", "Dataset", "Tokenizer", "Model", "Train", "Test"];
 
 export function App() {
-  const [state, setState] = useState<State>(() => defaultState(DEFAULT_QWEN3_CHAT_TEMPLATE));
+  const [state, setState] = useState<State>(() => defaultState(DEFAULT_CHAT_TEMPLATE));
   const set = (p: Partial<State>) => setState((s) => ({ ...s, ...p }));
 
   // Pull the canonical template + any existing models from the server on load.
@@ -33,7 +33,7 @@ export function App() {
     <div className="app">
       <h1>Felladrin's GGUF Trainer</h1>
       <p className="subtitle">
-        Train a Qwen3 model from scratch, straight to GGUF, on your own GPU — then test it in the
+        Train a Gemma3 model from scratch, straight to GGUF, on your own GPU — then test it in the
         browser.
       </p>
 

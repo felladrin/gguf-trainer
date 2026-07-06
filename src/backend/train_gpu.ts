@@ -12,7 +12,7 @@
 
 import { backward, crossEntropy } from "../model/autograd.ts";
 import type { Tensor } from "../model/autograd.ts";
-import type { Qwen3Model } from "../model/qwen3.ts";
+import type { Gemma3Model } from "../model/gemma3.ts";
 import { maskWindow, type TrainOpts } from "../train/trainer.ts";
 import { applyQKClip } from "../train/qk_clip.ts";
 import { toTokenSource } from "../data/tokens.ts";
@@ -21,7 +21,7 @@ import type { MuonGpu } from "./muon_gpu.ts";
 import type { WebGPUBackend } from "./webgpu.ts";
 
 export async function trainLMGpu(
-  model: Qwen3Model,
+  model: Gemma3Model,
   gpu: WebGPUBackend,
   opts: TrainOpts,
 ): Promise<{ step: number; loss: number }[]> {
@@ -124,7 +124,7 @@ export interface TrainGpuResidentOpts {
  * wall-time split honest.
  */
 export async function trainLMGpuResident(
-  model: Qwen3Model,
+  model: Gemma3Model,
   gpu: WebGPUBackend,
   opts: TrainGpuResidentOpts,
 ): Promise<{ step: number; loss: number }[]> {

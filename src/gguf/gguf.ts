@@ -2,7 +2,7 @@
 // Format reference: ggml-org/llama.cpp docs/development/gguf.md
 //
 // The writer is architecture-agnostic: callers add metadata key/values and
-// tensors, then call build() to get the complete file bytes. The qwen3
+// tensors, then call build() to get the complete file bytes. The gemma3
 // specifics live in ../export/export_gguf.ts.
 
 import type { GGMLTypeId, Serialized } from "./quantize.ts";

@@ -21,8 +21,8 @@
 import { initWebGPU } from "../src/backend/webgpu.ts";
 import { MuonGpu } from "../src/backend/muon_gpu.ts";
 import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
-import { paramCount, scaleConfig } from "../src/model/config.ts";
-import { Qwen3Model } from "../src/model/qwen3.ts";
+import { gemma3Config, gemma3ParamCount } from "../src/model/config.ts";
+import { Gemma3Model } from "../src/model/gemma3.ts";
 import { mulberry32 } from "../src/model/autograd.ts";
 
 function args(): string[] {
@@ -50,11 +50,11 @@ async function main() {
     return;
   }
 
-  const cfg = scaleConfig(vocab, hidden, layers, Math.max(512, seqLen));
-  const model = new Qwen3Model(cfg, mulberry32(1234), { baseWidth: 128 });
+  const cfg = gemma3Config(vocab, hidden, layers, Math.max(512, seqLen));
+  const model = new Gemma3Model(cfg, mulberry32(1234), { baseWidth: 128 });
   console.log(
     `model: hidden=${hidden} layers=${layers} seqLen=${seqLen} batch=${batch} ` +
-      `~${(paramCount(cfg) / 1e6).toFixed(1)}M params`,
+      `~${(gemma3ParamCount(cfg) / 1e6).toFixed(1)}M params`,
   );
 
   // Synthetic tokens — profiling depends on shapes, not corpus content.

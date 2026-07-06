@@ -29,9 +29,8 @@ import {
   silu,
   Tensor,
 } from "../src/model/autograd.ts";
-import { Qwen3Model } from "../src/model/qwen3.ts";
 import { Gemma3Model } from "../src/model/gemma3.ts";
-import type { Gemma3Config, Qwen3Config } from "../src/model/config.ts";
+import type { Gemma3Config } from "../src/model/config.ts";
 import { Muon, newtonSchulz } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
@@ -288,7 +287,11 @@ async function gpuMatmulFdCheck(gpu: WebGPUBackend) {
   console.log(`  ${bad === 0 ? "ok " : "FAIL"} matmul finite-difference on GPU (12 sampled elems)`);
 }
 
-function microConfig(): Qwen3Config {
+// A tiny mixed SWA/global config for the optimizer/schedule/clip parity tests.
+// swaPattern 2 -> layer 0 sliding-window (local RoPE), layer 1 global (global
+// RoPE), so both paths are exercised; slidingWindow == maxSeq so it never
+// restricts here (gemma3ModelParity covers a genuinely-restricting window).
+function microConfig(): Gemma3Config {
   return {
     vocabSize: 50,
     hiddenSize: 32,
@@ -297,57 +300,14 @@ function microConfig(): Qwen3Config {
     nKVHeads: 2,
     headDim: 8,
     ffnDim: 64,
-    ropeBase: 10000,
+    ropeBase: 1_000_000,
+    ropeBaseLocal: 10_000,
     rmsEps: 1e-6,
     maxSeq: 32,
     tieEmbeddings: true,
+    slidingWindow: 32,
+    swaPattern: 2,
   };
-}
-
-async function modelParity(gpu: WebGPUBackend) {
-  const cfg = microConfig();
-  const model = new Qwen3Model(cfg, mulberry32(5));
-  const rng = mulberry32(11);
-  const T = 12;
-  const ids = Array.from({ length: T }, () => Math.floor(rng() * cfg.vocabSize));
-  const targets = Array.from({ length: T }, () => Math.floor(rng() * cfg.vocabSize));
-  const params = model.params();
-
-  // CPU reference.
-  for (const p of params) p.zeroGrad();
-  const cpuLogits = model.forward(ids);
-  const cpuLoss = crossEntropy(cpuLogits, targets);
-  backward(cpuLoss, 1);
-  const cpuLogitsData = cpuLogits.data.slice();
-  const cpuLossVal = cpuLoss.data[0];
-  const cpuGrads = params.map((p) => p.grad.slice());
-
-  // GPU.
-  for (const p of params) p.zeroGrad();
-  gpu.install();
-  let ok = true;
-  try {
-    const logits = model.forward(ids);
-    const loss = crossEntropy(logits, targets);
-    backward(loss, 1);
-    await gpu.sync([logits, loss]);
-
-    ok = compare("model.logits", logits.data, cpuLogitsData, { atol: 5e-4, rtol: 1e-2 }) && ok;
-    const lossAbs = Math.abs(loss.data[0] - cpuLossVal);
-    if (lossAbs > 1e-3 + 1e-3 * Math.abs(cpuLossVal)) {
-      console.log(`    MISMATCH loss: gpu=${loss.data[0]} cpu=${cpuLossVal}`);
-      ok = false;
-    }
-    for (let i = 0; i < params.length; i++) {
-      ok = compare(`model.dParam${i}`, params[i].grad, cpuGrads[i], BWD) && ok;
-    }
-  } finally {
-    gpu.uninstall();
-  }
-  if (!ok) failures++;
-  console.log(
-    `  ${ok ? "ok " : "FAIL"} qwen3 model forward + full backward (${params.length} param tensors)`,
-  );
 }
 
 /**
@@ -419,7 +379,7 @@ async function gemma3ModelParity(gpu: WebGPUBackend) {
 /** Two micro-batches accumulated before one sync must match CPU accumulation. */
 async function accumulationParity(gpu: WebGPUBackend) {
   const cfg = microConfig();
-  const model = new Qwen3Model(cfg, mulberry32(5));
+  const model = new Gemma3Model(cfg, mulberry32(5));
   const rng = mulberry32(23);
   const T = 9;
   const batch = () => ({
@@ -641,7 +601,6 @@ async function main() {
   }
 
   // 5. graph-level
-  await modelParity(gpu);
   await gemma3ModelParity(gpu);
   await accumulationParity(gpu);
 
@@ -888,7 +847,7 @@ async function muonTrajectoryParity(gpu: WebGPUBackend) {
   const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
   const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
 
-  const cpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const cpuModel = new Gemma3Model(cfg, mulberry32(5));
   const cg = cpuModel.paramGroups();
   const cpuHist = trainLM(cpuModel, {
     tokens,
@@ -900,7 +859,7 @@ async function muonTrajectoryParity(gpu: WebGPUBackend) {
     rng: mulberry32(7),
   });
 
-  const gpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const gpuModel = new Gemma3Model(cfg, mulberry32(5));
   const gg = gpuModel.paramGroups();
   const gpuHist = await trainLMGpuResident(gpuModel, gpu, {
     tokens,
@@ -955,7 +914,7 @@ async function wsdScheduleParity(gpu: WebGPUBackend) {
   const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
   const schedule = wsdSchedule({ warmupSteps: 2, stableSteps: 0, cooldownSteps: 2, minScale: 0.1 });
 
-  const cpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const cpuModel = new Gemma3Model(cfg, mulberry32(5));
   const cg = cpuModel.paramGroups();
   const cpuHist = trainLM(cpuModel, {
     tokens,
@@ -968,7 +927,7 @@ async function wsdScheduleParity(gpu: WebGPUBackend) {
     rng: mulberry32(7),
   });
 
-  const gpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const gpuModel = new Gemma3Model(cfg, mulberry32(5));
   const gg = gpuModel.paramGroups();
   const gpuHist = await trainLMGpuResident(gpuModel, gpu, {
     tokens,
@@ -1015,7 +974,7 @@ async function qkClipTrajectoryParity(gpu: WebGPUBackend) {
   const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
   const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
 
-  const cpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const cpuModel = new Gemma3Model(cfg, mulberry32(5));
   const cg = cpuModel.paramGroups();
   const cpuHist = trainLM(cpuModel, {
     tokens,
@@ -1028,7 +987,7 @@ async function qkClipTrajectoryParity(gpu: WebGPUBackend) {
     rng: mulberry32(7),
   });
 
-  const gpuModel = new Qwen3Model(cfg, mulberry32(5));
+  const gpuModel = new Gemma3Model(cfg, mulberry32(5));
   const gg = gpuModel.paramGroups();
   const gpuHist = await trainLMGpuResident(gpuModel, gpu, {
     tokens,

@@ -2,17 +2,18 @@
 
 ## What this project is
 
-A TypeScript framework that trains a **Qwen3ForCausalLM** model **from scratch** and writes it
+A TypeScript framework that trains a **Gemma3ForCausalLM** model **from scratch** and writes it
 **directly to GGUF** — no Python, no Hugging Face, no PyTorch. It runs on **Deno, Bun, and Node**,
 and trains on **any GPU — AMD, Apple Silicon, NVIDIA — via WebGPU** (Deno ships WebGPU natively;
 Node/Bun fall back to CPU).
 
-## Architecture update — Gemma3 (SWA) is now the trained arch for real runs
+## Architecture — Gemma3 (SWA) is the sole trained arch
 
-Qwen3 stays as the reference backbone (and the shared-kernel parity gate), but real training now
-targets **Gemma3** because sliding-window attention (SWA) is a measured **~1.9× training speedup at
-8K** — and, unlike Qwen3, llama.cpp's gemma3 build path _honors_ the window at inference, so there's
-no train/inference mismatch. Key facts (see `docs/DESIGN.md` if expanded, and the memory files):
+**Gemma3 is now the only architecture in the repo** — the Qwen3 backbone (model, config, both GGUF
+export/load paths, and its tests) was fully removed; every entry point, the web wizard, and the
+resume loader are Gemma3. SWA is the reason: sliding-window attention is a measured **~1.9× training
+speedup at 8K**, and llama.cpp's gemma3 build path _honors_ the window at inference, so there's no
+train/inference mismatch. Key facts (see `docs/DESIGN.md`, and the memory files):
 
 - **SWA is a real lever; the naive kernel is a trap.** A per-thread windowed lower bound
   (`s = t-W+1`) is _0.78× (slower)_ at W=1024 on GFX1151 — it destroys the wave K/V broadcast (the
@@ -26,7 +27,7 @@ no train/inference mismatch. Key facts (see `docs/DESIGN.md` if expanded, and th
   `gemma3Config`/`gemma3ParamCount`/ `isGlobalLayer` in `config.ts`, `buildGemma3GGUF` in
   `export_gguf.ts`. New ops: `gelu` (tanh-approx, for GeGLU) + `scale` (const-mul, for the √hidden
   embed scale) in `autograd.ts`/`webgpu.ts`. Windowed `attention(…, window)`.
-- **Gemma3 deltas from Qwen3** (all matched to llama.cpp's gemma3 graph): sandwich norms
+- **Gemma3's distinctive pieces** (all matched to llama.cpp's gemma3 graph): sandwich norms
   (`post_attention_norm` + `post_ffw_norm`, applied pre-residual), GeGLU (gelu·up), √hidden
   embedding scale (runtime; raw embeds exported), per-layer SWA window + local RoPE base (1e4) on
   SWA layers / global base (1e6) on the every-6th global layer, QK-norm kept (len head_dim), tied
@@ -48,16 +49,15 @@ no train/inference mismatch. Key facts (see `docs/DESIGN.md` if expanded, and th
 
 Both backends are complete and pass end-to-end:
 
-- **CPU reference path** (`examples/demo.ts`): trains a tiny Qwen3, loss drops 5.65 → 0.98, greedy
+- **CPU reference path** (`examples/demo.ts`): trains a tiny Gemma3, loss drops steeply, greedy
   sampling reproduces the corpus, writes + re-verifies GGUF in F16, Q8_0, Q4_0. Runs on Deno, Bun,
   and Node.
 - **WebGPU path** (`examples/demo_gpu.ts`): the full op set from `src/model/autograd.ts` implemented
-  as WGSL compute shaders — forward AND backward — in `src/backend/webgpu.ts`. Trains the full
-  `tinyConfig` (725K params), loss 5.67 → 0.56, GPU greedy sampling reproduces the corpus, exports
-  GGUF that loads and runs in `llama-cli`. Measured on an M1 Max (serial, no GPU contention): **~42
-  ms/step** forward+backward+sync, **~3 ms/step** GPU Muon optimizer — **~21 steps/s** total.
-  Baseline before these changes was 0.8 steps/s (1276 ms CPU Muon dominated). Both demos run
-  unchanged.
+  as WGSL compute shaders — forward AND backward — in `src/backend/webgpu.ts`. Trains a tiny mixed
+  SWA/global Gemma3 device-resident, GPU greedy sampling reproduces the corpus, exports GGUF that
+  loads and runs in `llama-cli`. The GPU-Muon optimization measured on an M1 Max (serial,
+  ~725K-param config): **~42 ms/step** forward+backward+sync, **~3 ms/step** GPU Muon optimizer — up
+  from a 0.8 steps/s baseline where the 1276 ms CPU Muon dominated.
 - **Validation harnesses** (the gate for all future op/kernel work):
   - `tests/gradcheck.ts` — per-element finite-difference gradient checks for every CPU op plus
     whole-model checks, with a negative control proving the harness rejects wrong gradients. Runs on
@@ -70,9 +70,10 @@ Both backends are complete and pass end-to-end:
 
 Implemented overall: GGUF v3 writer/reader (+ checkpoint loader), F16/Q8_0/Q4_0 (de)quantizers,
 byte-level BPE tokenizer (train + round-trip), reverse-mode CPU autograd, WGSL kernels for the whole
-op set, the Qwen3 forward pass (GQA, QK-RMSNorm, RoPE, SwiGLU, tied embeddings), AdamW + Muon
-optimizers on both CPU and GPU (device-resident), flash-style tiled causal attention, WSD schedule,
-MuonClip, muP init, a disk-streaming token loader, and training loops for both backends.
+op set, the Gemma3 forward pass (GQA, QK-RMSNorm, dual local/global RoPE, GeGLU, sandwich norms,
+sliding-window attention, tied embeddings), AdamW + Muon optimizers on both CPU and GPU
+(device-resident), flash-style tiled causal attention, WSD schedule, MuonClip, muP init, a
+disk-streaming token loader, and training loops for both backends.
 
 ## How the WebGPU backend plugs in
 
@@ -166,14 +167,12 @@ functional gate at T=3584 under spec-default limits.
   header, system/user, and scaffolding); the web corpus builder writes a parallel `.mask`, and both
   trainers take an optional `supervised` TokenSource (`maskWindow()` applies it). On by default for
   chat models (wizard toggle in step 4). Self-check in `tests/gradcheck.ts`.
-- **External Qwen3 GGUF import (Tier-2 loader).** `tokenizerFromGGUF` recovers control/special
-  tokens from `tokenizer.ggml.token_type` (also fixes our own chat-model resume, which was silently
-  losing atomic ChatML); `dequantize` gained BF16 and now throws a clear error on unsupported
-  k-quants instead of returning silent zeros. F16/BF16/Q8_0/Q4_0 external Qwen3 GGUFs load for
-  fine-tune. Out of scope by design (this is a train-from-scratch project, not a llama.cpp
-  reimplementation): k-quant super-block dequant and Qwen's exact pre-tokenizer regex — both matter
-  only for byte-exact loading of someone else's quantized release. A k-quant file fails loud rather
-  than silently.
+- **Resume-loader robustness.** `tokenizerFromGGUF` recovers control/special tokens from
+  `tokenizer.ggml.token_type`, so a resumed chat model keeps its atomic ChatML/`<think>` tokens
+  instead of silently shredding them to bytes; `dequantize` handles BF16 and throws a clear error on
+  unsupported k-quants instead of returning silent zeros. Importing a foreign (non-Gemma3) GGUF is
+  out of scope by design — this is a train-from-scratch project; the loader resumes GGUFs this
+  project produced (see the checkpoint-loader item below).
 - **Mid-run checkpointing.** `trainLMGpuResident` takes `checkpointEvery` + `onCheckpoint`; it syncs
   device-resident weights to the host and fires the callback so long runs export a loadable GGUF
   periodically (used by `examples/train_tinystories.ts`). Measured ~6.46 s/step for the 29.4M config
@@ -200,7 +199,7 @@ so training the way this repo does works on the intended 24/7 APU.
   models gain more).
 - **2-D dispatch fold (enables 8K context).** A flat `ceilDiv(n,256)` dispatch overflows WebGPU's
   65535-workgroups-per-dimension cap past ~16.7M elements, which crashed training at seqLen≥4096
-  (cross-entropy backward) and blocks SwiGLU/`[T,ffn]`, per-head RMSNorm (`rows=T·H`), and a large
+  (cross-entropy backward) and blocks GeGLU/`[T,ffn]`, per-head RMSNorm (`rows=T·H`), and a large
   embedding. `recordDispatch` now folds `x>65535` into a 2-D grid at one point; the overflow-capable
   kernels bake the matching gridX (`grid2D`/`gridRows`) to rebuild their index. Training runs at
   seqLen 4096 and 8192.
@@ -273,7 +272,7 @@ _(Subgroup-matrix GEMM is dropped from the roadmap: unavailable in Deno's wgpu, 
 
 ## Non-negotiable invariants (do not break these)
 
-1. **GGUF loadability is a contract.** The `qwen3` tensor names and metadata keys in
+1. **GGUF loadability is a contract.** The `gemma3` tensor names and metadata keys in
    `src/export/export_gguf.ts` are what `llama.cpp` expects. If you touch them, re-validate the
    output loads and runs in `llama-cli`.
 2. **Reference backend stays dependency-free and runtime-agnostic.** Everything in `src/` outside
@@ -295,7 +294,7 @@ _(Subgroup-matrix GEMM is dropped from the roadmap: unavailable in Deno's wgpu, 
 
 1. **muP parametrization** — init part done (`src/model/mup.ts`), contract-safe. The old `lr`-baking
    caveat is resolved: `MuonGpu` reads `lr` from a device buffer now (see WSD).
-   - **What shipped.** `Qwen3Model(cfg, rng, { baseWidth })` scales the embedding/head init std by
+   - **What shipped.** `Gemma3Model(cfg, rng, { baseWidth })` scales the embedding/head init std by
      `√(baseWidth/hidden)` so the tied-readout logits stay O(1) across widths. The contract-safe
      derivation: `token_embd` is the readout (tied), and the post-embedding RMSNorm divides out the
      embedding's magnitude on the way IN, so we're free to set it for the output side — pinning
@@ -318,7 +317,7 @@ _(Subgroup-matrix GEMM is dropped from the roadmap: unavailable in Deno's wgpu, 
      scale was added. If a future change breaks it (e.g. `ffnDim` not scaling with `hidden`, or an
      untied head), add an explicit per-group LR scale in `mup.ts` and re-run `deno task mup:check`.
    - The alternative (untie embeddings for a textbook readout) works and stays llama.cpp-compatible,
-     but changes the model (more params, drops the tie convention Qwen3 small models use).
+     but changes the model (more params, drops the tie convention Gemma3 uses).
 2. **WSD learning-rate schedule** (warmup → stable → linear cooldown) — done.
    `src/train/schedule.ts` `wsdSchedule()` returns a per-step lr multiplier; `Muon`, `MuonGpu`, and
    `AdamW` gained `setLrScale()`, and all three training loops (`trainLM`, `trainLMGpu`,
@@ -331,7 +330,7 @@ _(Subgroup-matrix GEMM is dropped from the roadmap: unavailable in Deno's wgpu, 
 3. **MuonClip / attention-logit clipping** — done, adapted for QK-norm. `src/train/qk_clip.ts`
    `applyQKClip(model, tau)` caps each layer's logit-scale proxy
    `(1/√headDim)·√Σ_d(qNorm[d]·kNorm[d])²` at `tau` by rescaling `qNorm`/`kNorm` (each by
-   `√(tau/s)`). Moonshot clips the q/k _projection_ weights, but Qwen3's QK-RMSNorm renormalizes
+   `√(tau/s)`). Moonshot clips the q/k _projection_ weights, but Gemma3's QK-RMSNorm renormalizes
    those away — the norm weights are the actual lever (per-layer; they're shared across a layer's
    heads). Opt-in via `qkClipTau` on `trainLM`/`trainLMGpu`/`trainLMGpuResident`; host-side weight
    math so CPU and GPU apply it identically (gated by `qkClipTrajectoryParity` in `gpu_parity.ts`
@@ -351,29 +350,28 @@ _(Subgroup-matrix GEMM is dropped from the roadmap: unavailable in Deno's wgpu, 
    dominated, and it grows with vocab·hidden — this is the real win at scale). Gated by the existing
    GPU-vs-CPU trajectory-parity tests, which now exercise GPU AdamW and still hold within BWD
    tolerance.
-5. **GGUF checkpoint loader** — tier 1 (resume own checkpoints) done. `src/export/load_gguf.ts` is
-   the inverse of `export_gguf.ts`: `configFromGGUF()` rebuilds the `Qwen3Config` from `qwen3.*`
-   metadata (tie is inferred from the presence of `output.weight`), `loadWeightsFromGGUF()` copies
-   every tensor back by name via the existing `dequantize()` (per-tensor type, so the f16-fallback
-   case is handled), and `loadQwen3FromGGUF(bytes)` returns `{ model, cfg, tokenizer }` ready to
-   sample or keep training. `BPETokenizer.fromData()` (new, the inverse of `export()`) rebuilds the
-   tokenizer from the embedded vocab/merges. Fidelity follows the export quant: f32/f16 round-trip
-   cleanly (f32 bit-exact), a q4_0/q8_0 checkpoint resumes from its lossy dequantized weights — so
-   export in f16/f32 for a faithful resume. Gated by a round-trip check in `tests/gradcheck.ts`
-   (config + tokenizer + weights + forward logits, f32 exact and q8_0 within tolerance) and
-   demonstrated end-to-end in `examples/demo.ts` (train → save → reload → identical greedy sample).
-   Note: `mergeKey()` in `bpe.ts` uses a U+0000 separator internally while the exported merges use a
-   space, so `fromData()` rebuilds `mergeRank` through `mergeKey()` rather than keying on the raw
-   string — worth a look if that separator ever changes.
-   - **Tier 2 — fine-tuning an arbitrary external Qwen3 GGUF** (e.g. the real Alibaba releases):
-     still open. `configFromGGUF()` already reads config from metadata, but the tokenizer path only
-     handles our own gpt2/BPE data; an external GGUF's vocab/merges/special-token scheme would need
-     broader import support in `src/tokenizer/bpe.ts`.
+5. **GGUF checkpoint loader** — resume own checkpoints, done. `src/export/load_gguf.ts` is the
+   inverse of `export_gguf.ts`: `configFromGGUF()` rebuilds the `Gemma3Config` from `gemma3.*`
+   metadata (tie is inferred from the presence of `output.weight`; the SWA window/pattern and both
+   RoPE bases round-trip), `loadWeightsFromGGUF()` copies every tensor back by name via the existing
+   `dequantize()` (per-tensor type, so the f16-fallback case is handled), and
+   `loadGemma3FromGGUF(bytes)` returns `{ model, cfg, tokenizer }` ready to sample or keep training
+   — this is the resume path the curriculum stages chain through. `BPETokenizer.fromData()` rebuilds
+   the tokenizer from the embedded vocab/merges. Fidelity follows the export quant: f32/f16
+   round-trip cleanly (f32 bit-exact), a q4_0/q8_0 checkpoint resumes from its lossy dequantized
+   weights — so export in f16/f32 for a faithful resume. Gated by a round-trip check in
+   `tests/gradcheck.ts` (config + tokenizer + weights + forward logits, f32 exact and q8_0 within
+   tolerance) and demonstrated end-to-end in `examples/demo.ts` (train → save → reload → identical
+   greedy sample). Note: `mergeKey()` in `bpe.ts` uses a U+0000 separator internally while the
+   exported merges use a space, so `fromData()` rebuilds `mergeRank` through `mergeKey()` rather
+   than keying on the raw string — worth a look if that separator ever changes. Importing a foreign
+   (non-Gemma3) GGUF is out of scope by design.
 6. **Scale + real data** — infra done and wired to a real corpus; only the multi-hour run itself
    remains (a compute job, not a code change). What's in place:
-   - **Larger configs.** `scaleConfig(vocabSize, hiddenSize, nLayers, maxSeq?, headDim?)` derives
-     Qwen3-shaped attention/FFN dims (headDim 64, GQA 2:1, SwiGLU ffn 3× to a multiple of 32).
-     Example: hidden 384 × 6 ≈ 14M, hidden 512 × 8 ≈ 33M (vocab 8k, tied).
+   - **Larger configs.** `gemma3Config(vocabSize, hiddenSize, nLayers, maxSeq?, headDim?, window?)`
+     derives Gemma3-shaped attention/FFN dims (headDim 64, GQA 2:1, GeGLU ffn 4× to a multiple of
+     32, 5:1 SWA:global pattern). Example: hidden 384 × 6 ≈ 16M, hidden 512 × 8 ≈ 36M (vocab 8k,
+     tied).
    - **Disk-streaming corpus.** `src/data/tokens.ts`: `writeTokenFile()` pretokenizes to a compact
      binary (u16/u32 via `tokenBytes(vocab)`); `diskTokenSource()` streams windows off disk so peak
      memory is O(window), not O(corpus); `memTokenSource()` for small in-memory corpora. Both
@@ -386,8 +384,8 @@ _(Subgroup-matrix GEMM is dropped from the roadmap: unavailable in Deno's wgpu, 
      s). The raw corpus lives in `corpus/` and the outputs in `examples/tinystories.*` — both
      gitignored (derived/downloaded, not source).
    - **Turnkey run.** `examples/train_tinystories.ts` (`deno task train:tinystories`) is the
-     real-run entry point: it reuses the pretokenized corpus + saved vocab, builds a `scaleConfig`'d
-     model with muP init, runs the CPU-vs-GPU parity gate, trains device-resident
+     real-run entry point: it reuses the pretokenized corpus + saved vocab, builds a
+     `gemma3Config`'d model with muP init, runs the CPU-vs-GPU parity gate, trains device-resident
      (`MuonGpu +
      trainLMGpuResident`) under a WSD schedule, samples, and exports+verifies an
      F16 GGUF. Defaults are the real run (hidden 384 × 6 ≈ 14M, 3000 steps); positional args scale
@@ -418,7 +416,7 @@ Architecture and the decisions behind it:
   `hyparquet` for Parquet parsing) live **only** in `web/` — the server declares them in the root
   `deno.json` import map; the client has its own `web/client/package.json`. `src/` gains no
   dependency. The one shared, dependency-free addition is `src/data/chat.ts` (dataset-schema
-  normalization + the verbatim Qwen3 chat template constant), imported by the engine, server, and
+  normalization + the default ChatML chat template constant), imported by the engine, server, and
   client.
 - **Data path.** Preview uses the HF Datasets Server JSON API (`web/server/hf.ts`); training
   downloads the actual data files — the auto-converted Parquet the Datasets Server exposes, or a
@@ -428,9 +426,9 @@ Architecture and the decisions behind it:
   streams. `web/server/train_job.ts` is the config-driven twin of `examples/train_tinystories.ts`.
 - **Chat contract additions.** `BPETokenizer.encode()` now emits special tokens atomically (ChatML
   turns tokenize as single ids, not shredded bytes) — gated by a case in `tests/gradcheck.ts`.
-  `buildGGUF()` writes `tokenizer.chat_template` when given one, and chat models set eos to
+  `buildGemma3GGUF()` writes `tokenizer.chat_template` when given one, and chat models set eos to
   `<|im_end|>`. Both are llama.cpp-contract-relevant; validated by loading the export in `llama-cli`
-  (with `--jinja`, llama.cpp engages the Qwen3 chat parser from the embedded template).
+  (with `--jinja`, llama.cpp engages the ChatML chat parser from the embedded template).
 - **Artifacts** land in `web/.data/` (gitignored): downloaded corpora, `.tokens`, and exported
   `.gguf` models (`web/.data/models/`, served to wllama and for download).
 
@@ -474,7 +472,7 @@ server and shared code are held to the same Deno gates as the engine.
 ```
 src/gguf/      f16, quantize (+dequant), gguf writer/reader
 src/tokenizer/ byte-level BPE (train + export/fromData round-trip)
-src/model/     config (+ scaleConfig), autograd (CPU op set + OpsBackend hook), qwen3 forward, mup
+src/model/     config (+ gemma3Config), autograd (CPU op set + OpsBackend hook), gemma3 forward, mup
 src/train/     optimizer iface, adamw, muon, trainer (CPU), schedule (WSD), qk_clip (MuonClip)
 src/data/      tokens.ts (TokenSource: in-memory + disk-streaming corpus access)
 src/backend/   wgsl.ts (pure WGSL kernel-source generators + codegen/dispatch helpers),

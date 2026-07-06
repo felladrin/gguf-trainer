@@ -5,7 +5,7 @@
 // disk during training (src/data/tokens.ts). Peak memory is O(window), not
 // O(corpus), so the same loop scales from this synthetic corpus to a
 // TinyStories / FineWeb-Edu slice — swap `CORPUS` for the contents of a real
-// text file (readFileText) and bump scaleConfig().
+// text file (readFileText) and bump gemma3Config().
 //
 // Run (any runtime):  deno run -A examples/train_streaming.ts
 //                     node --experimental-strip-types examples/train_streaming.ts
@@ -14,8 +14,8 @@
 // TokenSource).
 
 import { mulberry32 } from "../src/model/autograd.ts";
-import { paramCount, scaleConfig } from "../src/model/config.ts";
-import { Qwen3Model } from "../src/model/qwen3.ts";
+import { gemma3Config, gemma3ParamCount } from "../src/model/config.ts";
+import { Gemma3Model } from "../src/model/gemma3.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { Muon } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
@@ -36,7 +36,7 @@ function argmax(row: number[]): number {
   return best;
 }
 
-function generate(model: Qwen3Model, tok: BPETokenizer, prompt: string, n: number): string {
+function generate(model: Gemma3Model, tok: BPETokenizer, prompt: string, n: number): string {
   const ids = tok.encode(prompt);
   for (let i = 0; i < n; i++) {
     const ctx = ids.slice(-model.cfg.maxSeq);
@@ -81,12 +81,12 @@ async function main() {
 
   // 3. A real-shape (if small) model via scaleConfig, trained from the disk
   //    stream with a WSD schedule. Kept CPU-small here so the demo is quick;
-  //    the same call scales up by widening scaleConfig and moving to the GPU loop.
-  const cfg = scaleConfig(tok.vocabSize, 128, 2, 64);
-  const model = new Qwen3Model(cfg, mulberry32(1234));
+  //    the same call scales up by widening gemma3Config and moving to the GPU loop.
+  const cfg = gemma3Config(tok.vocabSize, 128, 2, 64);
+  const model = new Gemma3Model(cfg, mulberry32(1234));
   console.log(
     `Model: hidden=${cfg.hiddenSize}, ${cfg.nLayers} layers, heads=${cfg.nHeads}/${cfg.nKVHeads}, ` +
-      `ffn=${cfg.ffnDim}, ~${(paramCount(cfg) / 1e3).toFixed(1)}K params\n`,
+      `ffn=${cfg.ffnDim}, ~${(gemma3ParamCount(cfg) / 1e3).toFixed(1)}K params\n`,
   );
 
   const groups = model.paramGroups();

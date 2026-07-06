@@ -1,4 +1,4 @@
-import { DEFAULT_QWEN3_CHAT_TEMPLATE } from "../../../../src/data/chat.ts";
+import { DEFAULT_CHAT_TEMPLATE } from "../../../../src/data/chat.ts";
 import type { StepProps } from "./state.ts";
 
 export function Step3Tokenizer({ state, set }: StepProps) {
@@ -32,7 +32,7 @@ export function Step3Tokenizer({ state, set }: StepProps) {
           <label>Chat template (Jinja)</label>
           <p className="hint" style={{ margin: "0 0 6px" }}>
             Embedded into the GGUF as <code>tokenizer.chat_template</code>, and used to format
-            training data. Default is the Qwen3-Instruct template.
+            training data. Default is a ChatML template (from Qwen3-Instruct).
           </p>
           <textarea
             value={state.chatTemplate}
@@ -43,7 +43,7 @@ export function Step3Tokenizer({ state, set }: StepProps) {
           <div style={{ marginTop: 8 }}>
             <button
               className="ghost"
-              onClick={() => set({ chatTemplate: DEFAULT_QWEN3_CHAT_TEMPLATE })}
+              onClick={() => set({ chatTemplate: DEFAULT_CHAT_TEMPLATE })}
             >
               Reset to default
             </button>

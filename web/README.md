@@ -33,13 +33,13 @@ the memory budget that makes big local runs practical.
 
 1. **Goal** — new model or continue a checkpoint; pick a type (Base / Instruct / Reasoning /
    Instruct+Tools). Type selects the training format and recommended datasets; every model still
-   exports as a llama.cpp-loadable Qwen3 GGUF.
+   exports as a llama.cpp-loadable Gemma3 GGUF.
 2. **Dataset** — paste any Hugging Face dataset URL (or a direct `.jsonl`/`.parquet`/`.txt` file
    URL). Preview comes from the HF Datasets Server API; the column mapping is auto-detected (`text`,
    OpenAI `messages`, ShareGPT `conversations`, Alpaca `instruction/output`) and editable. A live
    sample shows exactly what the model will train on (rendered through the chat template for chat
    types).
-3. **Tokenizer & template** — vocabulary size; for chat models, the editable Qwen3 chat template
+3. **Tokenizer & template** — vocabulary size; for chat models, the editable ChatML chat template
    (the default is the one from `Qwen/Qwen3-4B-Instruct-2507`). ChatML control tokens are added to
    the vocabulary automatically so turns tokenize atomically.
 4. **Model & training** — a size preset (Tiny/Small/Medium) or custom, plus the same knobs the CLI
@@ -82,6 +82,6 @@ and download.
   the _format_ but not strong capability. Great for the pipeline; not a large pretrained model.
 - Training data is downloaded via HF's auto-converted Parquet, or — for datasets HF never converted
   — by listing the dataset repo and pulling its original files (`.jsonl`/`.json`/`.csv`/`.tsv`/
-  `.txt`/`.parquet`), or from a direct file URL. For a gated or private dataset, paste an HF token in
-  step 2.
+  `.txt`/`.parquet`), or from a direct file URL. For a gated or private dataset, paste an HF token
+  in step 2.
 - One training job runs at a time (a single GPU).

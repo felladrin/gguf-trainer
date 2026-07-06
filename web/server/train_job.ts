@@ -5,10 +5,10 @@
 // export a GGUF (with the chat template embedded for chat models).
 
 import { crossEntropy, mulberry32 } from "../../src/model/autograd.ts";
-import { paramCount, scaleConfig } from "../../src/model/config.ts";
-import { Qwen3Model } from "../../src/model/qwen3.ts";
-import { buildGGUF } from "../../src/export/export_gguf.ts";
-import { loadQwen3FromGGUF } from "../../src/export/load_gguf.ts";
+import { gemma3Config, gemma3ParamCount } from "../../src/model/config.ts";
+import { Gemma3Model } from "../../src/model/gemma3.ts";
+import { buildGemma3GGUF } from "../../src/export/export_gguf.ts";
+import { loadGemma3FromGGUF } from "../../src/export/load_gguf.ts";
 import { readGGUF } from "../../src/gguf/gguf.ts";
 import { wsdSchedule } from "../../src/train/schedule.ts";
 import { diskTokenSource } from "../../src/data/tokens.ts";
@@ -108,7 +108,7 @@ function argmax(row: Float32Array): number {
 
 async function generateGpu(
   gpu: WebGPUBackend,
-  model: Qwen3Model,
+  model: Gemma3Model,
   tok: BPETokenizer,
   prompt: string,
   n: number,
@@ -153,12 +153,12 @@ export async function runJob(job: Job, modelsDir: string, jobDir: string): Promi
 
     // Resume: load the checkpoint's model + tokenizer up front.
     let existingTok: BPETokenizer | undefined;
-    let model: Qwen3Model | undefined;
+    let model: Gemma3Model | undefined;
     let modelCfg;
     if (cfg.resumeFrom) {
       status("resume", `Loading checkpoint ${cfg.resumeFrom}`);
       const bytes = await readFileBytes(`${modelsDir}/${cfg.resumeFrom}`);
-      const r = loadQwen3FromGGUF(bytes);
+      const r = loadGemma3FromGGUF(bytes);
       model = r.model;
       modelCfg = r.cfg;
       existingTok = r.tokenizer;
@@ -197,7 +197,7 @@ export async function runJob(job: Job, modelsDir: string, jobDir: string): Promi
 
     // Build the model (fresh) unless resuming.
     if (!model) {
-      modelCfg = scaleConfig(
+      modelCfg = gemma3Config(
         built.tok.vocabSize,
         cfg.model.hidden,
         cfg.model.layers,
@@ -206,14 +206,14 @@ export async function runJob(job: Job, modelsDir: string, jobDir: string): Promi
       const mup = cfg.model.baseWidth === cfg.model.hidden
         ? undefined
         : { baseWidth: cfg.model.baseWidth };
-      model = new Qwen3Model(modelCfg, mulberry32(1234), mup);
+      model = new Gemma3Model(modelCfg, mulberry32(1234), mup);
     }
     if (cfg.training.seqLen > modelCfg!.maxSeq) {
       throw new Error(`seqLen ${cfg.training.seqLen} exceeds context length ${modelCfg!.maxSeq}`);
     }
     emit(job, {
       type: "model",
-      params: paramCount(modelCfg!),
+      params: gemma3ParamCount(modelCfg!),
       summary: `${modelCfg!.nLayers}L hidden=${modelCfg!.hiddenSize} heads=${modelCfg!.nHeads}/${
         modelCfg!.nKVHeads
       } ffn=${modelCfg!.ffnDim}`,
@@ -258,15 +258,15 @@ export async function runJob(job: Job, modelsDir: string, jobDir: string): Promi
     const chatTemplate = cfg.modelType !== "base" ? cfg.chatTemplate : undefined;
     const file = `${safeName(cfg.name)}-${cfg.training.quant}.gguf`;
     const exportModel = async (): Promise<{ sizeMB: number; tensors: number }> => {
-      const bytes = buildGGUF(model!, built.tok.export(), modelCfg!, {
+      const bytes = buildGemma3GGUF(model!, built.tok.export(), modelCfg!, {
         quant: cfg.training.quant,
         name: cfg.name,
         chatTemplate,
       });
       await writeFileBytes(`${modelsDir}/${file}`, bytes);
       const g = readGGUF(bytes);
-      if (g.metadata.get("general.architecture") !== "qwen3") {
-        throw new Error("export arch != qwen3");
+      if (g.metadata.get("general.architecture") !== "gemma3") {
+        throw new Error("export arch != gemma3");
       }
       job.file = file;
       return { sizeMB: bytes.length / 1e6, tensors: g.tensors.length };

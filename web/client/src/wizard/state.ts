@@ -71,7 +71,7 @@ export function defaultState(chatTemplate: string): State {
 
 export function buildConfig(s: State): TrainConfig {
   return {
-    name: s.name || `qwen3-${s.modelType}`,
+    name: s.name || `gemma3-${s.modelType}`,
     modelType: s.modelType,
     dataset: {
       url: s.datasetUrl,

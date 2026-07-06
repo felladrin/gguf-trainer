@@ -7,7 +7,7 @@ Thanks for helping build a from-scratch, GGUF-native LLM trainer in TypeScript.
 1. **Reference backend stays dependency-free and runtime-agnostic.** The code in `src/` (outside
    `backend/`) must run on Deno, Bun, and Node with no npm install. Avoid runtime-specific APIs;
    file I/O goes through `src/io.ts`.
-2. **GGUF loadability is a contract.** The `qwen3` architecture tensor names and metadata keys in
+2. **GGUF loadability is a contract.** The `gemma3` architecture tensor names and metadata keys in
    `src/export/export_gguf.ts` mirror what `llama.cpp` expects. Don't change them without validating
    the output loads in `llama-cli`.
 3. **Correctness before speed.** The CPU backend is the reference implementation; optimize on the

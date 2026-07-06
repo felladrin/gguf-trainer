@@ -10,7 +10,7 @@
 
 # Felladrin's GGUF Trainer
 
-Train a **Qwen3ForCausalLM** language model **from scratch, in TypeScript**, and export it
+Train a **Gemma3ForCausalLM** language model **from scratch, in TypeScript**, and export it
 **directly to GGUF** — no Python, no Hugging Face, no PyTorch.
 
 Yes, it's a _trainer_ — in both senses. It trains language models, and it comes with the swagger of
@@ -37,7 +37,7 @@ bun examples/demo.ts                             # Bun
 node --experimental-strip-types examples/demo.ts # Node
 ```
 
-The demo trains a tiny model on a toy corpus and writes `tinyqwen3-{f16,q8_0,q4_0}.gguf`, then
+The demo trains a tiny model on a toy corpus and writes `tinygemma3-{f16,q8_0,q4_0}.gguf`, then
 re-parses each to verify structure.
 
 ```
@@ -58,7 +58,7 @@ deno task webui        # builds the React client, then serves at http://localhos
 The browser is only the control panel — training runs on the local **WebGPU engine** (this repo,
 unchanged), and in-browser testing uses [wllama](https://github.com/ngxson/wllama) (llama.cpp in
 WASM). It covers **Base** (pretraining), **Instruct**, **Reasoning**, and **tool-calling** models,
-with the Qwen3 chat template embedded into the exported GGUF so llama.cpp/wllama format turns
+with a ChatML chat template embedded into the exported GGUF so llama.cpp/wllama format turns
 correctly. Any HF dataset works (text or conversational — `messages`/ShareGPT/Alpaca are
 auto-detected). Details in [`web/README.md`](web/README.md).
 
@@ -67,11 +67,11 @@ auto-detected). Details in [`web/README.md`](web/README.md).
 ```ts
 import {
   BPETokenizer,
-  buildGGUF,
+  buildGemma3GGUF,
+  Gemma3Model,
   mulberry32,
   Muon,
-  Qwen3Model,
-  tinyConfig,
+  tinyGemma3Config,
   trainLM,
   writeFileBytes,
 } from "./src/index.ts";
@@ -80,15 +80,15 @@ const tok = new BPETokenizer();
 tok.train(myCorpus, 8000); // train a BPE vocab
 const tokens = tok.encode(myCorpus);
 
-const cfg = tinyConfig(tok.vocabSize); // or hand-write a Qwen3Config
-const model = new Qwen3Model(cfg, mulberry32(42));
+const cfg = tinyGemma3Config(tok.vocabSize); // or hand-write a Gemma3Config
+const model = new Gemma3Model(cfg, mulberry32(42));
 
 const g = model.paramGroups(); // Muon on matmuls, AdamW on the rest
 const opt = new Muon(g.muon, g.aux, { lr: 0.02, aux: { lr: 3e-3 } });
 
 trainLM(model, { tokens, seqLen: 128, steps: 2000, batchPerStep: 8, optimizer: opt });
 
-await writeFileBytes("model.gguf", buildGGUF(model, tok.export(), cfg, { quant: "q4_0" }));
+await writeFileBytes("model.gguf", buildGemma3GGUF(model, tok.export(), cfg, { quant: "q4_0" }));
 ```
 
 ## What works today (verified end-to-end)
@@ -96,20 +96,22 @@ await writeFileBytes("model.gguf", buildGGUF(model, tok.export(), cfg, { quant: 
 - **GGUF v3 writer + reader** — spec-faithful metadata & tensor layout (`src/gguf/`).
 - **Quantizers** — F16, Q8_0, Q4_0, matching ggml block layout, with dequant for round-trips.
 - **Byte-level BPE tokenizer** — GPT-2 compatible, trainable; exports vocab + merges into GGUF.
-- **Autograd engine (CPU)** — reverse-mode over dense tensors, exactly the ops a Qwen3 block needs.
-- **Qwen3 model** — GQA attention, **QK-RMSNorm**, RoPE (NEOX), SwiGLU, tied embeddings.
+- **Autograd engine (CPU)** — reverse-mode over dense tensors, exactly the ops a Gemma3 block needs.
+- **Gemma3 model** — GQA attention, **QK-RMSNorm**, per-layer **sliding-window attention** (the SWA
+  speed lever) with dual local/global RoPE (NEOX), **GeGLU**, **sandwich norms**, tied embeddings.
 - **Optimizers** — **AdamW** and **Muon** (Newton–Schulz orthogonalized momentum).
 - **Trainer** — next-token cross-entropy, grad accumulation, gradient clipping.
 - **WebGPU backend** (`src/backend/webgpu.ts`) — the full op set as WGSL compute shaders, forward +
-  backward: tiled GEMM, elementwise, workgroup-reduction RMSNorm/QK-norm, RoPE, causal GQA
-  attention, cross-entropy. Same `Tensor` interface; the model and `backward()` run unchanged.
+  backward: tiled GEMM, elementwise, workgroup-reduction RMSNorm/QK-norm, RoPE, causal GQA attention
+  (full + sliding-window), cross-entropy. Same `Tensor` interface; the model and `backward()` run
+  unchanged.
 - **Validation harnesses** — `tests/gradcheck.ts` (finite-difference gradient checks, with a
   negative control) and `tests/gpu_parity.ts` (GPU-vs-CPU forward/backward parity per op and
   whole-model).
 
-Demo results: CPU demo, loss 5.65 → 0.98 in ~20 s, greedy sampling reproduces the corpus, all three
-GGUF files verify. GPU demo (M1 Max), the full 725K-param `tinyConfig`: forward+backward at 36
-ms/step vs 143 ms/step on CPU, and the exported GGUF loads and runs in `llama-cli`.
+Demo results: the CPU demo drives loss down fast, greedy sampling reproduces the toy corpus, and all
+three GGUF files verify. The GPU demo (M1 Max) trains a tiny mixed SWA/global Gemma3 device-resident
+and the exported GGUF loads and runs in `llama-cli`.
 
 ## Roadmap
 
@@ -132,10 +134,10 @@ In rough priority order (details and rationale in [`docs/DESIGN.md`](docs/DESIGN
 src/
   gguf/        f16, quantize (+dequant), gguf writer/reader
   tokenizer/   byte-level BPE trainer + encode/decode
-  model/       config, autograd (CPU ops), qwen3 forward
+  model/       config, autograd (CPU ops), gemma3 forward
   train/       optimizer iface, adamw, muon, trainer loop
   backend/     webgpu (WGSL kernels + buffer/sync machinery), GPU train loop
-  export/      model -> GGUF (qwen3 tensor names + metadata)
+  export/      model -> GGUF (gemma3 tensor names + metadata)
 tests/         gradcheck (finite differences), gpu_parity (GPU vs CPU)
 examples/      demo.ts / demo_gpu.ts (train -> export -> verify)
 ```
@@ -172,7 +174,7 @@ decreasing loss, GGUF structure, finite dequantized weights — exiting non-zero
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md). In short: keep the reference backend dependency-free and
 runtime-agnostic (Deno/Bun/Node), validate any new autograd op against a finite-difference gradient
-check, and don't break GGUF loadability in `llama.cpp` (the `qwen3` tensor names and metadata keys
+check, and don't break GGUF loadability in `llama.cpp` (the `gemma3` tensor names and metadata keys
 are a contract).
 
 ## License
