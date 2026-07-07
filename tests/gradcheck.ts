@@ -43,7 +43,7 @@ import { Muon } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
 import { diskTokenSource, memTokenSource, tokenBytes, writeTokenFile } from "../src/data/tokens.ts";
 import { assistantLossMask, maskedTargets } from "../src/data/chat.ts";
-import { f16BitsToF32, f32ToF16Bits } from "../src/backend/f16.ts";
+import { f16BitsToF32, f32ToF16Bits } from "../src/gguf/f16.ts";
 
 // Storage is f32, so the finite difference carries ~1e-6 forward-rounding noise;
 // ε=1e-2 keeps both that noise (δ/2ε) and the O(ε²) truncation well under tol.
@@ -773,7 +773,7 @@ async function main() {
   }
 
   {
-    // f16 <-> f32 conversion (host<->GPU transfer for mixed precision).
+    // f16 <-> f32 conversion (GGUF f16 weight quantization on export).
     let ok = true;
     const exact: [number, number][] = [[1, 0x3c00], [0.5, 0x3800], [2, 0x4000], [-1, 0xbc00], [
       0,

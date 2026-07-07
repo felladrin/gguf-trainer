@@ -106,13 +106,6 @@ async function main() {
     );
   }
   console.log(`WebGPU adapter: ${gpu.adapterName}`);
-  // Mixed precision: GGUF_F16=1 multiplies GEMM operands in f16 (f32 accumulate).
-  // 2x ALU on packed-f16 GPUs (Strix Halo); ~neutral on Apple. Needs shader-f16.
-  // deno-lint-ignore no-explicit-any
-  const wantF16 = (globalThis as any).Deno?.env?.get?.("GGUF_F16") === "1";
-  const precision: "f16" | "f32" = wantF16 && gpu.f16Supported ? "f16" : "f32";
-  if (wantF16 && !gpu.f16Supported) console.log("  (GGUF_F16 set but shader-f16 unavailable; f32)");
-  console.log(`Precision: ${precision}`);
 
   // 1. Reuse the exact vocab the corpus was tokenized with (pretokenize.ts).
   const dir = new URL(".", import.meta.url).pathname;
@@ -227,7 +220,6 @@ async function main() {
     batchPerStep: batch,
     optimizer: opt,
     schedule,
-    precision,
     logEvery: Math.max(1, Math.round(steps / 30)),
     rng: mulberry32(7),
     checkpointEvery,

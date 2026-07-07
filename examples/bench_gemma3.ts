@@ -23,7 +23,7 @@ const vocab = 32768;
 const gpu = await initWebGPU();
 if (!gpu) throw new Error("no WebGPU");
 const cfg = gemma3Config(vocab, hidden, layers, Math.max(seqLen, 512), 64, window);
-console.log(`adapter: ${gpu.adapterName} | f16: ${gpu.f16Supported}`);
+console.log(`adapter: ${gpu.adapterName}`);
 console.log(
   `gemma3: hidden=${hidden} layers=${layers} heads=${cfg.nHeads}/${cfg.nKVHeads} ffn=${cfg.ffnDim} ` +
     `window=${window} pattern=${cfg.swaPattern} seqLen=${seqLen} batch=${batch} ` +
@@ -50,7 +50,6 @@ await trainLMGpuResident(model, gpu, {
   steps,
   batchPerStep: batch,
   optimizer: opt,
-  precision: gpu.f16Supported ? "f16" : "f32",
   rng: mulberry32(7),
   logEvery: 1,
   onLog: (_s, l) => losses.push(l),

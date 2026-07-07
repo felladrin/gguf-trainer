@@ -120,26 +120,31 @@ attention.
 cluster scale, but WebGPU targets f16/f32 compute — not worth the complexity here. Q4_0/Q8_0 remain
 **export-time** only.
 
-## Precision: f16, and why not bf16
+## Precision: f32, and why not f16/bf16
 
-Training runs f16-operand GEMM with f32 accumulate (`setPrecision("f16")`), on top of f32 master
-weights and f32 gradients/optimizer state. Only the matmul operands are rounded to f16.
+Training runs in **f32** end to end: f32 master weights, f32 GEMM, f32 accumulate, f32
+gradients/optimizer. An f16-operand GEMM path existed (f16 multiply, f32 accumulate) but was
+**removed** — see below.
 
 A fair question on AMD Strix Halo (RDNA 3.5, RADV GFX1151), whose silicon has native bf16: why not
 bf16? Because WebGPU cannot reach it. WGSL's only reduced-precision scalar is `f16` (IEEE half),
 gated by the `shader-f16` feature; there is no `bf16` WGSL type and no `shader-bf16` WebGPU feature,
 and Deno's wgpu/naga shader compiler has no bf16 either. So the backend physically cannot emit a
-bf16 kernel (`setPrecision` accepts only `"f16" | "f32"`), and the hardware's bf16 units are
-unreachable from this path. Same story for f16 matrix cores (WMMA): not exposed to WebGPU here, so
-f16 buys packed-ALU throughput (~2x over f32 on Strix), not matrix-core acceleration.
+bf16 kernel, and the hardware's bf16 units are unreachable from this path. Same story for f16 matrix
+cores (WMMA): not exposed to WebGPU here.
 
-Does f16 hurt training? Not at these sizes. bf16's advantage is its f32-like exponent range (it
-avoids activation/gradient overflow/underflow) at the cost of mantissa bits; we sidestep f16's
-narrower range structurally instead (f32 master weights + f32 accumulate + f16 only on operands),
-and RMSNorm keeps activations O(1) well inside f16's range. Evidence: the CPU-f32 vs GPU-f16 parity
-probe that gates every run agrees to ~1e-6 relative (e.g. 9.6941 vs 9.6941 at init on the 31M
-pretrain). So f16 is loss-free here. bf16 would pay off only on a native ROCm/PyTorch path that taps
-the matrix cores, which is a different engine (and the real throughput lever, not a precision flag).
+So why not at least f16-operand GEMM? It was tried and it **failed on two counts.** (1) No speedup
+at the sizes we train: f16 accelerates the GEMM (~9% of runtime), but attention (~78%) dominates, so
+the end-to-end change was unmeasurable (0.28 f32 vs 0.27 f16 st/s on the 31M pretrain). (2) It
+**overflows**: casting each operand to `f16(v)` sends any value past f16's 65504 ceiling to
+`inf`→NaN, and the real 20k-step run died at step 2400 at every LR once trained activations grew
+large. The trap was that the init-time CPU-f32/GPU-f16 parity probe agreed to ~1e-6 (9.6941 vs
+9.6941) — but that only tests the _untrained_ model, whose activations are small; f16 looked
+loss-free and wasn't. This is exactly the failure bf16's wider exponent range would have avoided,
+and exactly why f16 needs loss-scaling/clamping that f32 does not. Since f16 bought no speed here,
+f32 is strictly better: stable AND same wall-clock. bf16 would pay off only on a native ROCm/PyTorch
+path that taps the matrix cores — a different engine, and the real throughput lever, not a precision
+flag.
 
 ## WebGPU backend bring-up
 
@@ -148,9 +153,10 @@ shaders behind the same `Tensor` interface in `src/backend/webgpu.ts`, forward a
 planned order:
 
 1. `matmul`/`linear` (tiled GEMM) — throughput-critical, built first. ✓ Later register-tiled (4×4
-   micro-tile per thread, unrolled to stay in registers; 1.9–3.3× end-to-end) and made f16-capable
-   (f16 multiply, f32 accumulate via `setPrecision("f16")`). Kernel sources now live in
-   `src/backend/wgsl.ts`; see the performance-work section in `docs/HANDOFF.md`.
+   micro-tile per thread, unrolled to stay in registers; 1.9–3.3× end-to-end). An f16-operand
+   variant was added and then removed (no speedup at our sizes + overflow; see "Precision" above).
+   Kernel sources now live in `src/backend/wgsl.ts`; see the performance-work section in
+   `docs/HANDOFF.md`.
 2. elementwise `add`, `mul`, `silu`. ✓
 3. `rmsnorm`, `rmsnorm_heads` (QK-norm) — workgroup reductions. ✓
 4. `rope`, causal `attention`, `cross_entropy`. ✓ Attention uses a hybrid dispatch: materialized

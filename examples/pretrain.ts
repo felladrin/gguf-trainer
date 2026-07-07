@@ -15,9 +15,13 @@
 // GGUF checkpoints. The export is a BASE model: no chat template, eos is the
 // document boundary. Coherence emerges well before a full epoch on TinyStories.
 //
-//   deno run -A --unstable-webgpu examples/pretrain.ts [corpus.txt] [hidden] [layers] [steps] [seqLen] [batch]
+//   deno run -A --unstable-webgpu examples/pretrain.ts [corpus.txt] [hidden] [layers] [steps] [seqLen] [batch] [muonLr]
 // Defaults: corpus=corpus/tinystories-valid.txt, hidden 512, layers 6 (~28M),
-//   steps 2000, seqLen 1024, batch 8. GGUF_F16=1 enables f16-compute GEMM.
+//   steps 2000, seqLen 1024, batch 8, muonLr 0.01. Compute is f32 throughout.
+//
+// muonLr 0.01 is the stable peak: a 20k-step run at 0.02 trained cleanly through
+// warmup then went NaN the moment the WSD schedule hit peak LR (same failure the
+// long reasoning run hit at 0.02). Halving the peak is the fix; 10% warmup holds.
 //
 // NOTE: the corpus is read whole (readFileText), so keep a single file under
 // ~500 MB (V8's ~512 MB string cap). For the full multi-GB TinyStories/FineWeb
@@ -152,16 +156,12 @@ async function main() {
   const steps = a[3] ? Number(a[3]) : 2000;
   const seqLen = a[4] ? Number(a[4]) : 1024;
   const batch = a[5] ? Number(a[5]) : 8;
-  const muonLr = 0.02, auxLr = 3e-3, baseWidth = 128;
+  const muonLr = a[6] ? Number(a[6]) : 0.01, auxLr = 3e-3, baseWidth = 128;
 
   console.log("=== curriculum stage 1: pretrain gemma3 base -> GGUF ===\n");
   const gpu = await initWebGPU();
   if (!gpu) die("no WebGPU (run under Deno with --unstable-webgpu)");
   console.log(`WebGPU adapter: ${gpu.adapterName}`);
-  // deno-lint-ignore no-explicit-any
-  const wantF16 = (globalThis as any).Deno?.env?.get?.("GGUF_F16") === "1";
-  const precision: "f16" | "f32" = wantF16 && gpu.f16Supported ? "f16" : "f32";
-  console.log(`Precision: ${precision}`);
 
   const corpus = await readFileText(corpusPath).catch(() =>
     die(`cannot read corpus ${corpusPath}`)
@@ -235,6 +235,11 @@ async function main() {
     cooldownSteps: Math.max(1, Math.round(steps * 0.2)),
     minScale: 0.1,
   });
+  console.log(
+    `Schedule: muon lr ${muonLr}, aux lr ${auxLr}, WSD warmup ${
+      Math.round(steps * 0.1)
+    } / cooldown ${Math.round(steps * 0.2)} steps`,
+  );
 
   // BASE model export: no chat template (there are no turns yet). The tokenizer
   // still carries the reserved specials, so the instruct stage inherits them.
@@ -255,7 +260,6 @@ async function main() {
     batchPerStep: batch,
     optimizer: opt,
     schedule,
-    precision,
     logEvery: Math.max(1, Math.round(steps / 50)),
     rng: mulberry32(7),
     checkpointEvery,

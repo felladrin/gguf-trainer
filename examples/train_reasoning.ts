@@ -6,7 +6,6 @@
 //
 //   deno run -A --unstable-webgpu examples/train_reasoning.ts [hidden] [layers] [steps] [seqLen] [batch] [window]
 // Defaults: hidden 512, layers 12 (~64M), 20000 steps, seqLen 2048, batch 2, window 1024.
-// GGUF_F16=1 enables f16-compute GEMM (Strix Halo win).
 
 import { readGGUF } from "../src/gguf/gguf.ts";
 import { readFileText, writeFileBytes } from "../src/io.ts";
@@ -89,10 +88,6 @@ async function main() {
   const gpu = await initWebGPU();
   if (!gpu) die("no WebGPU (run under Deno with --unstable-webgpu)");
   console.log(`WebGPU adapter: ${gpu.adapterName}`);
-  // deno-lint-ignore no-explicit-any
-  const wantF16 = (globalThis as any).Deno?.env?.get?.("GGUF_F16") === "1";
-  const precision: "f16" | "f32" = wantF16 && gpu.f16Supported ? "f16" : "f32";
-  console.log(`Precision: ${precision}`);
 
   const dir = new URL(".", import.meta.url).pathname;
   const prefix = `${dir}reasoning`;
@@ -188,7 +183,6 @@ async function main() {
     batchPerStep: batch,
     optimizer: opt,
     schedule,
-    precision,
     logEvery: Math.max(1, Math.round(steps / 100)),
     rng: mulberry32(7),
     checkpointEvery,

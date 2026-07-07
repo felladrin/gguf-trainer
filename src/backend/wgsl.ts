@@ -76,20 +76,16 @@ export function srcGemm(
   M: number,
   N: number,
   K: number,
-  f16 = false,
 ): string {
   const [BM, BN, BK, TM, TN, WG] = [GEMM_BM, GEMM_BN, GEMM_BK, GEMM_TM, GEMM_TN, GEMM_WG];
   // gr = global row (m), gc = global col (n), gk = global k index.
   const aLoad = kind === "TN" ? "AB[gk * M + gr]" : "AB[gr * K + gk]";
   const bLoad = kind === "NT" ? "BB[gc * K + gk]" : "BB[gk * N + gc]";
-  // Mixed precision: stage the tiles as f16 and multiply in f16 (2x ALU on
-  // hardware with packed f16, e.g. Strix Halo), but ACCUMULATE in f32 so the
-  // K-length reduction keeps full precision. Operands (activations/weights/grads)
-  // round to f16 for the multiply only; buffers, grads, and the optimizer stay
-  // f32, so no loss scaling is needed. sh = shared-tile scalar type.
-  const sh = f16 ? "f16" : "f32";
-  const toSh = f16 ? "f16(v)" : "v";
-  const prod = (i: number, j: number) => f16 ? `f32(a${i} * b${j})` : `a${i} * b${j}`;
+  // Everything is f32: buffers, the shared tiles, the multiply, and the
+  // K-length accumulation. (An f16-operand variant was removed — it gave no
+  // wall-clock gain here since attention, not GEMM, dominates runtime, and
+  // rounding operands to f16 overflowed on longer runs.) sh = tile scalar type.
+  const sh = "f32";
   // Unroll the tile so every accumulator/fragment is a compile-time-named
   // scalar (stays in registers) rather than a dynamically-indexed array.
   let decl = "", fragA = "", fragB = "", macs = "", stores = "";
@@ -98,14 +94,14 @@ export function srcGemm(
   for (let i = 0; i < TM; i++) {
     for (let j = 0; j < TN; j++) {
       decl += `  var acc${i}_${j} = 0.0;\n`;
-      macs += `      acc${i}_${j} = acc${i}_${j} + ${prod(i, j)};\n`;
+      macs += `      acc${i}_${j} = acc${i}_${j} + a${i} * b${j};\n`;
       const idx = `(blockRow + tRow + ${i}u) * N + (blockCol + tCol + ${j}u)`;
       const rhs = accum ? `CB[ci] + acc${i}_${j}` : `acc${i}_${j}`;
       stores += `  if (blockRow + tRow + ${i}u < M && blockCol + tCol + ${j}u < N) ` +
         `{ let ci = ${idx}; CB[ci] = ${rhs}; }\n`;
     }
   }
-  return `${f16 ? "enable f16;\n" : ""}
+  return `
 ${bindF32(0, "AB", "read")}
 ${bindF32(1, "BB", "read")}
 ${bindF32(2, "CB", "read_write")}
@@ -129,7 +125,7 @@ ${decl}  var kk = 0u;
       let gk = kk + kc;
       var v = 0.0;
       if (gr < M && gk < K) { v = ${aLoad}; }
-      As[r * ${BK}u + kc] = ${toSh};
+      As[r * ${BK}u + kc] = v;
     }
     for (var t = lidx; t < ${BK * BN}u; t += ${WG}u) {
       let kc = t / ${BN}u;
@@ -138,7 +134,7 @@ ${decl}  var kk = 0u;
       let gc = blockCol + c;
       var v = 0.0;
       if (gk < K && gc < N) { v = ${bLoad}; }
-      Bs[kc * ${BN}u + c] = ${toSh};
+      Bs[kc * ${BN}u + c] = v;
     }
     workgroupBarrier();
     for (var kc = 0u; kc < ${BK}u; kc++) {

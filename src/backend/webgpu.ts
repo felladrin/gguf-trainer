@@ -205,8 +205,6 @@ export class WebGPUBackend implements OpsBackend {
   readonly adapterName: string;
   /** Whether the device granted the timestamp-query feature (see startProfile). */
   readonly timestampSupported: boolean;
-  /** Whether the device granted shader-f16 (prerequisite for mixed-precision training). */
-  readonly f16Supported: boolean;
   /**
    * Context-length threshold for the flash-style attention kernels. Below this
    * T, the materialized [Hq,T,T] kernels win because flash's one-thread-per-row
@@ -235,21 +233,17 @@ export class WebGPUBackend implements OpsBackend {
   /** Label attributed to dispatches recorded via dispatch() (profiling only). */
   private curLabel = "";
   private prof: Profiler | null = null;
-  /** Mixed-precision GEMM: f16 multiply, f32 accumulate (see setPrecision). */
-  private f16 = false;
 
   constructor(
     device: GpuDevice,
     adapterName: string,
     timestampSupported = false,
-    f16Supported = false,
   ) {
     this.device = device;
     this.queue = device.queue;
     this.pool = new BufferPool(device);
     this.adapterName = adapterName;
     this.timestampSupported = timestampSupported;
-    this.f16Supported = f16Supported;
     device.lost?.then((info) => {
       this.deviceError = `WebGPU device lost: ${info?.message ?? "unknown"}`;
     });
@@ -260,25 +254,6 @@ export class WebGPUBackend implements OpsBackend {
     } catch {
       // Runtime without onuncapturederror support; sync() still surfaces device loss.
     }
-  }
-
-  /**
-   * Select matmul precision. "f16" makes the GEMM multiply operands in f16 and
-   * accumulate in f32 (2x ALU throughput on packed-f16 hardware like Strix Halo;
-   * on Apple GPUs f16 and f32 ALU run at the same rate, so expect little change
-   * there). Buffers, gradients, and the optimizer stay f32, so no loss scaling
-   * is needed. Requires the shader-f16 device feature. Set before training.
-   */
-  setPrecision(p: "f16" | "f32") {
-    if (p === "f16" && !this.f16Supported) {
-      throw new Error("setPrecision('f16'): shader-f16 not available on this device");
-    }
-    this.f16 = p === "f16";
-  }
-
-  /** Current matmul precision. */
-  get precision(): "f16" | "f32" {
-    return this.f16 ? "f16" : "f32";
   }
 
   /** Route the autograd op set through this backend. */
@@ -857,7 +832,7 @@ export class WebGPUBackend implements OpsBackend {
     label = "",
   ): () => void {
     return this.prepareDispatch(
-      srcGemm(kind, accum, M, N, K, this.f16),
+      srcGemm(kind, accum, M, N, K),
       [a, b, c],
       ceilDiv(N, GEMM_BN),
       ceilDiv(M, GEMM_BM),
@@ -946,7 +921,7 @@ export class WebGPUBackend implements OpsBackend {
     c: GpuBuffer,
   ) {
     this.dispatch(
-      srcGemm(kind, accum, M, N, K, this.f16),
+      srcGemm(kind, accum, M, N, K),
       [a, b, c],
       ceilDiv(N, GEMM_BN),
       ceilDiv(M, GEMM_BM),
@@ -1108,10 +1083,9 @@ export async function initWebGPU(): Promise<WebGPUBackend | null> {
   // Opt into timestamp-query when the adapter offers it, so per-kernel GPU-time
   // profiling (startProfile) is available; absence just disables profiling.
   // Opt into optional features when offered: timestamp-query enables per-kernel
-  // profiling (startProfile); shader-f16 enables mixed-precision training.
+  // profiling (startProfile).
   const feats: string[] = [];
   if (adapter.features?.has?.("timestamp-query")) feats.push("timestamp-query");
-  if (adapter.features?.has?.("shader-f16")) feats.push("shader-f16");
   let device: GpuDevice;
   try {
     device = await adapter.requestDevice({
@@ -1129,6 +1103,5 @@ export async function initWebGPU(): Promise<WebGPUBackend | null> {
     device,
     String(name),
     !!device.features?.has?.("timestamp-query"),
-    !!device.features?.has?.("shader-f16"),
   );
 }

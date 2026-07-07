@@ -126,8 +126,9 @@ Next, in rough priority order:
 1. **Curriculum training** — pretrain (unlabeled) → instruct → reasoning → tool-calling, chaining
    each stage's checkpoint through the Gemma3 resume loader. Coherence needs a real pretraining
    phase; the reasoning/tool stages graft onto that base.
-2. **Throughput** — vec4-vectorized elementwise kernels, full f16 activation storage (a bigger batch
-   at 8K), and a fused online-softmax cross-entropy (large-vocab memory).
+2. **Throughput** — vec4-vectorized elementwise kernels and a fused online-softmax cross-entropy
+   (large-vocab memory). (Compute runs f32: an f16-operand GEMM path was removed — no speedup at
+   these sizes, since attention not GEMM dominates, and it overflowed to NaN on real runs.)
 
 ## Architecture
 

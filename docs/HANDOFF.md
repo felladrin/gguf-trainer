@@ -38,8 +38,8 @@ train/inference mismatch. Key facts (see `docs/DESIGN.md`, and the memory files)
   want text-only). Trivial future swap (only the export mapping changes) if ever wanted.
 - **Reasoning run pipeline:** `examples/prepare_reasoning.ts` (OpenThoughts-114k → ChatML with
   `<think>`/`</think>` atomic specials → BPE → `.tokens`) then `examples/train_reasoning.ts`
-  (device-resident Muon+AdamW, WSD, `GGUF_F16=1`, mid-run gemma3 GGUF checkpoints). Test checkpoints
-  with **`llama-server`** (OpenAI `/v1`) or `llama-simple` — build 9850's `llama-cli` is an
+  (device-resident Muon+AdamW, WSD f32, mid-run gemma3 GGUF checkpoints). Test checkpoints with
+  **`llama-completion`** (base) / **`llama-server`** (OpenAI `/v1`) — build 9850's `llama-cli` is an
   interactive REPL that hangs on piped stdin.
 - **Honest scale note:** matching SmolLM2-135M from scratch on one APU is not reachable (~2T tokens
   on a cluster vs ~1.9M tok/hr here). The deliverable is a correct fast arch + a healthy descending
@@ -79,14 +79,47 @@ types), gated by a gradcheck assertion. Because token_type is metadata (not weig
 independently of the frozen embeddings and can be re-tuned before the reasoning/tool stages; verify
 end-to-end via `llama-server` on build 9850 when a stage first emits these tags.
 
-**Throughput / precision reality.** ~3.5M tok/hr @58M on Strix (~7M @31M with f16). A 100-300M-token
-pretrain is ~1-2 days; full SmolLM2/Minueza scale (100B+ tokens) is not reachable on one APU, and no
-precision flag closes it — bf16 is not exposed by WebGPU (see `docs/DESIGN.md` "Precision: f16, and
-why not bf16"), and the real ~1000x lever is a native ROCm/PyTorch path, not this trainer.
+**Throughput / precision reality.** ~8M tok/hr @31M on Strix (0.28 st/s × 8192 tok/step, measured
+f32). **f16 gives no wall-clock speedup at this scale** (0.28 vs 0.27 st/s) because attention is
+~78% of runtime and f16 only accelerates the GEMM ~9% slice — plus it overflows (see the step-2400
+NaN below), so f32 is the default. A 100-300M-token pretrain is ~1-2 days; full SmolLM2/Minueza
+scale (100B+ tokens) is not reachable on one APU, and no precision flag closes it — bf16 is not
+exposed by WebGPU (see `docs/DESIGN.md` "Precision: f16, and why not bf16"), and the real ~1000x
+lever is a native ROCm/PyTorch path, not this trainer. The real on-device throughput lever is
+attention, not precision.
+
+**The step-2400 NaN (f16 overflow, NOT learning rate).** The 20k-step pretrain (31.4M, batch 16 ×
+seq 512, f16) descends cleanly (loss 9.64 → ~2.8) then goes to **NaN at step 2400** — and it does so
+at the _identical_ step for muon lr 0.02 AND lr 0.01. Halving the LR did not move the failure, which
+rules LR out (a magnitude problem would shift with magnitude). Ruled out too: data — the token
+stream is clean (80.4M ids, range [9, 15283], vocab 15294, zero out-of-range). Root cause is **f16
+GEMM overflow**: `srcGemm` (`wgsl.ts`) keeps buffers/grads/optimizer in f32 but casts each operand
+to f16 for the multiply (`f16(v)`) with no clamp, so once any activation/weight/grad exceeds f16's
+65504 ceiling it becomes `inf` → NaN. The model reaches that magnitude around loss ~2.8 (~step 2400)
+at _any_ LR, so both runs die there. Gemma3's √hidden embedding scale and dropped logit soft-capping
+make it prone. NOTE: the earlier reasoning-run "0.02 too hot" divergence was likely this same f16
+overflow, not LR. **CONFIRMED + RESOLVED: run f32** (launch WITHOUT `GGUF_F16=1`; `pretrain.ts`
+defaults to f32). The f32 run cleared step 2400 (loss 1.61) and 2800 (1.73) where both f16 runs
+NaN'd. Two surprises settled the design: (1) f32 _learns better_ — loss 1.87 vs f16's 2.82 at step
+2000 (f16 operand rounding degraded the whole trajectory, not just the tail); (2) f32 is the **same
+speed** as f16 (0.28 vs 0.27 st/s). f16 only accelerates the GEMM/linear slice (~9% of runtime;
+attention is ~78%), so its end-to-end speedup is unmeasurable here. **The f16-compute code was
+removed** (`setPrecision`, the `f16` GEMM operand path in `srcGemm`, the `precision` option, the
+`GGUF_F16` env plumbing, and the dead `backend/f16.ts`): it overflows without a guard, and building
+that guard (operand clamp / loss-scaling) buys a speedup that does not exist at this scale. NOTE for
+scale-up: f16-compute _did_ measure ~1.54× on a larger GEMM-heavy shape (45.6M, seqLen 512), so if a
+future large/GEMM-bound config revisits it, do so on a native path with a real overflow guard — not
+here. `pretrain.ts` takes muonLr as arg `a[6]` (LR was never the cause).
 
 **Corpus caveat.** `pretrain.ts` reads the corpus whole (`readFileText`, V8's ~512 MB string cap),
 so use a sub-500 MB slice or add chunked reading before pointing it at the full multi-GB TinyStories
 / FineWeb train split.
+
+**Launching on Strix.** Use the absolute deno path `/home/victor/.deno/bin/deno` (a bare `env deno`
+under `setsid` has no `~/.deno/bin` on PATH; a `bash -lc "..."` login-shell wrapper works too).
+Detached run:
+`cd ~/gguf-trainer && setsid nohup /home/victor/.deno/bin/deno run -A
+--unstable-webgpu examples/pretrain.ts <corpus> 512 6 20000 512 16 0.01 > pretrain.log 2>&1 </dev/null &`.
 
 ## Current state (working and verified)
 
@@ -225,8 +258,8 @@ functional gate at T=3584 under spec-default limits.
 
 All below are committed and gated by `tests/gpu_parity.ts`. Measured on an M1 Max and an AMD Strix
 Halo (Ryzen AI Max+ 395, Radeon 8060S = RADV GFX1151). The **entire backend runs green on GFX1151**
-(all parity checks incl. f16 GEMM), the first time this Deno/WebGPU path has run on the AMD target —
-so training the way this repo does works on the intended 24/7 APU.
+(all f32 parity checks), the first time this Deno/WebGPU path has run on the AMD target — so
+training the way this repo does works on the intended 24/7 APU.
 
 - **Per-kernel profiler.** `WebGPUBackend.startProfile()/stopProfile()` time each dispatch in its
   own compute pass via the `timestamp-query` feature (opted into by `initWebGPU` when the adapter
@@ -246,15 +279,18 @@ so training the way this repo does works on the intended 24/7 APU.
   embedding. `recordDispatch` now folds `x>65535` into a 2-D grid at one point; the overflow-capable
   kernels bake the matching gridX (`grid2D`/`gridRows`) to rebuild their index. Training runs at
   seqLen 4096 and 8192.
-- **f16 mixed precision (compute).** `backend.setPrecision("f16")` / the `precision` option on
-  `trainLMGpuResident` / `GGUF_F16=1` on `train_tinystories`: the GEMM multiplies operands in f16
-  and accumulates the K reduction in f32 (the tensor-core pattern). Buffers, gradients, and the
-  optimizer stay f32, so **no loss scaling is needed**. Requires `shader-f16`
-  (`backend.f16Supported`; host transfer helpers in `f16.ts`). This is the **Strix Halo** win; Apple
-  GPUs run f16 and f32 ALU at the same rate, so M1 Max is ~neutral. **Measured on Strix Halo:**
-  **1.54×** at a GEMM-heavy shape (45.6M params, seqLen 512: 997→1537 tok/s), loss curve identical
-  to f32. Validated: f16 GEMM matches the f32 CPU reference within a loose tolerance, and multi-step
-  runs track the f32 loss trajectory.
+- **f16 mixed precision (compute) — IMPLEMENTED, THEN REMOVED.** Once `backend.setPrecision("f16")`
+  / a `precision` option / `GGUF_F16=1`: the GEMM multiplied operands in f16 and accumulated the K
+  reduction in f32 (tensor-core pattern), buffers/grads/optimizer staying f32. It measured **1.54×**
+  on a GEMM-heavy shape (45.6M, seqLen 512), BUT: (a) **no speedup on the actual small-model
+  pretrain** (31M, seqLen 512 batch 16: 0.28 f32 vs 0.27 f16 st/s) because attention (~78%), not
+  GEMM (~9%), dominates there; and (b) it casts each operand `f16(v)` with **no clamp**, so once an
+  activation/grad exceeds f16's 65504 it goes `inf`→NaN — the real 20k-step run died at step 2400 at
+  any LR (see "step-2400 NaN" above). A 1.54× that NaNs mid-run is unusable without a guard
+  (clamp/loss-scaling) not worth building at this scale, so the whole compute-f16 path was removed
+  (`setPrecision`, the `srcGemm` f16 operand branch, the `precision` option, `GGUF_F16` plumbing,
+  the dead `backend/f16.ts`). Revisit only for a large GEMM-bound config on a native path with a
+  guard.
 
 **Key empirical finding (measured on Strix Halo — do not re-tread):** f16 is a **GEMM lever, not an
 attention lever**. Both f16-compute (f16 multiply) and f16-storage (f16 Q/K/V, halving the O(T²)
