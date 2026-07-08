@@ -282,6 +282,72 @@ export async function newtonSchulzGpu(
 
 // --- The optimizer ---------------------------------------------------------------
 
+/** Serializable optimizer state: Muon momentum per muon param + Adam moments. */
+export interface OptState {
+  muonMomentum: Float32Array[];
+  adamM: Float32Array[];
+  adamV: Float32Array[];
+  adamT: number;
+}
+
+const OPT_MAGIC = 0x4f505431; // "OPT1"
+
+/** Pack OptState into bytes: header (magic, adamT, per-array lengths) + f32 data
+ * in order muonMomentum, adamM, adamV. No fs here — callers own the file. */
+export function serializeOptState(s: OptState): Uint8Array {
+  const lens = [
+    s.muonMomentum.map((a) => a.length),
+    s.adamM.map((a) => a.length),
+    s.adamV.map((a) => a.length),
+  ];
+  const headerU32 = 2 + lens.reduce((n, g) => n + 1 + g.length, 0); // magic,t + (count+lengths)×3
+  const totalF32 = lens.flat().reduce((a, b) => a + b, 0);
+  const bytes = new Uint8Array(headerU32 * 4 + totalF32 * 4);
+  const dv = new DataView(bytes.buffer);
+  let o = 0;
+  dv.setUint32(o, OPT_MAGIC, true), o += 4;
+  dv.setUint32(o, s.adamT, true), o += 4;
+  for (const g of lens) {
+    dv.setUint32(o, g.length, true), o += 4;
+    for (const L of g) dv.setUint32(o, L, true), o += 4;
+  }
+  const f32 = new Float32Array(bytes.buffer, o);
+  let fo = 0;
+  for (const arr of [...s.muonMomentum, ...s.adamM, ...s.adamV]) {
+    f32.set(arr, fo), fo += arr.length;
+  }
+  return bytes;
+}
+
+/** Inverse of serializeOptState. */
+export function deserializeOptState(bytes: Uint8Array): OptState {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let o = 0;
+  if (dv.getUint32(o, true) !== OPT_MAGIC) throw new Error("bad optstate magic");
+  o += 4;
+  const adamT = dv.getUint32(o, true);
+  o += 4;
+  const readLens = (): number[] => {
+    const count = dv.getUint32(o, true);
+    o += 4;
+    const out: number[] = [];
+    for (let i = 0; i < count; i++) {
+      out.push(dv.getUint32(o, true)), o += 4;
+    }
+    return out;
+  };
+  const mmLens = readLens(), amLens = readLens(), avLens = readLens();
+  const f32 = new Float32Array(bytes.buffer, bytes.byteOffset + o);
+  let fo = 0;
+  const take = (lens: number[]): Float32Array[] =>
+    lens.map((L) => {
+      const a = f32.slice(fo, fo + L);
+      fo += L;
+      return a;
+    });
+  return { muonMomentum: take(mmLens), adamM: take(amLens), adamV: take(avLens), adamT };
+}
+
 export class MuonGpu {
   /** Aux group (embeddings, head, norms); device-resident under AdamWGpu. */
   readonly auxParams: Tensor[];
@@ -291,6 +357,7 @@ export class MuonGpu {
   private ops: (() => void)[]; // one step's dispatches, prepared once
   private baseLr: number;
   private lrBuf: GpuBuffer; // 1-element, shared by every param's apply kernel
+  private momentumBufs: GpuBuffer[] = []; // per muon param (for checkpointing)
 
   constructor(
     gpu: WebGPUBackend,
@@ -319,6 +386,7 @@ export class MuonGpu {
       const bufs = gpu.buffersFor(p);
       gpu.keepGradOnDevice(p);
       const buf = gpu.createStateBuffer(p.size * 4); // momentum, zero at start
+      this.momentumBufs.push(buf);
       const ns = allocNs(gpu, m, n, gpu.createStateBuffer(p.size * 4));
       const scale = Math.sqrt(Math.max(1, m / n)); // shape-static; lr is dynamic
       this.ops.push(
@@ -371,5 +439,32 @@ export class MuonGpu {
   /** Copy device-resident Muon + aux weights back to host (sampling/export). */
   async syncWeightsToHost(): Promise<void> {
     await this.gpu.sync([...this.muonParams, ...this.auxParams]);
+  }
+
+  /** Read all optimizer state (Muon momentum + Adam moments + step) to the host,
+   * so a long run can resume with a warm optimizer instead of cold-starting. */
+  async exportState(): Promise<OptState> {
+    const muonMomentum: Float32Array[] = [];
+    for (let i = 0; i < this.momentumBufs.length; i++) {
+      muonMomentum.push(
+        await this.gpu.readStateBuffer(this.momentumBufs[i], this.muonParams[i].size),
+      );
+    }
+    const adam = await this.aux.exportState();
+    return { muonMomentum, adamM: adam.m, adamV: adam.v, adamT: adam.t };
+  }
+
+  /** Restore optimizer state from a checkpoint (call after construction, before
+   * training). Shapes must match the constructed param groups. */
+  importState(s: OptState): void {
+    if (s.muonMomentum.length !== this.momentumBufs.length) {
+      throw new Error(
+        `muon momentum count mismatch: ${s.muonMomentum.length} vs ${this.momentumBufs.length}`,
+      );
+    }
+    for (let i = 0; i < this.momentumBufs.length; i++) {
+      this.gpu.writeStateBuffer(this.momentumBufs[i], s.muonMomentum[i]);
+    }
+    this.aux.importState({ m: s.adamM, v: s.adamV, t: s.adamT });
   }
 }

@@ -807,6 +807,25 @@ export class WebGPUBackend implements OpsBackend {
   }
 
   /**
+   * Read a state buffer's contents back to the host — for checkpointing
+   * optimizer state (momentum, Adam moments). Flushes pending encoder work,
+   * copies to a mappable staging buffer, and returns `elems` f32 values. Call
+   * outside the hot loop (e.g. at checkpoint time, after syncWeightsToHost).
+   */
+  async readStateBuffer(buf: GpuBuffer, elems: number): Promise<Float32Array> {
+    this.endPass();
+    if (!this.enc) this.enc = this.device.createCommandEncoder();
+    const stage = this.copyToStaging(buf, elems * 4);
+    this.submit();
+    await stage.mapAsync(MAP_MODE_READ);
+    const out = new Float32Array(elems);
+    out.set(new Float32Array(stage.getMappedRange(), 0, elems));
+    stage.unmap();
+    stage.destroy();
+    return out;
+  }
+
+  /**
    * Resolve pipeline + bind group once and return a closure that records the
    * dispatch. Only valid for PERSISTENT buffers (a pooled transient may be
    * recycled under the cached bind group). An optimizer re-records identical

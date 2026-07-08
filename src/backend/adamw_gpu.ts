@@ -137,6 +137,8 @@ export class AdamWGpu {
   private t = 0;
   private hyp: GpuBuffer; // [lr, bc1, bc2], rewritten each step
   private ops: (() => void)[]; // reductions (if clip) + finalize + per-param adam
+  private mBufs: GpuBuffer[] = []; // first moment per param (for checkpointing)
+  private vBufs: GpuBuffer[] = []; // second moment per param
 
   constructor(gpu: WebGPUBackend, params: Tensor[], opts: AdamOpts) {
     this.gpu = gpu;
@@ -182,6 +184,8 @@ export class AdamWGpu {
       gpu.keepGradOnDevice(p);
       const m = gpu.createStateBuffer(p.size * 4);
       const v = gpu.createStateBuffer(p.size * 4);
+      this.mBufs.push(m);
+      this.vBufs.push(v);
       return gpu.prepareDispatch(
         srcAdam(p.size, o.beta1, o.beta2, o.eps, o.weightDecay),
         [bufs.grad, m, v, bufs.data, this.hyp, scale],
@@ -219,5 +223,29 @@ export class AdamWGpu {
   /** Copy device-resident aux weights back to host (sampling/export). */
   async syncWeightsToHost(): Promise<void> {
     await this.gpu.sync(this.params);
+  }
+
+  /** Read the Adam moments + step counter back to the host (checkpointing). */
+  async exportState(): Promise<{ m: Float32Array[]; v: Float32Array[]; t: number }> {
+    const m: Float32Array[] = [], v: Float32Array[] = [];
+    for (let i = 0; i < this.params.length; i++) {
+      m.push(await this.gpu.readStateBuffer(this.mBufs[i], this.params[i].size));
+      v.push(await this.gpu.readStateBuffer(this.vBufs[i], this.params[i].size));
+    }
+    return { m, v, t: this.t };
+  }
+
+  /** Restore Adam moments + step counter from a checkpoint (before resuming). */
+  importState(s: { m: Float32Array[]; v: Float32Array[]; t: number }): void {
+    if (s.m.length !== this.params.length || s.v.length !== this.params.length) {
+      throw new Error(
+        `adam state count mismatch: ${s.m.length}/${s.v.length} vs ${this.params.length}`,
+      );
+    }
+    for (let i = 0; i < this.params.length; i++) {
+      this.gpu.writeStateBuffer(this.mBufs[i], s.m[i]);
+      this.gpu.writeStateBuffer(this.vBufs[i], s.v[i]);
+    }
+    this.t = s.t;
   }
 }

@@ -67,7 +67,7 @@ import type { TokenSource } from "../src/data/tokens.ts";
 import type { QuantName } from "../src/gguf/quantize.ts";
 import { initWebGPU } from "../src/backend/webgpu.ts";
 import type { WebGPUBackend } from "../src/backend/webgpu.ts";
-import { MuonGpu } from "../src/backend/muon_gpu.ts";
+import { deserializeOptState, MuonGpu, serializeOptState } from "../src/backend/muon_gpu.ts";
 import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
 
 const DOC_SEP = "<|endoftext|>"; // TinyStories and most raw dumps mark doc boundaries with this
@@ -327,6 +327,18 @@ async function main() {
     momentum: 0.95,
     aux: { lr: auxLr, weightDecay: 0.0, clip: 1.0 },
   });
+  // Restore optimizer state (Muon momentum + Adam moments + step) if a sidecar
+  // sits next to the resume checkpoint — a warm resume instead of a cold restart.
+  // Absent (e.g. a weights-only checkpoint) -> cold optimizer, exactly as before.
+  if (resumePath) {
+    const optPath = `${resumePath}.optstate`;
+    if (await fileExists(optPath)) {
+      opt.importState(deserializeOptState(await readFileBytes(optPath)));
+      console.log(`Resumed optimizer state from ${optPath}`);
+    } else {
+      console.log(`No optimizer state at ${optPath}; optimizer cold-starts (momentum re-warms)`);
+    }
+  }
   // WSD over the FULL run (0..steps); on resume we offset into it so the LR
   // continues rather than re-warming. 10% warmup / 20% cooldown, floor 0.1.
   const fullSchedule = wsdSchedule({
@@ -369,6 +381,15 @@ async function main() {
     fs.renameSync(`${outPath}.tmp`, outPath);
     return b;
   };
+  // Optimizer-state sidecar next to the GGUF, so a resume continues with a warm
+  // optimizer (Muon momentum + Adam moments) instead of cold-starting. Atomic.
+  const optStatePath = `${outPath}.optstate`;
+  const writeOptState = async (): Promise<number> => {
+    const bytes = serializeOptState(await opt.exportState());
+    await writeFileBytes(`${optStatePath}.tmp`, bytes);
+    (await import("node:fs")).renameSync(`${optStatePath}.tmp`, optStatePath);
+    return bytes.length;
+  };
   const ckptEvery = flags.get("ckpt")
     ? Number(flags.get("ckpt"))
     : Math.min(1000, Math.max(1, Math.round(steps / 20)));
@@ -390,10 +411,12 @@ async function main() {
     checkpointEvery: ckptEvery,
     onCheckpoint: async (localStep) => {
       const b = await exportGGUF();
+      const optBytes = await writeOptState();
       const step = startStep + localStep;
       const el = (Date.now() - t0) / 1000;
       console.log(
-        `  [ckpt @ ${step}] ${outPath.split("/").pop()} ${(b.length / 1e6).toFixed(0)}MB, ` +
+        `  [ckpt @ ${step}] ${outPath.split("/").pop()} ${(b.length / 1e6).toFixed(0)}MB ` +
+          `+ optstate ${(optBytes / 1e6).toFixed(0)}MB, ` +
           `loss ${lastLoss.toFixed(3)}, ${(localStep / Math.max(1, el)).toFixed(3)} st/s`,
       );
     },
@@ -420,11 +443,13 @@ async function main() {
   console.log(`\nSample:\n${await generateGpu(gpu, model, tok, "Once upon a time", 60)}`);
 
   const bytes = await exportGGUF();
+  const optBytes = await writeOptState();
   const g = readGGUF(bytes);
   if (g.metadata.get("general.architecture") !== "gemma3") die("exported arch != gemma3");
   console.log(
     `\nWrote ${outPath} (${(bytes.length / 1e6).toFixed(0)} MB, ${g.tensors.length} tensors, ` +
-      `gemma3 base ✓, ctx ${cfg.maxSeq}). Next stage resumes via loadGemma3FromGGUF.`,
+      `gemma3 base ✓, ctx ${cfg.maxSeq}) + ${optStatePath.split("/").pop()} ` +
+      `(${(optBytes / 1e6).toFixed(0)} MB). Next stage resumes via loadGemma3FromGGUF.`,
   );
   console.log("=== stage 1 complete ===");
 }
