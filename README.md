@@ -130,6 +130,9 @@ Next, in rough priority order:
    (large-vocab memory). (Compute runs f32: an f16-operand GEMM path was removed — no speedup at
    these sizes, since attention not GEMM dominates, and it overflowed to NaN on real runs.)
 
+The remaining optimization levers — measured, prioritized, with honest payoff estimates from the
+94.7M/8192 run — are in [`docs/OPTIMIZATION.md`](docs/OPTIMIZATION.md).
+
 ## Architecture
 
 ```
