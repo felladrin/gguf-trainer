@@ -101,6 +101,17 @@ export interface TrainGpuResidentOpts {
    */
   checkpointEvery?: number;
   onCheckpoint?: (step: number) => void | Promise<void>;
+  /**
+   * WSD decay-phase data injection (MiniCPM / Xmodel-2 trick): from `injectFromStep`
+   * on, each micro-batch draws from `injectSource` instead of the main tokens with
+   * probability `injectFrac`. Used to fold a little instruct/ChatML data into the
+   * cooldown so the base emerges more instructable. All unset -> no injection and
+   * the rng stream is byte-identical to before (the decision rng() is only drawn
+   * when injection is actually active), so CPU/GPU parity is unaffected.
+   */
+  injectSource?: TokenSource;
+  injectFrac?: number; // 0..1 probability per micro-batch during the window
+  injectFromStep?: number; // first step injection is eligible (e.g. cooldown start)
 }
 
 /**
@@ -129,6 +140,12 @@ export async function trainLMGpuResident(
   const maxStart = tokens.length - opts.seqLen - 1;
   if (maxStart <= 0) throw new Error("Not enough tokens for one training window");
 
+  // WSD decay-phase injection (all optional; off -> no behavior/rng change).
+  const inject = opts.injectSource;
+  const injectFrac = opts.injectFrac ?? 0;
+  const injectFrom = opts.injectFromStep ?? 0;
+  const injectMaxStart = inject ? inject.length - opts.seqLen - 1 : 0;
+
   const history: { step: number; loss: number }[] = [];
 
   // MuonClip reads/rewrites qNorm/kNorm on the host, but they are device-resident
@@ -147,10 +164,15 @@ export async function trainLMGpuResident(
 
       const losses: Tensor[] = [];
       for (let b = 0; b < opts.batchPerStep; b++) {
-        const start = Math.floor(rng() * maxStart);
-        const inputIds = tokens.window(start, opts.seqLen);
-        const targetIds = tokens.window(start + 1, opts.seqLen);
-        if (opts.supervised) maskWindow(targetIds, opts.supervised, start + 1);
+        // Draw the inject decision (extra rng()) ONLY while injection is active,
+        // so with injection off the rng stream is unchanged (parity preserved).
+        const useInject = inject !== undefined && step >= injectFrom && injectFrac > 0 &&
+          injectMaxStart > 0 && rng() < injectFrac;
+        const src = useInject ? inject! : tokens;
+        const start = Math.floor(rng() * (useInject ? injectMaxStart : maxStart));
+        const inputIds = src.window(start, opts.seqLen);
+        const targetIds = src.window(start + 1, opts.seqLen);
+        if (opts.supervised && !useInject) maskWindow(targetIds, opts.supervised, start + 1);
         const loss = crossEntropy(model.forward(inputIds), targetIds);
         backward(loss, 1 / opts.batchPerStep); // average grads over the batch
         losses.push(loss);

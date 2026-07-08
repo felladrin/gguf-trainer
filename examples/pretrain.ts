@@ -342,6 +342,22 @@ async function main() {
     } / cooldown ${Math.round(steps * 0.2)} steps, quant ${quant}`,
   );
 
+  // WSD decay-phase instruct injection (MiniCPM/Xmodel-2 trick): from the cooldown
+  // start, draw injectFrac of micro-batches from a second .tokens stream (instruct
+  // data encoded with THIS tokenizer). Off unless --inject is given.
+  const injectPath = flags.get("inject");
+  let injectSource: TokenSource | undefined;
+  const injectFrac = flags.get("injectFrac") ? Number(flags.get("injectFrac")) : 0;
+  const cooldownStart = steps - Math.round(steps * 0.2);
+  const injectFrom = flags.get("injectFrom") ? Number(flags.get("injectFrom")) : cooldownStart;
+  if (injectPath) {
+    injectSource = await diskTokenSource(injectPath, tokenBytes(tok.vocabSize));
+    console.log(
+      `Inject: ${injectPath} (${(injectSource.length / 1e6).toFixed(1)}M tokens), ` +
+        `frac ${injectFrac} from step ${injectFrom}`,
+    );
+  }
+
   // BASE model export: no chat template (there are no turns yet). The tokenizer
   // still carries the reserved specials, so the instruct stage inherits them.
   // Write atomically (tmp + rename) so a crash mid-write can't corrupt the
@@ -366,6 +382,9 @@ async function main() {
     batchPerStep: batch,
     optimizer: opt,
     schedule,
+    injectSource,
+    injectFrac,
+    injectFromStep: Math.max(0, injectFrom - startStep), // trainer step is local to this segment
     logEvery: Math.max(1, Math.round(steps / 100)),
     rng: mulberry32(7 + startStep), // vary batches across resume segments
     checkpointEvery: ckptEvery,
@@ -391,6 +410,7 @@ async function main() {
     },
   });
   src.close();
+  injectSource?.close();
   console.log(
     `\nTraining: loss ${firstLoss.toFixed(3)} -> ${lastLoss.toFixed(3)} in ${
       ((Date.now() - t0) / 60000).toFixed(1)
