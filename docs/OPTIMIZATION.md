@@ -38,7 +38,10 @@ ideas, none proven: a fused windowed-attention kernel that never materializes th
 full score matrix; better workgroup occupancy for the global (full-attention)
 layers; exploiting the 5:1 SWA:global ratio to skip work. Expect this to be a
 research effort, not a quick fix. It is also the same wall PyTorch+ROCm hits on
-this GPU, so it is not a "switch frameworks" problem.
+this GPU, so it is not a "switch frameworks" problem. CONSTRAINT: only pursue
+approaches that stay portable — plain WGSL that runs cross-vendor (AMD/Apple/
+NVIDIA), no vendor intrinsics or hardware-specific paths. A kernel that only helps
+gfx1151 at the cost of the "runs anywhere" story is out of scope.
 
 ### 2. True micro-batching (medium, uncertain payoff)
 Packing the `batchPerStep` sequences into one real batch dimension would enlarge
@@ -50,12 +53,18 @@ of the model forward.
 
 ## Memory / scale levers
 
-### 3. Raise the GTT cap (cheap, unlocks Phase B batch > 1) — external
-seq 8192 batch 2 OOMs with a RADV "context lost" error, while batch 1 is fine and
-~90 GB of host RAM sits free. The limit is the amdgpu GTT ceiling (~37 GB here),
-not host RAM. Raising `amdgpu.gttsize` / `ttm.pages_limit` (kernel params, needs a
-reboot) would let Phase B train long-context with batch > 1 instead of batch 1.
-This is a config change on the machine, not a code change.
+### 3. seq-8192 batch>1 is a WebGPU per-buffer limit, not memory (investigate)
+seq 8192 batch 2 fails with a RADV "context lost" / validation error, while batch 1
+is fine. This is NOT a memory-size cap: grub already sets `ttm.pages_limit` to the
+full 128 GB (`mem_info_gtt_total` = 131072 MB) and only ~37 GB is in use. So the
+failure is a WebGPU validation limit hit at that allocation shape — most likely a
+single storage buffer exceeding `maxStorageBufferBindingSize` (an intermediate or
+gradient buffer that only appears at batch 2 / seq 8192), or a dispatch-size limit.
+Next step (needs a GPU-idle moment — do NOT probe during a live run): query
+`adapter.limits.maxStorageBufferBindingSize` / `maxBufferSize` and log the size of
+the buffer that trips `webgpu.ts` sync validation, then either split that buffer or
+tile the op. This overlaps the attention-kernel work (#1) and must stay portable.
+Phase B works at batch 1 regardless, so this is an efficiency unlock, not a blocker.
 
 ### 4. More unique data (cheap data, expensive compute)
 The corpus is 722M unique tokens; the run does 2 epochs (~1.44B). `prepare_pretrain.ts`
