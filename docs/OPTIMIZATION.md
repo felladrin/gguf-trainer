@@ -75,12 +75,13 @@ a tooling one.
 
 ## Correctness / robustness
 
-### 5. Checkpoint optimizer state (medium, real gap)
-Checkpoints save weights only (GGUF). Muon momentum and AdamW moments are not
-serialized, so a crash-resume cold-starts the optimizer (momentum re-warms over a
-few steps; minor but real) even though `--startStep` correctly continues the WSD
-schedule. For a 3-week, possibly multi-segment run, serializing optimizer state
-next to the checkpoint would make resumes seamless.
+### 5. Checkpoint optimizer state (medium, real gap) — DONE
+Checkpoints now write a `<ckpt>.optstate` sidecar (Muon momentum + Adam moments +
+step) beside the weights and restore it on `--resume`; absent -> cold start as
+before. `readStateBuffer` in the backend does the readback. Validated: bit-exact
+round-trip, GPU parity unchanged, end-to-end resume. (The in-flight Phase A run
+predates this — its checkpoints have no sidecar and resume cold; future runs and
+Phase B are seamless.)
 
 ### 6. rsync hygiene (cheap)
 Plain rsync without `--delete` leaves stale files on the Strix copy when a source
@@ -96,17 +97,21 @@ touching the checkpoint cadence.
 
 ## Quality levers
 
-### 8. WSD decay-phase instruct injection (medium)
+### 8. WSD decay-phase instruct injection (medium) — MECHANISM DONE
 The MiniCPM / Xmodel-2 trick: blend a small fraction of ChatML instruct data into
-the WSD cooldown phase so the base emerges more instructable. A training-wiring
-change in `pretrain.ts` (mix a second token source during cooldown). Deferred from
-the corpus work; the curriculum specials are already reserved in the vocab for it.
+the WSD cooldown so the base emerges more instructable. Implemented: `pretrain.ts
+--inject=<tokens> --injectFrac --injectFrom` draws that fraction of micro-batches
+from a second token source during the cooldown (default window = the WSD cooldown);
+off by default, and the extra rng() is drawn only while active so parity is intact.
+Remaining to USE it: prepare an instruct `.tokens` encoded with the shared
+tokenizer (smol-smoltalk → ChatML) — tracked with the instruct curriculum stage.
 
-### 9. Eval harness (medium, validates the whole effort)
-There is no automated eval yet. To back the "beat Minueza-32M / compare to
-Minueza-2-96M" claims with numbers rather than estimates, add an ARC-Challenge +
-HellaSwag (and perplexity) harness that scores our GGUF and both Minueza models
-through the same path. This gates the "Minueza-3" naming decision on data.
+### 9. Eval harness (medium, validates the whole effort) — DONE (run pending base)
+`examples/eval_mc.ts` scores a GGUF on ARC-Challenge / HellaSwag via length-
+normalized log-likelihood (matches lm-eval-harness, comparable to the Minueza
+leaderboard numbers), plus acc/acc_norm; datasets via the HF parquet tooling.
+Smoke-tested end-to-end. The full run (our base vs both Minueza models) waits on
+an idle GPU after Phase A, and gates the "Minueza-3" naming on data.
 
 ## Explicitly not worth doing
 
