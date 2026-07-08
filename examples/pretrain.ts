@@ -13,45 +13,90 @@
 // Stage 1 — pretrain: full-sequence next-token LM loss (NOT assistant-masked —
 // there are no turns yet), device-resident Muon + AdamW, WSD schedule, mid-run
 // GGUF checkpoints. The export is a BASE model: no chat template, eos is the
-// document boundary. Coherence emerges well before a full epoch on TinyStories.
+// document boundary.
 //
-//   deno run -A --unstable-webgpu examples/pretrain.ts [corpus.txt] [hidden] [layers] [steps] [seqLen] [batch] [muonLr]
-// Defaults: corpus=corpus/tinystories-valid.txt, hidden 512, layers 6 (~28M),
-//   steps 2000, seqLen 1024, batch 8, muonLr 0.01. Compute is f32 throughout.
+// TWO input modes:
+//   1. A raw .txt corpus (≤~480 MB): trains the tokenizer + pretokenizes inline.
+//      This is the TinyStories / single-file path.
+//   2. A pretokenized .tokens file (from pretokenize.ts): the tokenizer is the
+//      sibling <prefix>.tokenizer.json. This is the path for the multi-GB blend
+//      corpus, which cannot be read whole (V8's ~512 MB single-string cap).
 //
-// muonLr 0.01 is the stable peak: a 20k-step run at 0.02 trained cleanly through
-// warmup then went NaN the moment the WSD schedule hit peak LR (same failure the
-// long reasoning run hit at 0.02). Halving the peak is the fix; 10% warmup holds.
+//   deno run -A --unstable-webgpu examples/pretrain.ts <corpus.txt|tokens.tokens> \
+//       [hidden] [layers] [steps] [seqLen] [batch] [muonLr] [--flags]
 //
-// NOTE: the corpus is read whole (readFileText), so keep a single file under
-// ~500 MB (V8's ~512 MB string cap). For the full multi-GB TinyStories/FineWeb
-// run, point this at a few-hundred-MB slice, or add chunked file reading first.
+//   flags (all optional):
+//     --maxSeq=N       declared context_length (default max(8192, seqLen))
+//     --window=N       SWA sliding-window size (default 1024, Gemma3's shape)
+//     --headDim=N      attention head dim (default 64)
+//     --resume=PATH    load weights from a prior GGUF (long-context phase B, or
+//                      crash recovery); config must match the built model
+//     --startStep=N    resume the WSD schedule + step counter at N (crash
+//                      recovery mid-phase; steps stays the FULL run length)
+//     --ckpt=N         checkpoint every N steps (default min(1000, steps/20))
+//     --quant=f32|f16  checkpoint storage precision (default f32 — lossless
+//                      resume; f16 halves disk at a tiny rounding cost)
+//     --auxLr=F        AdamW lr for the aux (norm/embed) group (default 3e-3)
+//     --out=PATH       output GGUF path (default examples/pretrain-base.gguf)
+//     --name=STR       general.name in the GGUF (default "pretrain-base")
+//
+// Defaults: hidden 512, layers 6 (~28M), steps 2000, seqLen 1024, batch 8,
+//   muonLr 0.01. Compute is f32 throughout.
+//
+// muonLr 0.01 is the proven stable peak (the 20k-step f32 run trained clean to
+// loss 1.18 at 0.01; 0.02 diverged). Keep 0.01 for unattended long runs.
+//
+// NOTE: in .txt mode the corpus is read whole (readFileText), so keep a single
+// file under ~480 MB. For a bigger corpus, build it with prepare_pretrain.ts as
+// parts, run pretokenize.ts once, and feed the resulting .tokens file here.
 
 import { readGGUF } from "../src/gguf/gguf.ts";
-import { readFileText, writeFileBytes } from "../src/io.ts";
+import { readFileBytes, readFileText, writeFileBytes } from "../src/io.ts";
 import { crossEntropy, mulberry32 } from "../src/model/autograd.ts";
 import { gemma3Config, gemma3ParamCount } from "../src/model/config.ts";
+import type { Gemma3Config } from "../src/model/config.ts";
 import { Gemma3Model } from "../src/model/gemma3.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import type { TokenizerData } from "../src/tokenizer/bpe.ts";
 import { CURRICULUM_SPECIALS } from "../src/data/chat.ts";
 import { buildGemma3GGUF } from "../src/export/export_gguf.ts";
+import { configFromGGUF, loadWeightsFromGGUF } from "../src/export/load_gguf.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
 import { diskTokenSource, tokenBytes, writeTokenFile } from "../src/data/tokens.ts";
 import type { TokenSource } from "../src/data/tokens.ts";
+import type { QuantName } from "../src/gguf/quantize.ts";
 import { initWebGPU } from "../src/backend/webgpu.ts";
 import type { WebGPUBackend } from "../src/backend/webgpu.ts";
 import { MuonGpu } from "../src/backend/muon_gpu.ts";
 import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
 
 const DOC_SEP = "<|endoftext|>"; // TinyStories and most raw dumps mark doc boundaries with this
-const VOCAB = 16384; // shared curriculum vocab (caps below this on a small sample)
+const VOCAB = 16384; // .txt-mode shared vocab (caps below this on a small sample)
 const TRAIN_SAMPLE_MB = 12; // BPE converges on a few MB; no need to scan the whole corpus
 
-function args(): string[] {
+interface Flags {
+  positional: string[];
+  get(name: string): string | undefined;
+  has(name: string): boolean;
+}
+function parseArgs(): Flags {
   // deno-lint-ignore no-explicit-any
   const g = globalThis as any;
-  return g.Deno?.args ?? g.process?.argv?.slice(2) ?? [];
+  const raw: string[] = g.Deno?.args ?? g.process?.argv?.slice(2) ?? [];
+  const positional: string[] = [];
+  const flags = new Map<string, string>();
+  for (const a of raw) {
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      if (eq < 0) flags.set(a.slice(2), "");
+      else flags.set(a.slice(2, eq), a.slice(eq + 1));
+    } else positional.push(a);
+  }
+  return {
+    positional,
+    get: (n) => flags.get(n),
+    has: (n) => flags.has(n),
+  };
 }
 function die(msg: string): never {
   console.error("pretrain: " + msg);
@@ -124,6 +169,18 @@ async function sharedTokenizer(path: string, corpus: string): Promise<BPETokeniz
   return tok;
 }
 
+/** Load the tokenizer that pretokenize.ts wrote next to a .tokens file. */
+async function siblingTokenizer(tokensPath: string): Promise<BPETokenizer> {
+  const jsonPath = tokensPath.replace(/\.tokens$/, ".tokenizer.json");
+  if (!(await fileExists(jsonPath))) {
+    die(`no sibling tokenizer ${jsonPath} for ${tokensPath} (run pretokenize.ts first)`);
+  }
+  const data = JSON.parse(await readFileText(jsonPath)) as TokenizerData;
+  const tok = BPETokenizer.fromData(data);
+  console.log(`Tokenizer: loaded ${jsonPath} (vocab ${tok.vocabSize}, specials ${tok.specials})`);
+  return tok;
+}
+
 /** Pretokenize the whole corpus into a growable Uint16Array (a number[] would
  * hit V8's max-array-length near 10^8), doc-by-doc with eos between docs. */
 function encodeCorpus(tok: BPETokenizer, corpus: string): Uint16Array {
@@ -147,49 +204,82 @@ function encodeCorpus(tok: BPETokenizer, corpus: string): Uint16Array {
   return ids.subarray(0, n);
 }
 
+/** True if two configs describe the same architecture (so a GGUF resume is valid). */
+function configMatches(a: Gemma3Config, b: Gemma3Config): string | null {
+  const keys: (keyof Gemma3Config)[] = [
+    "vocabSize",
+    "hiddenSize",
+    "nLayers",
+    "nHeads",
+    "nKVHeads",
+    "headDim",
+    "ffnDim",
+    "slidingWindow",
+    "swaPattern",
+  ];
+  for (const k of keys) if (a[k] !== b[k]) return `${k}: built ${a[k]} vs checkpoint ${b[k]}`;
+  return null;
+}
+
 async function main() {
-  const a = args();
+  const flags = parseArgs();
+  const a = flags.positional;
   const dir = new URL(".", import.meta.url).pathname;
-  const corpusPath = a[0] ?? `${dir}../corpus/tinystories-valid.txt`;
+  const inputPath = a[0] ?? `${dir}../corpus/tinystories-valid.txt`;
   const hidden = a[1] ? Number(a[1]) : 512;
   const layers = a[2] ? Number(a[2]) : 6;
   const steps = a[3] ? Number(a[3]) : 2000;
   const seqLen = a[4] ? Number(a[4]) : 1024;
   const batch = a[5] ? Number(a[5]) : 8;
-  const muonLr = a[6] ? Number(a[6]) : 0.01, auxLr = 3e-3, baseWidth = 128;
+  const muonLr = a[6] ? Number(a[6]) : 0.01;
+  const auxLr = flags.get("auxLr") ? Number(flags.get("auxLr")) : 3e-3;
+  const baseWidth = 128;
+  const maxSeq = flags.get("maxSeq") ? Number(flags.get("maxSeq")) : Math.max(8192, seqLen);
+  const window = flags.get("window") ? Number(flags.get("window")) : 1024;
+  const headDim = flags.get("headDim") ? Number(flags.get("headDim")) : 64;
+  const startStep = flags.get("startStep") ? Number(flags.get("startStep")) : 0;
+  const quant = (flags.get("quant") ?? "f32") as QuantName;
+  const resumePath = flags.get("resume");
+  const outPath = flags.get("out") ?? `${dir}pretrain-base.gguf`;
+  const name = flags.get("name") ?? "pretrain-base";
+  if (quant !== "f32" && quant !== "f16") die(`--quant must be f32 or f16, got ${quant}`);
+  if (startStep < 0 || startStep >= steps) die(`--startStep must be in [0, ${steps})`);
 
   console.log("=== curriculum stage 1: pretrain gemma3 base -> GGUF ===\n");
   const gpu = await initWebGPU();
   if (!gpu) die("no WebGPU (run under Deno with --unstable-webgpu)");
   console.log(`WebGPU adapter: ${gpu.adapterName}`);
 
-  const corpus = await readFileText(corpusPath).catch(() =>
-    die(`cannot read corpus ${corpusPath}`)
-  );
-  if (corpus.length === 0) die(`${corpusPath} is empty`);
-  console.log(`Corpus: ${corpusPath} (${(corpus.length / 1e6).toFixed(1)}M chars)`);
-
-  // Stage 0: the shared tokenizer (reused across all curriculum stages).
-  const tokPath = `${dir}curriculum.tokenizer.json`;
-  const tok = await sharedTokenizer(tokPath, corpus);
-  const bpt = tokenBytes(tok.vocabSize);
-
-  // Pretokenize (skip if a .tokens for this run already exists).
-  const tokensPath = `${dir}pretrain.tokens`;
-  if (!(await fileExists(tokensPath))) {
-    await writeTokenFile(tokensPath, encodeCorpus(tok, corpus), bpt);
+  // --- Tokens + tokenizer: pretokenized (.tokens) or raw (.txt) input ---
+  let tok: BPETokenizer;
+  let src: TokenSource;
+  if (inputPath.endsWith(".tokens")) {
+    tok = await siblingTokenizer(inputPath);
+    src = await diskTokenSource(inputPath, tokenBytes(tok.vocabSize));
+    console.log(`Tokens: ${inputPath} (${(src.length / 1e6).toFixed(1)}M, pretokenized)`);
+  } else {
+    const corpus = await readFileText(inputPath).catch(() =>
+      die(`cannot read corpus ${inputPath}`)
+    );
+    if (corpus.length === 0) die(`${inputPath} is empty`);
+    console.log(`Corpus: ${inputPath} (${(corpus.length / 1e6).toFixed(1)}M chars)`);
+    tok = await sharedTokenizer(`${dir}curriculum.tokenizer.json`, corpus);
+    const bpt = tokenBytes(tok.vocabSize);
+    const tokensPath = `${dir}pretrain.tokens`;
+    if (!(await fileExists(tokensPath))) {
+      await writeTokenFile(tokensPath, encodeCorpus(tok, corpus), bpt);
+    }
+    src = await diskTokenSource(tokensPath, bpt);
   }
-  const src: TokenSource = await diskTokenSource(tokensPath, bpt);
   const tokensPerStep = batch * seqLen;
   console.log(
-    `Tokens: ${
-      (src.length / 1e6).toFixed(1)
-    }M (${bpt}B), eos=${tok.eosId}; ${steps} x ${batch} x ` +
-      `${seqLen} = ${(steps * tokensPerStep / 1e6).toFixed(0)}M tokens ` +
-      `(${(steps * tokensPerStep / src.length).toFixed(1)} epochs)`,
+    `Run: ${steps} x ${batch} x ${seqLen} = ${(steps * tokensPerStep / 1e6).toFixed(0)}M tokens ` +
+      `(${(steps * tokensPerStep / src.length).toFixed(1)} epochs of ${
+        (src.length / 1e6).toFixed(0)
+      }M), eos=${tok.eosId}` + (startStep ? `, resuming @ step ${startStep}` : ""),
   );
 
-  const cfg = gemma3Config(tok.vocabSize, hidden, layers, Math.max(4096, seqLen));
+  const cfg = gemma3Config(tok.vocabSize, hidden, layers, maxSeq, headDim, window);
   if (seqLen > cfg.maxSeq) die(`seqLen ${seqLen} exceeds context_length ${cfg.maxSeq}`);
   const model = new Gemma3Model(
     cfg,
@@ -198,10 +288,18 @@ async function main() {
   );
   console.log(
     `Model: gemma3 base, ${cfg.nLayers} layers, hidden=${cfg.hiddenSize}, heads=${cfg.nHeads}/` +
-      `${cfg.nKVHeads}, ffn=${cfg.ffnDim}, window=${cfg.slidingWindow}, ~${
-        (gemma3ParamCount(cfg) / 1e6).toFixed(1)
-      }M params`,
+      `${cfg.nKVHeads}, headDim=${cfg.headDim}, ffn=${cfg.ffnDim}, ctx=${cfg.maxSeq}, ` +
+      `window=${cfg.slidingWindow}, ~${(gemma3ParamCount(cfg) / 1e6).toFixed(1)}M params`,
   );
+
+  // Resume weights from a prior GGUF (long-context phase, or crash recovery).
+  if (resumePath) {
+    const g = readGGUF(await readFileBytes(resumePath));
+    const mismatch = configMatches(cfg, configFromGGUF(g));
+    if (mismatch) die(`--resume config mismatch (${mismatch}); build the same shape as the ckpt`);
+    loadWeightsFromGGUF(model, g);
+    console.log(`Resumed weights from ${resumePath} (${g.tensors.length} tensors)`);
+  }
 
   // Trust gate: GPU forward+loss must match the CPU reference at init.
   const probeIn = src.window(0, 16), probeTgt = src.window(1, 16);
@@ -229,56 +327,66 @@ async function main() {
     momentum: 0.95,
     aux: { lr: auxLr, weightDecay: 0.0, clip: 1.0 },
   });
-  const schedule = wsdSchedule({
+  // WSD over the FULL run (0..steps); on resume we offset into it so the LR
+  // continues rather than re-warming. 10% warmup / 20% cooldown, floor 0.1.
+  const fullSchedule = wsdSchedule({
     warmupSteps: Math.max(1, Math.round(steps * 0.1)),
     stableSteps: Math.max(0, steps - Math.round(steps * 0.1) - Math.round(steps * 0.2)),
     cooldownSteps: Math.max(1, Math.round(steps * 0.2)),
     minScale: 0.1,
   });
+  const schedule = (localStep: number) => fullSchedule(startStep + localStep);
   console.log(
     `Schedule: muon lr ${muonLr}, aux lr ${auxLr}, WSD warmup ${
       Math.round(steps * 0.1)
-    } / cooldown ${Math.round(steps * 0.2)} steps`,
+    } / cooldown ${Math.round(steps * 0.2)} steps, quant ${quant}`,
   );
 
   // BASE model export: no chat template (there are no turns yet). The tokenizer
   // still carries the reserved specials, so the instruct stage inherits them.
-  const outPath = `${dir}pretrain-base-f16.gguf`;
+  // Write atomically (tmp + rename) so a crash mid-write can't corrupt the
+  // checkpoint a multi-week run resumes from.
   const exportGGUF = async (): Promise<Uint8Array> => {
-    const b = buildGemma3GGUF(model, tok.export(), cfg, { quant: "f16", name: "pretrain-base" });
-    await writeFileBytes(outPath, b);
+    const b = buildGemma3GGUF(model, tok.export(), cfg, { quant, name });
+    await writeFileBytes(`${outPath}.tmp`, b);
+    const fs = await import("node:fs");
+    fs.renameSync(`${outPath}.tmp`, outPath);
     return b;
   };
-  const checkpointEvery = Math.min(500, Math.max(1, Math.round(steps / 20)));
+  const ckptEvery = flags.get("ckpt")
+    ? Number(flags.get("ckpt"))
+    : Math.min(1000, Math.max(1, Math.round(steps / 20)));
 
   let firstLoss = 0, lastLoss = 0;
   const t0 = Date.now();
   await trainLMGpuResident(model, gpu, {
     tokens: src,
     seqLen,
-    steps,
+    steps: steps - startStep,
     batchPerStep: batch,
     optimizer: opt,
     schedule,
-    logEvery: Math.max(1, Math.round(steps / 50)),
-    rng: mulberry32(7),
-    checkpointEvery,
-    onCheckpoint: async (step) => {
+    logEvery: Math.max(1, Math.round(steps / 100)),
+    rng: mulberry32(7 + startStep), // vary batches across resume segments
+    checkpointEvery: ckptEvery,
+    onCheckpoint: async (localStep) => {
       const b = await exportGGUF();
+      const step = startStep + localStep;
       const el = (Date.now() - t0) / 1000;
       console.log(
         `  [ckpt @ ${step}] ${outPath.split("/").pop()} ${(b.length / 1e6).toFixed(0)}MB, ` +
-          `loss ${lastLoss.toFixed(3)}, ${(step / Math.max(1, el)).toFixed(2)} st/s`,
+          `loss ${lastLoss.toFixed(3)}, ${(localStep / Math.max(1, el)).toFixed(3)} st/s`,
       );
     },
-    onLog: (step, loss) => {
-      if (step === 0) firstLoss = loss;
+    onLog: (localStep, loss) => {
+      const step = startStep + localStep;
+      if (localStep === 0) firstLoss = loss;
       lastLoss = loss;
       const el = (Date.now() - t0) / 1000;
       console.log(
-        `  step ${String(step).padStart(6)}  loss ${loss.toFixed(4)}  (${
-          (step / Math.max(1, el)).toFixed(2)
-        } st/s)`,
+        `  step ${String(step).padStart(7)}  loss ${loss.toFixed(4)}  (${
+          (localStep / Math.max(1, el)).toFixed(3)
+        } st/s, ${(el / 60).toFixed(1)}min)`,
       );
     },
   });
@@ -296,7 +404,7 @@ async function main() {
   if (g.metadata.get("general.architecture") !== "gemma3") die("exported arch != gemma3");
   console.log(
     `\nWrote ${outPath} (${(bytes.length / 1e6).toFixed(0)} MB, ${g.tensors.length} tensors, ` +
-      `gemma3 base ✓). Next stage resumes from this via loadGemma3FromGGUF.`,
+      `gemma3 base ✓, ctx ${cfg.maxSeq}). Next stage resumes via loadGemma3FromGGUF.`,
   );
   console.log("=== stage 1 complete ===");
 }

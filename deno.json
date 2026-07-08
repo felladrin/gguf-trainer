@@ -12,6 +12,7 @@
     "demo:gpu": "deno run -A examples/demo_gpu.ts",
     "streaming": "deno run -A examples/train_streaming.ts",
     "pretokenize": "deno run -A examples/pretokenize.ts corpus/tinystories-valid.txt examples/tinystories 8192 10",
+    "prepare:pretrain": "deno run -A examples/prepare_pretrain.ts",
     "train:tinystories": "deno run -A examples/train_tinystories.ts",
     "mup:check": "deno run -A examples/mup_coord_check.ts",
     "webui": "deno task webui:build && deno task webui:server",
