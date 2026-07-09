@@ -113,6 +113,22 @@ acc/acc_norm; datasets via the HF parquet tooling. Smoke-tested end-to-end. The 
 vs both Minueza models) waits on an idle GPU after Phase A, and gates the "Minueza-3" naming on
 data.
 
+### 10. Phase B KL anchor against the base checkpoint (medium)
+
+The continual-learning use of distillation (HF post `sergiopaniego/distillation-2026`): during Phase
+B SFT, add a per-token KL term against the frozen Phase A base so its fluency survives fine-tuning;
+models this small forget catastrophically under plain SFT. The teacher is this model, so the u16
+custom-BPE vocab is no obstacle (external teachers are ruled out by it; see below). One new op: a
+soft-target cross-entropy whose backward is `(p - q)`, where the existing `crossEntropy` backward is
+`(p - onehot)` (`src/model/autograd.ts`), reusing its ignore-index masking. Phase B data is fixed,
+so teacher logits are precomputed once over the SFT `.tokens` with the Phase A checkpoint and stored
+top-k (~100 B/token at top-16, single-digit GB): no second model in GPU memory, zero per-step
+teacher cost. CPU reference + WGSL port + gradient check follow the existing op pattern and need no
+GPU, so it is buildable while Phase A trains. The same op later enables Cursor-style hint
+self-distillation (teacher = same weights with an instruct prefix, student = bare, KL on the
+response tokens); an online teacher forward adds roughly a third of a step (forward-only,
+attention-bound), affordable at this scale.
+
 ## Explicitly not worth doing
 
 - **Guarded/clamped f16 compute** — no speed to recover; attention-bound, GEMM is a thin slice. f32
@@ -123,3 +139,7 @@ data.
 - **Switching to PyTorch + ROCm for speed** — the attention wall is the GPU, not the framework; ROCm
   on gfx1151 also lacks flash-attention. See the project direction: portability is the goal, not
   chasing SOTA on this hardware.
+- **Soft-label KD from off-the-shelf teachers** (e.g. Gemma-3-1B as teacher): vocab mismatch (our
+  custom u16 BPE vs their 262k tokenizer), and cross-tokenizer KD (GOLD/ULD) is research-grade
+  machinery. Data-level KD is already the corpus strategy (TinyStories and smol-smoltalk are
+  teacher-generated); same-vocab distillation stays available via the checkpoint anchor (#10).
