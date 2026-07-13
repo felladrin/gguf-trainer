@@ -111,12 +111,12 @@ function argmax(row: Float32Array): number {
   return best;
 }
 async function fileExists(path: string): Promise<boolean> {
-  try {
-    await readFileText(path);
-    return true;
-  } catch {
-    return false;
-  }
+  // Stat, don't read: the optimizer-state sidecar is a multi-hundred-MB binary
+  // blob, and decoding it as UTF-8 to test existence overflows V8's max string
+  // length and throws, which silently reported "no optstate" and cold-started
+  // the optimizer on every resume.
+  const fs = await import("node:fs");
+  return fs.existsSync(path);
 }
 
 /** Greedy continuation with the GPU forward (one sync/token); stops at eos. */
