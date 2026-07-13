@@ -4,11 +4,14 @@
 # eyeballed for progress (fluency, coherence, factual recall) over the course of
 # a long run.
 #
-# WHY the sampling flags below: a mid-training BASE model collapses into
+# WHY the sampling preset below: a mid-training BASE model collapses into
 # repetition loops ("fresh fresh fresh...") under naive/greedy sampling, which
-# reads far worse than the model actually is. --repeat-penalty + --min-p suppress
-# the loops so you judge the model, not the sampler. Keep the prompts and flags
-# fixed so runs at different steps stay comparable.
+# reads far worse than the model actually is. The default preset "D" — a gentle
+# repeat-penalty plus a light presence-penalty — kills the loops WITHOUT the
+# topic drift that a heavy penalty (or a strong presence-penalty alone) causes,
+# so you judge the model, not the sampler. Keep the prompts and preset fixed so
+# runs at different steps stay comparable. An alternative preset is provided
+# commented-out below.
 #
 # Usage:
 #   examples/eval_completions.sh [MODEL.gguf]      # or:  deno task eval:completions [MODEL.gguf]
@@ -53,15 +56,22 @@ PROMPTS=(
   "2 + 2 ="
 )
 
+# Sampling preset "D": best coherence / anti-loop balance found at ~24% training
+# (gentle repeat-penalty + light presence-penalty; see git log for the sweep).
+SAMPLER=(--temp 0.7 --top-p 0.85 --top-k 30 --min-p 0.02 --presence-penalty 0.4 --repeat-penalty 1.15 --repeat-last-n 128)
+# Alternative preset "U": maximum lexical variety via a strong presence-penalty,
+# but noticeably more topic drift. Swap by commenting D and uncommenting this.
+# SAMPLER=(--temp 0.7 --top-p 0.80 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0 --repeat-last-n 64)
+
 echo "model:    $MODEL"
-echo "sampling: temp 0.8, min-p 0.05, repeat-penalty 1.3 (last 64), seed $SEED, n $N"
+echo "sampling: ${SAMPLER[*]}"
+echo "seed $SEED, n $N tokens"
 echo
 
 for p in "${PROMPTS[@]}"; do
   echo "########## [$p]"
-  "$BIN" -m "$MODEL" -p "$p" -n "$N" -c 1024 \
-    --temp 0.8 --min-p 0.05 --repeat-penalty 1.3 --repeat-last-n 64 \
-    --seed "$SEED" --no-perf 2>/dev/null
+  "$BIN" -m "$MODEL" -p "$p" -n "$N" -c 1024 "${SAMPLER[@]}" \
+    --seed "$SEED" --no-perf </dev/null 2>/dev/null
   echo
   echo
 done
