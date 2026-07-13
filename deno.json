@@ -15,6 +15,7 @@
     "prepare:pretrain": "deno run -A examples/prepare_pretrain.ts",
     "train:tinystories": "deno run -A examples/train_tinystories.ts",
     "mup:check": "deno run -A examples/mup_coord_check.ts",
+    "eval:completions": "bash examples/eval_completions.sh",
     "webui": "deno task webui:build && deno task webui:server",
     "webui:build": "cd web/client && npm install && npm run build",
     "webui:server": "deno run -A web/server/main.ts",
