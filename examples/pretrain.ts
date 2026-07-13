@@ -52,6 +52,7 @@
 
 import { readGGUF } from "../src/gguf/gguf.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../src/io.ts";
+import { fmtEta } from "../src/eta.ts";
 import { crossEntropy, mulberry32 } from "../src/model/autograd.ts";
 import { gemma3Config, gemma3ParamCount } from "../src/model/config.ts";
 import type { Gemma3Config } from "../src/model/config.ts";
@@ -414,10 +415,13 @@ async function main() {
       const optBytes = await writeOptState();
       const step = startStep + localStep;
       const el = (Date.now() - t0) / 1000;
+      const rate = localStep / Math.max(1, el);
       console.log(
         `  [ckpt @ ${step}] ${outPath.split("/").pop()} ${(b.length / 1e6).toFixed(0)}MB ` +
           `+ optstate ${(optBytes / 1e6).toFixed(0)}MB, ` +
-          `loss ${lastLoss.toFixed(3)}, ${(localStep / Math.max(1, el)).toFixed(3)} st/s`,
+          `loss ${lastLoss.toFixed(3)}, ${rate.toFixed(3)} st/s, eta ${
+            fmtEta((steps - step) / rate)
+          }`,
       );
     },
     onLog: (localStep, loss) => {
@@ -425,10 +429,11 @@ async function main() {
       if (localStep === 0) firstLoss = loss;
       lastLoss = loss;
       const el = (Date.now() - t0) / 1000;
+      const rate = localStep / Math.max(1, el);
       console.log(
-        `  step ${String(step).padStart(7)}  loss ${loss.toFixed(4)}  (${
-          (localStep / Math.max(1, el)).toFixed(3)
-        } st/s, ${(el / 60).toFixed(1)}min)`,
+        `  step ${String(step).padStart(7)}  loss ${loss.toFixed(4)}  (${rate.toFixed(3)} st/s, ${
+          (el / 60).toFixed(1)
+        }min, eta ${fmtEta((steps - step) / rate)})`,
       );
     },
   });

@@ -19,8 +19,8 @@
     "webui:build": "cd web/client && npm install && npm run build",
     "webui:server": "deno run -A web/server/main.ts",
     "webui:dev": "cd web/client && npm run dev",
-    "test": "deno run -A tests/gradcheck.ts && deno run tests/gpu_parity.ts",
-    "test:node": "node --experimental-strip-types tests/gradcheck.ts && node --experimental-strip-types tests/gpu_parity.ts"
+    "test": "deno run tests/eta_fmt.ts && deno run -A tests/gradcheck.ts && deno run tests/gpu_parity.ts",
+    "test:node": "node --experimental-strip-types tests/eta_fmt.ts && node --experimental-strip-types tests/gradcheck.ts && node --experimental-strip-types tests/gpu_parity.ts"
   },
   "fmt": {
     "lineWidth": 100,
