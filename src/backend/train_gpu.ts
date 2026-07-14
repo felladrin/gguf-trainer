@@ -112,6 +112,17 @@ export interface TrainGpuResidentOpts {
   injectSource?: TokenSource;
   injectFrac?: number; // 0..1 probability per micro-batch during the window
   injectFromStep?: number; // first step injection is eligible (e.g. cooldown start)
+  /**
+   * Recycle each micro-batch's transient GPU buffers at the micro-batch boundary
+   * instead of holding all `batchPerStep` micro-batches' activations until the
+   * end-of-step sync. Cuts peak VRAM to ~one micro-batch, which is what lets
+   * batch>=2 fit at long context (e.g. seqLen 8192, where the crossEntropy
+   * probs buffer alone is seqLen*vocab*4 ~= 1GB per micro-batch). Costs one GPU
+   * fence per micro-batch (loses some CPU/GPU overlap), so it is OFF by default
+   * and worth enabling only when memory-bound. Numerically identical to off:
+   * only buffer-recycling timing changes (gated by tests/gpu_parity.ts).
+   */
+  reclaimTransients?: boolean;
 }
 
 /**
@@ -176,6 +187,12 @@ export async function trainLMGpuResident(
         const loss = crossEntropy(model.forward(inputIds), targetIds);
         backward(loss, 1 / opts.batchPerStep); // average grads over the batch
         losses.push(loss);
+        // Free this micro-batch's activations before the next one so peak VRAM
+        // stays at ~one micro-batch. Skipped on the last (the end-of-step sync
+        // reclaims it anyway). `losses` are kept: their data is read below.
+        if (opts.reclaimTransients && b < opts.batchPerStep - 1) {
+          await gpu.reclaimStepTransients(losses);
+        }
       }
 
       await gpu.sync(losses); // loss scalars only; both groups' grads stay on device

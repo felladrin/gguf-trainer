@@ -116,6 +116,7 @@ interface GpuCommandEncoder {
 interface GpuQueue {
   submit(buffers: unknown[]): void;
   writeBuffer(buffer: GpuBuffer, offset: number, data: ArrayBufferView): void;
+  onSubmittedWorkDone(): Promise<undefined>;
 }
 interface GpuDevice {
   createBuffer(desc: { size: number; usage: number }): GpuBuffer;
@@ -329,6 +330,45 @@ export class WebGPUBackend implements OpsBackend {
     this.touchedExternals.clear();
     this.backwardBegun = false;
 
+    if (this.deviceError) throw new Error(this.deviceError);
+  }
+
+  /**
+   * Recycle this step's transient buffers mid-step, WITHOUT the full sync()
+   * readback, so a multi-micro-batch step doesn't pile every micro-batch's
+   * activations into peak memory at once. Call it at a micro-batch boundary
+   * (after that micro-batch's backward has been recorded, before the next
+   * forward). Turns peak transient memory from batchPerStep x per-micro-batch
+   * down to ~one micro-batch, which is what lets batch>=2 fit at long context.
+   *
+   * Correctness (this is why it is safe to free buffers the running loop has not
+   * synced): parameter gradient accumulators are acquirePersistent buffers, NOT
+   * transients, so they are never in `this.transients` and this cannot touch
+   * them; grads keep accumulating across micro-batches exactly as before. We
+   * leave `touchedExternals`, `gradNeedsClear`, and `pendingClears` untouched
+   * (pendingClears is already empty at a micro-batch boundary: ensureBackwardBegun
+   * flushed it), so the deferred grad-clear timing and CPU/GPU parity are
+   * unchanged. Buffers are returned to the pool only after onSubmittedWorkDone
+   * proves the GPU finished the recorded work, so no in-flight pass still reads
+   * them. `keep` names tensors whose DATA buffer must survive to the end-of-step
+   * sync() readback (the per-micro-batch loss scalars); their buffers are
+   * retained in `this.transients` and released by that later sync().
+   */
+  async reclaimStepTransients(keep: Tensor[] = []): Promise<void> {
+    this.endPass();
+    this.submit();
+    await this.queue.onSubmittedWorkDone();
+    const keepBufs = new Set<GpuBuffer>();
+    for (const t of keep) {
+      const e = this.entries.get(t);
+      if (e) keepBufs.add(e.data);
+    }
+    const retained: { buf: GpuBuffer; size: number }[] = [];
+    for (const tr of this.transients) {
+      if (keepBufs.has(tr.buf)) retained.push(tr);
+      else this.pool.release(tr.size, tr.buf);
+    }
+    this.transients = retained;
     if (this.deviceError) throw new Error(this.deviceError);
   }
 

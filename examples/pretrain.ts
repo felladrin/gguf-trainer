@@ -407,6 +407,10 @@ async function main() {
     injectSource,
     injectFrac,
     injectFromStep: Math.max(0, injectFrom - startStep), // trainer step is local to this segment
+    // --reclaim: recycle each micro-batch's activations at the micro-batch
+    // boundary so batch>=2 fits at long context (e.g. Phase B seqLen 8192, where
+    // it otherwise OOMs). Off unless asked; one GPU fence/micro-batch of overhead.
+    reclaimTransients: flags.has("reclaim"),
     logEvery: Math.max(1, Math.round(steps / 100)),
     rng: mulberry32(7 + startStep), // vary batches across resume segments
     checkpointEvery: ckptEvery,

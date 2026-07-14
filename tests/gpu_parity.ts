@@ -366,6 +366,60 @@ async function accumulationParity(gpu: WebGPUBackend) {
 }
 
 /**
+ * reclaimTransients must not change the math. Freeing each micro-batch's
+ * transient buffers mid-step (to cut peak VRAM so batch>=2 fits at long ctx)
+ * only recycles pool buffers earlier, so an identical run with it off must
+ * produce the same loss trajectory and the same final weights. batchPerStep 3
+ * gives two reclaim boundaries per step. A grad-accumulation regression (freeing
+ * a live param grad) or a dropped loss buffer would diverge here.
+ */
+async function reclaimTransientsParity(gpu: WebGPUBackend) {
+  const cfg = microConfig();
+  const steps = 4, seqLen = 8, batchPerStep = 3;
+  const rngTok = mulberry32(0x5ec1);
+  const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
+  const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
+
+  const run = async (reclaimTransients: boolean) => {
+    const model = new Gemma3Model(cfg, mulberry32(5));
+    const g = model.paramGroups();
+    const hist = await trainLMGpuResident(model, gpu, {
+      tokens,
+      seqLen,
+      steps,
+      batchPerStep,
+      optimizer: new MuonGpu(gpu, g.muon, g.aux, hyper),
+      logEvery: 1,
+      rng: mulberry32(7),
+      reclaimTransients,
+    });
+    return { hist, params: model.params() };
+  };
+
+  const off = await run(false);
+  const on = await run(true);
+
+  let ok = true;
+  for (let i = 0; i < off.hist.length; i++) {
+    const dl = Math.abs(on.hist[i].loss - off.hist[i].loss);
+    if (dl > 1e-4 + 1e-4 * Math.abs(off.hist[i].loss)) {
+      console.log(
+        `    MISMATCH loss@step${off.hist[i].step}: on=${on.hist[i].loss} off=${off.hist[i].loss}`,
+      );
+      ok = false;
+    }
+  }
+  for (let i = 0; i < off.params.length; i++) {
+    ok = compare(`reclaim.param${i}`, on.params[i].data, off.params[i].data, BWD) && ok;
+  }
+  if (!ok) failures++;
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} reclaimTransients matches off ` +
+      `(${steps} steps x ${batchPerStep} micro-batches)`,
+  );
+}
+
+/**
  * Functional large-T check for flash attention (appended by the tiling task):
  * on a device requested with SPEC-DEFAULT limits, run forward+backward at
  * T=3584 (Hq=4, hd=32). The pre-flash kernels needed a ~205 MB [Hq,T,T] probs
@@ -555,6 +609,7 @@ async function main() {
   // 5. graph-level
   await gemma3ModelParity(gpu);
   await accumulationParity(gpu);
+  await reclaimTransientsParity(gpu);
 
   // 6. Attention kernels (appended by the tiling task):
   //    (a) Materialized path at small T (T < attnFlashMinT): non-multiples of
