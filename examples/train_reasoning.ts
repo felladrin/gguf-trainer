@@ -22,6 +22,7 @@ import { initWebGPU } from "../src/backend/webgpu.ts";
 import type { WebGPUBackend } from "../src/backend/webgpu.ts";
 import { MuonGpu } from "../src/backend/muon_gpu.ts";
 import { trainLMGpuResident } from "../src/backend/train_gpu.ts";
+import { greedyComplete } from "../src/eval/generate.ts";
 
 function args(): string[] {
   // deno-lint-ignore no-explicit-any
@@ -35,12 +36,6 @@ function die(msg: string): never {
   if (proc?.exit) proc.exit(1);
   throw new Error(msg);
 }
-function argmax(row: Float32Array): number {
-  let best = 0;
-  for (let i = 1; i < row.length; i++) if (row[i] > row[best]) best = i;
-  return best;
-}
-
 /** Greedy chat completion (GPU forward, one sync/token), stops at <|im_end|>. */
 async function chatGreedy(
   gpu: WebGPUBackend,
@@ -50,25 +45,14 @@ async function chatGreedy(
   n: number,
 ): Promise<string> {
   const prompt = `<|im_start|>user\n${question}<|im_end|>\n<|im_start|>assistant\n`;
-  const ids = tok.encode(prompt);
-  const eos = tok.eosId;
   gpu.install();
   try {
     gpu.uploadParams(model.params());
-    for (let i = 0; i < n; i++) {
-      const ctx = ids.slice(-model.cfg.maxSeq);
-      const logits = model.forward(ctx);
-      await gpu.sync([logits]);
-      const V = model.cfg.vocabSize;
-      const base = (ctx.length - 1) * V;
-      const next = argmax(logits.data.subarray(base, base + V));
-      ids.push(next);
-      if (next === eos) break;
-    }
+    const ids = await greedyComplete(model, gpu, tok.encode(prompt), n, [tok.eosId]);
+    return tok.decode(ids);
   } finally {
     gpu.uninstall();
   }
-  return tok.decode(ids);
 }
 
 async function main() {
