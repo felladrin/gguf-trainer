@@ -36,6 +36,15 @@
 // The model is loaded ONCE by one spawned server; configs are swept via per-request sampling
 // params, so a full sweep costs minutes, not hours.
 
+/** llama.cpp's DRY sampler (p-e-w port): penalizes continuing a verbatim repeat of length >=
+ * allowedLength within the last penaltyLastN tokens. Absent = off. */
+export interface DryCfg {
+  multiplier: number;
+  base: number;
+  allowedLength: number;
+  penaltyLastN: number;
+}
+
 export interface SamplerCfg {
   name: string;
   temp: number;
@@ -45,6 +54,7 @@ export interface SamplerCfg {
   presencePenalty: number;
   repeatPenalty: number;
   repeatLastN: number;
+  dry?: DryCfg;
 }
 
 /** Aggregate scores rank() needs; Result (below) carries the rest. */
@@ -67,16 +77,17 @@ function mk(
   presencePenalty: number,
   repeatPenalty: number,
   repeatLastN: number,
+  dry?: DryCfg,
 ): SamplerCfg {
-  return { name, temp, topP, topK, minP, presencePenalty, repeatPenalty, repeatLastN };
+  return { name, temp, topP, topK, minP, presencePenalty, repeatPenalty, repeatLastN, dry };
 }
 
 // Starting pool. Anchored by the two presets eval_completions.sh documents (D incumbent, U
 // high-variety alternative) plus baselines that expose loop collapse (G greedy, N naive),
 // repeat-penalty-only variants (RP3 was the pre-sweep default), gentler/heavier and
-// cooler/warmer takes on D, and the pure-min-p school (M, MP). Keep D/U in sync with
-// eval_completions.sh.
-//                       name    temp  top-p top-k min-p  pres  rep-p  rln
+// cooler/warmer takes on D, the pure-min-p school (M, MP), and the DRY school (no logit
+// penalties; DRY punishes only verbatim repeats). Keep D/U in sync with eval_completions.sh.
+//                       name    temp  top-p top-k min-p  pres  rep-p  rln   [dry]
 export const POOL: SamplerCfg[] = [
   mk("G", 0, 1, 0, 0, 0, 1, 64),
   mk("N", 0.7, 0.95, 40, 0, 0, 1, 64),
@@ -90,6 +101,12 @@ export const POOL: SamplerCfg[] = [
   mk("DW", 0.9, 0.85, 30, 0.02, 0.4, 1.15, 128),
   mk("M", 0.8, 1, 0, 0.1, 0, 1, 64),
   mk("MP", 0.8, 1, 0, 0.1, 0.3, 1.1, 128),
+  mk("DRY", 0.6, 0.85, 30, 0.05, 0, 1, 64, {
+    multiplier: 0.8,
+    base: 1.75,
+    allowedLength: 32,
+    penaltyLastN: 256,
+  }),
 ];
 
 // Same battery as eval_completions.sh (keep in sync): narrative, descriptive, everyday, factual
@@ -129,16 +146,20 @@ export function repScore(text: string): number {
  * How hard the config bends the model's own distribution. Penalties are the drift-causers (per
  * the sweep that picked D); truncation (top-p/k, min-p) and moderate temperature are not. Used
  * only as a tie-break: among configs whose rep scores are within noise of each other, prefer the
- * one that distorts least, so we keep judging the model, not the sampler.
+ * one that distorts least, so we keep judging the model, not the sampler. DRY is weighted low
+ * (crudely, by multiplier alone): it only fires on verbatim repeats >= allowedLength, leaving the
+ * rest of the distribution untouched.
  */
 export function distortion(c: SamplerCfg): number {
-  return (c.repeatPenalty - 1) + 0.5 * c.presencePenalty;
+  return (c.repeatPenalty - 1) + 0.5 * c.presencePenalty + (c.dry ? 0.25 * c.dry.multiplier : 0);
 }
 
 /** Identity of a config up to its name (for deduping perturbations against configs already run). */
 export function cfgKey(c: SamplerCfg): string {
-  return [c.temp, c.topP, c.topK, c.minP, c.presencePenalty, c.repeatPenalty, c.repeatLastN]
+  const base = [c.temp, c.topP, c.topK, c.minP, c.presencePenalty, c.repeatPenalty, c.repeatLastN]
     .join("|");
+  const d = c.dry;
+  return d ? `${base}|dry:${d.multiplier},${d.base},${d.allowedLength},${d.penaltyLastN}` : base;
 }
 
 /** First number in the judge's reply, accepted only if it is a plausible 0-10 score. */
@@ -193,14 +214,26 @@ export function neighbors(c: SamplerCfg, seen: Set<string>): SamplerCfg[] {
   add("pp+", { presencePenalty: r2(clamp(c.presencePenalty + 0.2, 0, 1.5)) });
   add("rp-", { repeatPenalty: r2(clamp(c.repeatPenalty - 0.05, 1, 1.4)) });
   add("rp+", { repeatPenalty: r2(clamp(c.repeatPenalty + 0.05, 1, 1.4)) });
+  if (c.dry) {
+    const d = c.dry;
+    add("dm-", { dry: { ...d, multiplier: r2(clamp(d.multiplier - 0.2, 0.2, 1.6)) } });
+    add("dm+", { dry: { ...d, multiplier: r2(clamp(d.multiplier + 0.2, 0.2, 1.6)) } });
+    // allowedLength is the sharpest DRY knob: above ~2 the sampler barely fires. Probe the
+    // stock value when the config under test sits higher.
+    if (d.allowedLength > 2) add("da2", { dry: { ...d, allowedLength: 2 } });
+  }
   return out;
 }
 
 /** The line eval_completions.sh wants, verbatim. */
 export function samplerLine(c: SamplerCfg): string {
+  const dry = c.dry
+    ? ` --dry-multiplier ${c.dry.multiplier} --dry-base ${c.dry.base}` +
+      ` --dry-allowed-length ${c.dry.allowedLength} --dry-penalty-last-n ${c.dry.penaltyLastN}`
+    : "";
   return `SAMPLER=(--temp ${c.temp} --top-p ${c.topP} --top-k ${c.topK} --min-p ${c.minP} ` +
     `--presence-penalty ${c.presencePenalty} --repeat-penalty ${c.repeatPenalty} ` +
-    `--repeat-last-n ${c.repeatLastN})`;
+    `--repeat-last-n ${c.repeatLastN}${dry})`;
 }
 
 // ───────────────────────── runtime below (Deno-only; spawns llama-server) ─────────────────────
@@ -300,6 +333,10 @@ async function complete(
       presence_penalty: cfg.presencePenalty,
       repeat_penalty: cfg.repeatPenalty,
       repeat_last_n: cfg.repeatLastN,
+      dry_multiplier: cfg.dry?.multiplier ?? 0,
+      dry_base: cfg.dry?.base ?? 1.75,
+      dry_allowed_length: cfg.dry?.allowedLength ?? 2,
+      dry_penalty_last_n: cfg.dry?.penaltyLastN ?? -1,
       cache_prompt: false,
     }),
     signal: AbortSignal.timeout(180_000),
@@ -408,6 +445,7 @@ function fmtRow(r: Result, rankNo: number): string {
     String(c.presencePenalty).padStart(6),
     String(c.repeatPenalty).padStart(7),
     String(c.repeatLastN).padStart(5),
+    (c.dry ? `${c.dry.multiplier}/${c.dry.allowedLength}` : "-").padStart(8),
     "  ",
     r.rep2.toFixed(3).padStart(6),
     r.rep3.toFixed(3).padStart(6),
@@ -429,6 +467,7 @@ function printTable(rs: Result[]): void {
       "pres".padStart(6),
       "rep-p".padStart(7),
       "rln".padStart(5),
+      "dry".padStart(8),
       "  ",
       "rep2".padStart(6),
       "rep3".padStart(6),

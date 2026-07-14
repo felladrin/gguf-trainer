@@ -5,6 +5,7 @@ import {
   cfgKey,
   type CfgScore,
   distortion,
+  type DryCfg,
   neighbors,
   parseJudgeScore,
   POOL,
@@ -99,6 +100,35 @@ ok(
     "SAMPLER=(--temp 0.7 --top-p 0.85 --top-k 30 --min-p 0.02 --presence-penalty 0.4 " +
       "--repeat-penalty 1.15 --repeat-last-n 128)",
   "D renders exactly the line eval_completions.sh documents",
+);
+
+// DRY support: identity, distortion weight, flag rendering, targeted perturbations
+const dry = POOL.find((c) => c.name === "DRY") as SamplerCfg;
+ok(dry !== undefined && dry.dry !== undefined, "pool has the DRY config");
+ok(
+  dry.temp === 0.6 && dry.topP === 0.85 && dry.topK === 30 && dry.minP === 0.05 &&
+    dry.dry?.multiplier === 0.8 && dry.dry?.base === 1.75 && dry.dry?.allowedLength === 32 &&
+    dry.dry?.penaltyLastN === 256,
+  "DRY config carries the requested parameters",
+);
+ok(cfgKey(dry) !== cfgKey({ ...dry, dry: undefined }), "dry block is part of config identity");
+near(distortion(dry), 0.2, "dry distortion = 0.25 * multiplier");
+ok(
+  samplerLine(dry) ===
+    "SAMPLER=(--temp 0.6 --top-p 0.85 --top-k 30 --min-p 0.05 --presence-penalty 0 " +
+      "--repeat-penalty 1 --repeat-last-n 64 --dry-multiplier 0.8 --dry-base 1.75 " +
+      "--dry-allowed-length 32 --dry-penalty-last-n 256)",
+  "DRY renders the full flag set",
+);
+ok(
+  neighbors(dry, new Set([cfgKey(dry)])).map((c) => c.name).join(",") ===
+    "DRY~t-,DRY~t+,DRY~pp+,DRY~rp+,DRY~dm-,DRY~dm+,DRY~da2",
+  "DRY neighbors include multiplier steps and the stock allowed-length probe",
+);
+const dryStock: SamplerCfg = { ...dry, dry: { ...(dry.dry as DryCfg), allowedLength: 2 } };
+ok(
+  !neighbors(dryStock, new Set([cfgKey(dryStock)])).some((c) => c.name.endsWith("~da2")),
+  "no allowed-length probe when already at stock",
 );
 
 console.log("sweep_score: all assertions passed");
