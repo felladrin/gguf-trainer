@@ -7,3 +7,7 @@ examples/*.tokenizer.json
 # Raw + pretokenized corpora (downloaded/derived, not source; see examples/pretokenize.ts).
 corpus/
 memory/
+
+# Optimizer-state sidecars and training logs — run artifacts, regenerated per run.
+examples/*.optstate
+examples/*.log
