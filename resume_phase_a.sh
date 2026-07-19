@@ -6,7 +6,8 @@
 # an ssh disconnect. Config MUST match the original launch exactly or the loader's
 # config guard aborts.
 set -euo pipefail
-cd ~/Repositories/gguf-trainer
+# Repo root = this script's own directory, so the run works from any clone location.
+cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 DENO=/home/victor/.deno/bin/deno
 CKPT=examples/pretrain-blend-base.gguf

@@ -4,9 +4,11 @@
 
 set -uo pipefail
 
-LOG="$HOME/Repositories/gguf-trainer/examples/phaseA.log"
-OUTPUT="$HOME/Repositories/gguf-trainer/examples/phaseA.monitor.log"
-ALERT="$HOME/Repositories/gguf-trainer/examples/phaseA.alert"
+# Repo root = parent of this script's dir, so it works from any clone location.
+REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG="$REPO/examples/phaseA.log"
+OUTPUT="$REPO/examples/phaseA.monitor.log"
+ALERT="$REPO/examples/phaseA.alert"
 
 # Check if training is running
 if ! pgrep -f 'pretrain[.]ts' >/dev/null; then

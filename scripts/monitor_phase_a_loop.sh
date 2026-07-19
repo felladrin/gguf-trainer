@@ -5,9 +5,11 @@
 
 set -uo pipefail
 
-LOG="$HOME/Repositories/gguf-trainer/examples/phaseA.log"
-MONITOR_LOG="$HOME/Repositories/gguf-trainer/examples/phaseA.monitor.log"
-ALERT_LOG="$HOME/Repositories/gguf-trainer/examples/phaseA.alert"
+# Repo root = parent of this script's dir, so it works from any clone location.
+REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG="$REPO/examples/phaseA.log"
+MONITOR_LOG="$REPO/examples/phaseA.monitor.log"
+ALERT_LOG="$REPO/examples/phaseA.alert"
 
 echo "=== Phase A Monitor Started at $(date) ===" | tee -a "$MONITOR_LOG"
 echo "Watching: $LOG" | tee -a "$MONITOR_LOG"

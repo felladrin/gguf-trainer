@@ -9,7 +9,8 @@
 # Launch detached (survives ssh disconnect):
 #   setsid bash watch_restart_for_eta.sh >>examples/watcher.log 2>&1 </dev/null &
 set -euo pipefail
-cd ~/Repositories/gguf-trainer
+# Repo root = this script's own directory, so it works from any clone location.
+cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG=examples/phaseA.log
 
 lastCkpt() { grep -oE '\[ckpt @ [0-9]+\]' "$LOG" 2>/dev/null | grep -oE '[0-9]+' | tail -1; }

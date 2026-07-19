@@ -2,8 +2,10 @@
 # Quick status check for Phase A training
 # Run: ./scripts/status_phase_a.sh
 
-LOG="$HOME/Repositories/gguf-trainer/examples/phaseA.log"
-CKPT="$HOME/Repositories/gguf-trainer/examples/pretrain-blend-base.gguf"
+# Repo root = parent of this script's dir, so it works from any clone location.
+REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG="$REPO/examples/phaseA.log"
+CKPT="$REPO/examples/pretrain-blend-base.gguf"
 
 echo "=== Phase A Training Status ==="
 echo "Time: $(date)"
@@ -38,13 +40,13 @@ else
 fi
 
 # Recent alerts
-if [ -f "$HOME/Repositories/gguf-trainer/examples/phaseA.alert" ]; then
-  ALERTS=$(wc -l < "$HOME/Repositories/gguf-trainer/examples/phaseA.alert")
+if [ -f "$REPO/examples/phaseA.alert" ]; then
+  ALERTS=$(wc -l < "$REPO/examples/phaseA.alert")
   echo "Alerts: $ALERTS (see phaseA.alert)"
 fi
 
 echo ""
 echo "Commands:"
-echo "  Monitor: tail -f ~/Repositories/gguf-trainer/examples/phaseA.log"
+echo "  Monitor: tail -f $LOG"
 echo "  Stop:    pkill -f 'pretrain[.]ts'"
-echo "  Resume:  bash ~/Repositories/gguf-trainer/resume_phase_a.sh"
+echo "  Resume:  bash $REPO/resume_phase_a.sh"
