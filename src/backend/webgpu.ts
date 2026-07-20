@@ -139,6 +139,52 @@ export interface KernelTime {
   count: number; // number of dispatches attributed to this label
 }
 
+/**
+ * Device capabilities captured once at init, for the startup banner and the
+ * allocation guard. Limits are the values the device actually granted (we
+ * request the adapter's maxima; see initWebGPU). Zeroed limits mean "unknown"
+ * and disable the guard — the path a backend constructed without caps takes.
+ */
+export interface DeviceCaps {
+  vendor: string;
+  architecture: string;
+  maxBufferSize: number;
+  maxStorageBufferBindingSize: number;
+  maxComputeWorkgroupStorageSize: number;
+  maxComputeInvocationsPerWorkgroup: number;
+  f16: boolean;
+}
+
+const DEFAULT_CAPS: DeviceCaps = {
+  vendor: "",
+  architecture: "",
+  maxBufferSize: 0,
+  maxStorageBufferBindingSize: 0,
+  maxComputeWorkgroupStorageSize: 0,
+  maxComputeInvocationsPerWorkgroup: 0,
+  f16: false,
+};
+
+const MiB = 1024 * 1024;
+
+/**
+ * Fail a GPU storage-buffer allocation that can't fit, with the lever to fix
+ * it, instead of the opaque device-lost / uncaptured-error that createBuffer
+ * raises past the limit. Every buffer here is bound as STORAGE, so the binding
+ * limit is the true ceiling. A zero limit (unknown) skips the check.
+ */
+export function guardBufferSize(bytes: number, maxBinding: number) {
+  if (maxBinding && bytes > maxBinding) {
+    const mb = (n: number) => (n / MiB).toFixed(0);
+    throw new Error(
+      `GPU storage buffer of ${mb(bytes)} MiB exceeds this device's limit of ` +
+        `${mb(maxBinding)} MiB (maxStorageBufferBindingSize). The likely cause is a ` +
+        `seqLen×vocab logits buffer — lower seqLen/--maxSeq, reduce the tokenizer ` +
+        `vocab, or shrink the model (hidden/layers).`,
+    );
+  }
+}
+
 interface Entry {
   data: GpuBuffer;
   grad: GpuBuffer;
@@ -156,19 +202,31 @@ interface Entry {
 class BufferPool {
   private free = new Map<number, GpuBuffer[]>();
   private device: GpuDevice;
+  private maxBinding: number;
+  // Bytes ever created (never decremented: released buffers return to the free
+  // list, not to the driver). The pool only grows, so this IS the peak resident
+  // storage-buffer footprint of the training graph.
+  private allocated = 0;
 
-  constructor(device: GpuDevice) {
+  constructor(device: GpuDevice, maxBinding = 0) {
     this.device = device;
+    this.maxBinding = maxBinding;
+  }
+
+  bytesAllocated(): number {
+    return this.allocated;
   }
 
   acquire(bytes: number): { buf: GpuBuffer; size: number } {
     const size = Math.max(256, Math.ceil(bytes / 256) * 256);
     const list = this.free.get(size);
     if (list && list.length > 0) return { buf: list.pop()!, size };
+    guardBufferSize(size, this.maxBinding);
     const buf = this.device.createBuffer({
       size,
       usage: USAGE.STORAGE | USAGE.COPY_SRC | USAGE.COPY_DST,
     });
+    this.allocated += size;
     return { buf, size };
   }
 
@@ -204,6 +262,8 @@ interface Profiler {
 
 export class WebGPUBackend implements OpsBackend {
   readonly adapterName: string;
+  /** Device capabilities captured at init (banner + allocation guard). */
+  readonly caps: DeviceCaps;
   /** Whether the device granted the timestamp-query feature (see startProfile). */
   readonly timestampSupported: boolean;
   /**
@@ -221,6 +281,9 @@ export class WebGPUBackend implements OpsBackend {
   private device: GpuDevice;
   private queue: GpuQueue;
   private pool: BufferPool;
+  // Bytes of optimizer/state buffers (allocated outside the pool, never freed
+  // until destroy). Added to the pool footprint for the peak-memory readout.
+  private stateAllocated = 0;
   private pipelines = new Map<string, GpuPipeline>();
   private entries = new WeakMap<Tensor, Entry>();
   private touchedExternals = new Set<Tensor>();
@@ -239,10 +302,12 @@ export class WebGPUBackend implements OpsBackend {
     device: GpuDevice,
     adapterName: string,
     timestampSupported = false,
+    caps: DeviceCaps = DEFAULT_CAPS,
   ) {
     this.device = device;
     this.queue = device.queue;
-    this.pool = new BufferPool(device);
+    this.caps = caps;
+    this.pool = new BufferPool(device, caps.maxStorageBufferBindingSize);
     this.adapterName = adapterName;
     this.timestampSupported = timestampSupported;
     device.lost?.then((info) => {
@@ -376,6 +441,54 @@ export class WebGPUBackend implements OpsBackend {
   destroy() {
     this.uninstall();
     this.pool.destroyAll();
+  }
+
+  /**
+   * Peak resident GPU storage-buffer memory, split into the activation/gradient
+   * pool and optimizer state. Both counters only grow (the pool recycles rather
+   * than frees; state lives for the run), so these ARE the peak, not a snapshot.
+   */
+  residentBytes(): { pool: number; state: number; total: number } {
+    const pool = this.pool.bytesAllocated();
+    return { pool, state: this.stateAllocated, total: pool + this.stateAllocated };
+  }
+
+  /**
+   * Startup-banner lines describing the resolved device: adapter identity, the
+   * granted limits, optional features, and — under Deno — the system-memory
+   * pool (on a unified-memory APU this is the shared GPU/CPU pool). Printed once
+   * so a headless run has a visible record of what it actually bound to, instead
+   * of silently probing capabilities.
+   */
+  describeDevice(): string[] {
+    const c = this.caps;
+    const mib = (n: number) => (n / MiB).toFixed(0);
+    // Some backends report vendor/arch as "" or the placeholder "0" (Metal):
+    // show those as "?" rather than a misleading literal zero.
+    const id = (s: string) => (s && s !== "0" ? s : "");
+    const vendor = id(c.vendor), arch = id(c.architecture);
+    const lines = [
+      `  adapter    : ${this.adapterName}` +
+      (vendor || arch ? ` (vendor ${vendor || "?"}, arch ${arch || "?"})` : ""),
+      `  limits     : maxBuffer ${mib(c.maxBufferSize)} MiB, maxStorageBinding ${
+        mib(c.maxStorageBufferBindingSize)
+      } MiB, workgroupStorage ${(c.maxComputeWorkgroupStorageSize / 1024).toFixed(0)} KiB, ` +
+      `invocations/wg ${c.maxComputeInvocationsPerWorkgroup}`,
+      `  features   : timestamp-query ${this.timestampSupported ? "yes" : "no"}, ` +
+      `shader-f16 ${c.f16 ? "yes" : "no"}`,
+    ];
+    // deno-lint-ignore no-explicit-any
+    const deno = (globalThis as any).Deno;
+    try {
+      const m = deno?.systemMemoryInfo?.();
+      if (m) {
+        const gib = (n: number) => (n / (1024 * 1024 * 1024)).toFixed(1);
+        lines.push(`  system mem : ${gib(m.free)} GiB free / ${gib(m.total)} GiB (unified pool)`);
+      }
+    } catch {
+      // systemMemoryInfo unavailable/denied: the device lines above still stand.
+    }
+    return lines;
   }
 
   // --- timestamp-query profiling -------------------------------------------------
@@ -829,8 +942,11 @@ export class WebGPUBackend implements OpsBackend {
    * guaranteed zeroed by the WebGPU spec.
    */
   createStateBuffer(bytes: number): GpuBuffer {
+    const size = Math.max(4, Math.ceil(bytes / 4) * 4);
+    guardBufferSize(size, this.caps.maxStorageBufferBindingSize);
+    this.stateAllocated += size;
     return this.device.createBuffer({
-      size: Math.max(4, Math.ceil(bytes / 4) * 4),
+      size,
       usage: USAGE.STORAGE | USAGE.COPY_SRC | USAGE.COPY_DST,
     });
   }
@@ -1158,9 +1274,26 @@ export async function initWebGPU(): Promise<WebGPUBackend | null> {
     device = await adapter.requestDevice();
   }
   const name = adapter.info?.description || adapter.info?.vendor || "unknown adapter";
+  // Capture the GRANTED limits (device.limits), falling back to the adapter's
+  // reported maxima — we request exactly those, so they normally coincide. Both
+  // are read untyped: the structural GpuDevice type declares only one limit.
+  // deno-lint-ignore no-explicit-any
+  const dl: any = (device as any).limits ?? {};
+  const al = adapter.limits ?? {};
+  const num = (k: string) => Number(dl[k] ?? al[k] ?? 0);
+  const caps: DeviceCaps = {
+    vendor: String(adapter.info?.vendor ?? ""),
+    architecture: String(adapter.info?.architecture ?? ""),
+    maxBufferSize: num("maxBufferSize"),
+    maxStorageBufferBindingSize: num("maxStorageBufferBindingSize"),
+    maxComputeWorkgroupStorageSize: num("maxComputeWorkgroupStorageSize"),
+    maxComputeInvocationsPerWorkgroup: num("maxComputeInvocationsPerWorkgroup"),
+    f16: !!device.features?.has?.("shader-f16"),
+  };
   return new WebGPUBackend(
     device,
     String(name),
     !!device.features?.has?.("timestamp-query"),
+    caps,
   );
 }
