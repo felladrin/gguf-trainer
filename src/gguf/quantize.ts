@@ -200,6 +200,25 @@ const GGML_TYPE_NAMES: Record<number, string> = {
 
 export type QuantName = "f32" | "f16" | "q8_0" | "q4_0";
 
+export const QUANT_NAMES: QuantName[] = ["f32", "f16", "q8_0", "q4_0"];
+
+/**
+ * Parse a comma-separated quant spec (e.g. "f16,q8_0,q4_0") into a validated,
+ * de-duplicated list, preserving order. Throws on an unknown name so a typo in
+ * a --exportQuants flag fails loudly instead of silently skipping a variant.
+ */
+export function parseQuantList(spec: string): QuantName[] {
+  const out: QuantName[] = [];
+  for (const raw of spec.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)) {
+    const q = raw as QuantName;
+    if (!QUANT_NAMES.includes(q)) {
+      throw new Error(`unknown quant "${raw}" (valid: ${QUANT_NAMES.join(", ")})`);
+    }
+    if (!out.includes(q)) out.push(q);
+  }
+  return out;
+}
+
 export function serialize(data: Float32Array, quant: QuantName): Serialized {
   switch (quant) {
     case "f32":

@@ -39,6 +39,10 @@
 //     --auxLr=F        AdamW lr for the aux (norm/embed) group (default 3e-3)
 //     --out=PATH       output GGUF path (default examples/pretrain-base.gguf)
 //     --name=STR       general.name in the GGUF (default "pretrain-base")
+//     --exportQuants=LIST  at the FINAL export, ALSO write deployment copies at
+//                      these quants (e.g. q8_0,q4_0), suffixed <out>.Q8_0.gguf.
+//                      Checkpoints are unaffected. A <out>.run.sh (llama.cpp
+//                      invocation) is always written next to the model.
 //
 // Defaults: hidden 512, layers 6 (~28M), steps 2000, seqLen 1024, batch 8,
 //   muonLr 0.01. Compute is f32 throughout.
@@ -60,11 +64,12 @@ import { Gemma3Model } from "../src/model/gemma3.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import type { TokenizerData } from "../src/tokenizer/bpe.ts";
 import { CURRICULUM_SPECIALS } from "../src/data/chat.ts";
-import { buildGemma3GGUF } from "../src/export/export_gguf.ts";
+import { buildGemma3GGUF, llamaRunScript } from "../src/export/export_gguf.ts";
 import { configFromGGUF, loadWeightsFromGGUF } from "../src/export/load_gguf.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
 import { diskTokenSource, tokenBytes, writeTokenFile } from "../src/data/tokens.ts";
 import type { TokenSource } from "../src/data/tokens.ts";
+import { parseQuantList } from "../src/gguf/quantize.ts";
 import type { QuantName } from "../src/gguf/quantize.ts";
 import { initWebGPU } from "../src/backend/webgpu.ts";
 import type { WebGPUBackend } from "../src/backend/webgpu.ts";
@@ -245,11 +250,23 @@ async function main() {
   const name = flags.get("name") ?? "pretrain-base";
   if (quant !== "f32" && quant !== "f16") die(`--quant must be f32 or f16, got ${quant}`);
   if (startStep < 0 || startStep >= steps) die(`--startStep must be in [0, ${steps})`);
+  // Parse the deployment-quant list up front so a typo fails before the run, not
+  // after weeks of training.
+  const exportQuants = flags.get("exportQuants")
+    ? (() => {
+      try {
+        return parseQuantList(flags.get("exportQuants")!);
+      } catch (e) {
+        return die(String((e as Error).message));
+      }
+    })()
+    : [];
 
   console.log("=== curriculum stage 1: pretrain gemma3 base -> GGUF ===\n");
   const gpu = await initWebGPU();
   if (!gpu) die("no WebGPU (run under Deno with --unstable-webgpu)");
-  console.log(`WebGPU adapter: ${gpu.adapterName}`);
+  console.log("Device:");
+  for (const line of gpu.describeDevice()) console.log(line);
 
   // --- Tokens + tokenizer: pretokenized (.tokens) or raw (.txt) input ---
   let tok: BPETokenizer;
@@ -395,6 +412,16 @@ async function main() {
     ? Number(flags.get("ckpt"))
     : Math.min(1000, Math.max(1, Math.round(steps / 20)));
 
+  // Peak resident GPU storage-buffer memory (pool + optimizer state). Both only
+  // grow, so this is the peak, and the headroom-to-ceiling signal for sizing the
+  // next run on a fixed-memory box.
+  const mem = () => {
+    const r = gpu.residentBytes();
+    return `${(r.total / 1e6).toFixed(0)}MB gpu (pool ${(r.pool / 1e6).toFixed(0)} + state ${
+      (r.state / 1e6).toFixed(0)
+    })`;
+  };
+
   let firstLoss = 0, lastLoss = 0;
   const t0 = Date.now();
   await trainLMGpuResident(model, gpu, {
@@ -425,7 +452,7 @@ async function main() {
           `+ optstate ${(optBytes / 1e6).toFixed(0)}MB, ` +
           `loss ${lastLoss.toFixed(3)}, ${rate.toFixed(3)} st/s, eta ${
             fmtEta((steps - step) / rate)
-          }`,
+          }, mem ${mem()}`,
       );
     },
     onLog: (localStep, loss) => {
@@ -443,11 +470,16 @@ async function main() {
   });
   src.close();
   injectSource?.close();
-  console.log(
-    `\nTraining: loss ${firstLoss.toFixed(3)} -> ${lastLoss.toFixed(3)} in ${
-      ((Date.now() - t0) / 60000).toFixed(1)
-    }min`,
-  );
+  {
+    const el = (Date.now() - t0) / 1000;
+    const localSteps = steps - startStep;
+    const tokPerSec = (localSteps * tokensPerStep) / Math.max(1, el);
+    console.log(
+      `\nTraining: loss ${firstLoss.toFixed(3)} -> ${lastLoss.toFixed(3)} in ${
+        (el / 60).toFixed(1)
+      }min, ${tokPerSec.toFixed(0)} tok/s, peak ${mem()}`,
+    );
+  }
 
   console.log(`\nSample:\n${await generateGpu(gpu, model, tok, "Once upon a time", 60)}`);
 
@@ -460,6 +492,24 @@ async function main() {
       `gemma3 base ✓, ctx ${cfg.maxSeq}) + ${optStatePath.split("/").pop()} ` +
       `(${(optBytes / 1e6).toFixed(0)} MB). Next stage resumes via loadGemma3FromGGUF.`,
   );
+
+  // Companion run script + optional deployment-quant copies, so the step after
+  // a run is copy-paste and the model can be tried at deploy precision without
+  // re-training. Enc is reused for the small text write.
+  const enc = new TextEncoder();
+  const base = outPath.split("/").pop()!;
+  const runScriptPath = `${outPath}.run.sh`;
+  await writeFileBytes(runScriptPath, enc.encode(llamaRunScript(base, cfg)));
+  console.log(`Wrote ${runScriptPath.split("/").pop()} (run with: bash ${runScriptPath})`);
+  for (const eq of exportQuants) {
+    if (eq === quant) continue; // already the main artifact
+    const variantPath = outPath.replace(/\.gguf$/i, `.${eq.toUpperCase()}.gguf`);
+    const vb = buildGemma3GGUF(model, tok.export(), cfg, { quant: eq, name });
+    await writeFileBytes(variantPath, vb);
+    console.log(
+      `Wrote ${variantPath.split("/").pop()} (${(vb.length / 1e6).toFixed(0)} MB, ${eq})`,
+    );
+  }
   console.log("=== stage 1 complete ===");
 }
 
