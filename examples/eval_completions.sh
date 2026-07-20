@@ -13,6 +13,13 @@
 # runs at different steps stay comparable. An alternative preset is provided
 # commented-out below.
 #
+# RE-DERIVING the preset (at milestones only — end of a phase, after a
+# curriculum stage — NOT per checkpoint, or comparability is lost): run
+#   deno task sweep:sampler MODEL.gguf        # examples/sweep_sampler.ts
+# It re-runs this battery over a pool of sampler configs plus a perturbation
+# round, ranks them (repetition heuristic + optional LLM judge), and prints a
+# paste-ready SAMPLER line for this file.
+#
 # Usage:
 #   examples/eval_completions.sh [MODEL.gguf]      # or:  deno task eval:completions [MODEL.gguf]
 #     MODEL.gguf   checkpoint to probe (default: examples/pretrain-blend-base.gguf)
