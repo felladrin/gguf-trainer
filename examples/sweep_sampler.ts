@@ -520,7 +520,7 @@ async function main(): Promise<void> {
   try {
     Deno.statSync(model);
   } catch {
-    die(`no model at '${model}' — pass a checkpoint path (rsync one first, see header)`);
+    die(`no model at '${model}' — pass the path to a checkpoint .gguf`);
   }
 
   let pool = POOL;
