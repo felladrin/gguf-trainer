@@ -48,5 +48,5 @@ fi
 echo ""
 echo "Commands:"
 echo "  Monitor: tail -f $LOG"
-echo "  Stop:    pkill -f 'pretrain[.]ts'"
+echo "  Stop:    bash $REPO/stop_phase_a.sh"
 echo "  Resume:  bash $REPO/resume_phase_a.sh"
