@@ -6,11 +6,19 @@ base (beats Felladrin/Minueza-32M; will NOT beat Minueza-2-96M, which saw 185B t
 our ~1.44B — that's the hardware ceiling, accepted). This is `examples/pretrain.ts`.
 
 ## Config (must match exactly on any resume)
-`examples/blend.tokens 640 12 88000 2048 8 0.01 --maxSeq=8192 --ckpt=500 --quant=f32
+`examples/blend.tokens 640 12 88000 2048 8 0.01 --maxSeq=8192 --ckpt=500 --quant=f32 --reclaim
 --out=examples/pretrain-blend-base.gguf --name=gemma3-96m-base`
 = hidden 640 × 12 layers, headDim 64, SWA window 1024, vocab 32768, seqLen 2048, batch 8,
 muon lr 0.01, WSD (warmup 8800 / cooldown 17600). 88000 steps = 2 epochs ≈ ~21 days at
 the measured 0.050 st/s. Checkpoints every 500 steps to the --out GGUF (f32, atomic).
+
+`--reclaim` is REQUIRED, not optional: it flushes each micro-batch as its own GPU
+submission (~2.5 s), keeping every submit under amdgpu's ~10 s GFX ring watchdog. Without
+it the whole ~20 s step submits as one command buffer and the driver kills it mid-step
+(`ring gfx_0.0.0 timeout` → hard recovery → `OperationError` at the first sync). It also
+caps peak VRAM at ~one micro-batch. The alternative — raising the watchdog via
+`amdgpu.lockup_timeout=100000` on the kernel cmdline (finite so a real hang still recovers;
+`0` means "keep default", `-1` disables recovery) — is not set on this box, so keep `--reclaim`.
 
 ## Files (all already here, gitignored)
 - `examples/blend.tokens` (1.44 GB, 722M tokens) + `examples/blend.tokenizer.json` (vocab 32768).
