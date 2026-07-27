@@ -27,6 +27,21 @@ param is absent (fresh install, GRUB reset), either put it back via `/etc/defaul
 step submits as one command buffer and the driver kills it mid-step (`ring gfx_0.0.0
 timeout` → hard recovery → `OperationError` at the first sync).
 
+## Vocab is 32768, and that supersedes the ~16k plan
+`examples/blend.tokenizer.json` was built 2026-07-08 with 32768 tokens, in the same commit
+(a8a3752) that swapped the corpus from TinyStories to the C4 + cosmopedia + github-code +
+open-web-math blend. No rationale was recorded at the time; the plausible one is that code
+and math text want a larger vocab than TinyStories' toy vocabulary. Two older references
+still describe the earlier ~16k plan and are NOT what this run uses: `docs/HANDOFF.md`
+("shared tokenizer, vocab ~16k") and `const VOCAB = 16384` in `pretrain.ts`, which now
+applies only to `.txt` mode, not to a pretokenized `.tokens` run.
+
+The cost: the tied embedding table is 20.97M of the 94.7M params (22%). At 16384 the model
+would be ~84M with proportionally more budget in the 12 layers, and cross-entropy would
+halve its `[T,V]` scratch (see the large-vocab CE note in `docs/HANDOFF.md`). Per the
+frozen-vocab rule there, none of this is changeable now — the embeddings froze when
+pretraining started, so revisit 16384-vs-32768 at the next from-scratch run, not this one.
+
 ## Files (all already here, gitignored)
 - `examples/blend.tokens` (1.44 GB, 722M tokens) + `examples/blend.tokenizer.json` (vocab 32768).
 - `examples/pretrain-blend-base.gguf` — the latest checkpoint (weights). Overwritten each ckpt.
