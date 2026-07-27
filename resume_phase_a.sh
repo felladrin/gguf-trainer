@@ -32,7 +32,7 @@ cp -f "$CKPT" "$SRC"
 echo "resuming Phase A from step $STEP (source $SRC) -> $CKPT"
 setsid "$DENO" run -A --unstable-webgpu examples/pretrain.ts \
   examples/blend.tokens 640 12 88000 2048 8 0.01 \
-  --maxSeq=8192 --ckpt=500 --quant=f32 --reclaim \
+  --maxSeq=8192 --ckpt=500 --quant=f32 \
   --out="$CKPT" --name=gemma3-96m-base \
   --resume="$SRC" --startStep="$STEP" \
   >>"$LOG" 2>&1 </dev/null &
