@@ -1,0 +1,16 @@
+.DS_Store
+
+# Working directories: models, tokens and corpora are outputs, never source.
+out/
+data/
+demo-out/
+
+# Raw and pretokenized corpora: downloaded or derived, never source.
+corpus/
+# Local run artifacts from before the CLI: checkpoints, token streams, logs.
+examples/
+# Downloaded validation sets and eval output.
+evaldata/
+
+# Agent scratch, not project source.
+memory/

@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Check formatting
+        run: deno fmt --check
+      - name: Lint
+        run: deno lint
+      - name: Type-check the CLI and every command
+        run: deno check cli.ts src/cli/registry.ts src/model/registry.ts
+      # The GPU parity suite prints SKIP where WebGPU is unavailable, which is
+      # every CI runner; the gradient checks are the real coverage here.
+      - name: Tests
+        run: deno task test
