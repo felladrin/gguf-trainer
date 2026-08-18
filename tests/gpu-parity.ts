@@ -134,7 +134,7 @@ async function profilerSmoke(gpu: WebGPUBackend) {
   gpu.install();
   let ok = true;
   try {
-    gpu.startProfile(64);
+    gpu.startProfile(); // no argument on purpose: the default must be a legal query-set size
     const y = silu(linear(x, w));
     await gpu.sync([y]);
     const { kernels, overflow } = gpu.stopProfile();
@@ -423,25 +423,31 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
 }
 
 /**
- * Functional large-T check for flash attention (appended by the tiling task):
- * on a device requested with SPEC-DEFAULT limits, run forward+backward at
- * T=3584 (Hq=4, hd=32). The pre-flash kernels needed a ~205 MB [Hq,T,T] probs
- * binding here (over the default 128 MiB maxStorageBufferBindingSize) and
- * failed bind-group validation. CPU comparison is far too slow at this T, so
- * assert completion with no device/validation error and finite, non-zero
- * output and input gradients instead.
+ * The flash kernels on a device that grants only the WebGPU spec defaults, which
+ * is what a browser or a plain `requestDevice()` hands out. `initWebGPU` asks for
+ * the adapter's maxima, so every other check in this file runs on a device that
+ * may be far more generous, and the limit that bites at long context is
+ * invisible there: at T=3584 the pre-flash kernels needed a ~205 MB [Hq,T,T]
+ * probs binding, over the default 128 MiB maxStorageBufferBindingSize, and
+ * failed bind-group validation. Deno's wgpu DOES validate that one, so this is
+ * a real gate for it. It is not a gate for workgroup storage, which wgpu does
+ * not validate: tests/kernel-limits.ts covers that from the source instead.
+ *
+ * CPU comparison is far too slow at these shapes, so assert completion with no
+ * device/validation error and finite, non-zero outputs and input gradients.
  */
-async function flashLargeTCheck() {
+async function specDefaultLimitsCheck(T: number, hd: number, why: string) {
   // deno-lint-ignore no-explicit-any
   const nav: any = (globalThis as any).navigator;
   const adapter = await nav?.gpu?.requestAdapter?.();
   if (!adapter) {
-    console.log("  SKIP flash large-T check: no WebGPU adapter");
+    console.log(`  SKIP spec-default-limits check (${why}): no WebGPU adapter`);
     return;
   }
   const device = await adapter.requestDevice(); // no requiredLimits: spec defaults
   const gpu2 = new WebGPUBackend(device, "spec-default-limits");
-  const T = 3584, Hq = 4, Hkv = 2, hd = 32;
+  gpu2.attnFlashMinT = 1; // force the flash path even at the small shape
+  const Hq = 4, Hkv = 2;
   const rng = mulberry32(0xf1a5);
   const q = randTensor([T, Hq * hd], rng, 0.5);
   const k = randTensor([T, Hkv * hd], rng, 0.5);
@@ -488,7 +494,8 @@ async function flashLargeTCheck() {
   }
   if (!ok) failures++;
   console.log(
-    `  ${ok ? "ok " : "FAIL"} flash attention fwd+bwd @ T=3584 under spec-default limits`,
+    `  ${ok ? "ok " : "FAIL"} flash attention fwd+bwd @ T=${T}, hd=${hd} ` +
+      `under spec-default limits (${why})`,
   );
 }
 
@@ -513,11 +520,13 @@ async function main() {
     await opCase(gpu, "linear (33x48 · 37x48ᵀ, tiled)", [x, w], () => linear(x, w));
   }
   {
-    // Straddles the register-tiled block dims (BM=BN=64, BK=8) in all three
-    // axes with remainders: 2 row-blocks + tail, 2 col-blocks + tail, 10 K-steps.
-    const x = randTensor([70, 80], rng);
-    const w = randTensor([75, 80], rng);
-    await opCase(gpu, "linear (70x80 · 75x80ᵀ, multi-block)", [x, w], () => linear(x, w));
+    // Straddles the register-tiled block dims (BM=BN=64, BK=16) in all three
+    // axes with remainders: 2 row-blocks + tail, 2 col-blocks + tail, and a K
+    // that is 5 full BK steps plus a 3-deep tail, so the ragged K arrives after
+    // several steps have already accumulated into the register tile.
+    const x = randTensor([70, 83], rng);
+    const w = randTensor([75, 83], rng);
+    await opCase(gpu, "linear (70x83 · 75x83ᵀ, multi-block, ragged K)", [x, w], () => linear(x, w));
   }
   await gpuMatmulFdCheck(gpu);
   await profilerSmoke(gpu);
@@ -609,6 +618,20 @@ async function main() {
     await opCase(gpu, "crossEntropy (ignore-index)", [logits], () => crossEntropy(logits, targets));
   }
   {
+    // V wider than the cross-entropy workgroup (256): every lane strides its row
+    // several times, which is the loop the one-thread-per-row kernel never had.
+    // The V=17 cases above enter it exactly once, so they cannot see a stride bug.
+    const T = 3, V = 1000;
+    const logits = randTensor([T, V], rng);
+    const targets = [617, 0, 999];
+    await opCase(
+      gpu,
+      "crossEntropy (V > workgroup)",
+      [logits],
+      () => crossEntropy(logits, targets),
+    );
+  }
+  {
     // Soft-target CE (Phase B KL anchor): normalized row, truncated top-k row
     // (mass < 1), ignored row, and a row with a duplicate teacher id: the case
     // that would race if the sparse backward ran one thread per teacher entry.
@@ -617,6 +640,20 @@ async function main() {
     const ids = [3, 9, 16, 0, 5, 11, -1, 0, 0, 7, 7, 2];
     const q = [0.5, 0.3, 0.2, 0.4, 0.2, 0.1, 0.0, 0.0, 0.0, 0.25, 0.25, 0.5];
     await opCase(gpu, "softCrossEntropy", [logits], () => softCrossEntropy(logits, ids, q, K));
+  }
+  {
+    // The same wide-row case for the soft-target path, which has its own strided
+    // loops and its own mass·log(Σ) loss form.
+    const T = 3, V = 1000, K = 2;
+    const logits = randTensor([T, V], rng);
+    const ids = [617, 0, 999, 12, -1, 0];
+    const q = [0.6, 0.4, 0.3, 0.2, 0.0, 0.0];
+    await opCase(
+      gpu,
+      "softCrossEntropy (V > workgroup)",
+      [logits],
+      () => softCrossEntropy(logits, ids, q, K),
+    );
   }
 
   // 5. graph-level
@@ -632,12 +669,17 @@ async function main() {
   //        the production threshold.
   //    (c) Backward-heavy case that exercises srcAttnBwdDkv's GQA head-group loop.
   //    (d) Large-T functional check under spec-default device limits.
+  // Head dims cover all three lanes of the flash kernels' vec4 codegen: hd=6/12
+  // are not multiples of 4 or leave an odd vec4 count (scalar fallback and the
+  // single-chain dQ/dV loop), hd=64 is the shape every published checkpoint uses.
   const flashCases: [number, number, number, number, string][] = [
     [67, 4, 2, 6, "T=67, hd=6, group=2"],
     [67, 2, 2, 32, "T=67, hd=32, group=1"],
     [130, 4, 2, 32, "T=130, hd=32, group=2"],
     [130, 3, 3, 6, "T=130, hd=6, group=1"],
     [193, 4, 1, 24, "T=193, hd=24, group=4"],
+    [130, 4, 2, 12, "T=130, hd=12, group=2"],
+    [130, 4, 2, 64, "T=130, hd=64, group=2"],
   ];
   for (const [T, Hq, Hkv, hd, label] of flashCases) {
     const q = randTensor([T, Hq * hd], rng);
@@ -668,6 +710,7 @@ async function main() {
     [193, 4, 2, 24, 48, "T=193, hd=24, group=2, W=48"],
     [130, 3, 3, 6, 40, "T=130, hd=6, group=1, W=40"],
     [67, 4, 2, 32, 20, "T=67, hd=32, group=2, W=20"],
+    [193, 4, 2, 64, 48, "T=193, hd=64, group=2, W=48"],
   ];
   for (const [T, Hq, Hkv, hd, W, label] of windowCases) {
     const q = randTensor([T, Hq * hd], rng);
@@ -688,7 +731,14 @@ async function main() {
     );
     gpu.attnFlashMinT = 2048;
   }
-  await flashLargeTCheck();
+  // hd=64 is the head size every published checkpoint trains at and had no
+  // coverage at all. Note this pair checks that the kernels RUN at these shapes,
+  // not that they respect the limits: Deno's wgpu does not enforce
+  // maxComputeWorkgroupStorageSize at pipeline creation (probed: it accepted a
+  // 16640-byte shader on a device granting 16384). tests/kernel-limits.ts is
+  // what actually gates the footprint, by reading the emitted WGSL.
+  await specDefaultLimitsCheck(3584, 32, "long-context storage binding");
+  await specDefaultLimitsCheck(130, 64, "the published head size");
 
   // 7. GPU-resident Muon optimizer (src/backend/muon-gpu.ts): Newton–Schulz
   //    kernel parity, momentum-buffer persistence across steps, and the

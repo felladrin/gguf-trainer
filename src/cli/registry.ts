@@ -15,6 +15,7 @@ import { evalLossCommand } from "../commands/eval-loss.ts";
 import { evalChoiceCommand } from "../commands/eval-choice.ts";
 import { demoCommand } from "../commands/demo.ts";
 import { archsCommand } from "../commands/archs.ts";
+import { benchCommand } from "../commands/bench.ts";
 import { styleSeedCommand } from "../commands/style-seed.ts";
 import { styleRestyleCommand } from "../commands/style-restyle.ts";
 
@@ -32,5 +33,6 @@ export const COMMANDS: Command[] = [
   inspectCommand,
   exportCommand,
   demoCommand,
+  benchCommand,
   archsCommand,
 ];

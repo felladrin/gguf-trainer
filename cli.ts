@@ -53,6 +53,7 @@ const GROUP: Record<string, string> = {
   inspect: "ship a model",
   generate: "ship a model",
   demo: "check the install",
+  bench: "check the install",
   archs: "check the install",
 };
 

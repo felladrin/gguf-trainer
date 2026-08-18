@@ -53,7 +53,12 @@ function bindU32(i: number, name: string): string {
 // (or TN) MACs instead of one: the arithmetic-intensity lever that lifts this
 // off the "SMEM-tiled, 1 output/thread" rung. Single-sourced with the dispatch
 // grid (gemm/prepareGemm below) so block size and workgroup count never drift.
-export const GEMM_BM = 64, GEMM_BN = 64, GEMM_BK = 8, GEMM_TM = 4, GEMM_TN = 4;
+//
+// BK=16 halves the barrier count and the per-K-step loop overhead versus the
+// original 8 at 8 KiB of workgroup storage, half the 16 KiB WebGPU floor (BK=32
+// measured no faster and spends the whole floor). TM and TN must stay multiples
+// of 4: the micro-tile fragments are read as vec4 (see srcGemm).
+export const GEMM_BM = 64, GEMM_BN = 64, GEMM_BK = 16, GEMM_TM = 4, GEMM_TN = 4;
 export const GEMM_WG = (GEMM_BM / GEMM_TM) * (GEMM_BN / GEMM_TN); // threads/workgroup (256)
 
 /**
@@ -69,7 +74,16 @@ export const GEMM_WG = (GEMM_BM / GEMM_TM) * (GEMM_BN / GEMM_TN); // threads/wor
  * memory and runs *slower* than the 1-output/thread kernel (measured ~3× on
  * M1 Max). Bounds are guarded per load and per store, so M/N/K need not be
  * multiples of the block dims (the parity suite covers tiny, odd, multi-block).
+ *
+ * Both staged tiles are held as vec4 and both fragments are read as vec4, so a
+ * K-step costs 2 workgroup loads instead of 8. That is why the A tile is staged
+ * TRANSPOSED (As[k][m], not As[m][k]): in the original layout a thread's TM
+ * rows are BK apart, and a stride-BK fragment cannot be one load. The staging
+ * loops walk vec4 units and still guard every element, so ragged edges are
+ * unchanged.
  */
+const XYZW = ["x", "y", "z", "w"];
+
 export function srcGemm(
   kind: "NT" | "NN" | "TN",
   accum: boolean,
@@ -78,6 +92,9 @@ export function srcGemm(
   K: number,
 ): string {
   const [BM, BN, BK, TM, TN, WG] = [GEMM_BM, GEMM_BN, GEMM_BK, GEMM_TM, GEMM_TN, GEMM_WG];
+  if (TM % 4 !== 0 || TN % 4 !== 0 || BM % 4 !== 0 || BN % 4 !== 0) {
+    throw new Error(`srcGemm: BM/BN/TM/TN must be multiples of 4 (vec4 fragments)`);
+  }
   // gr = global row (m), gc = global col (n), gk = global k index.
   const aLoad = kind === "TN" ? "AB[gk * M + gr]" : "AB[gr * K + gk]";
   const bLoad = kind === "NT" ? "BB[gc * K + gk]" : "BB[gk * N + gc]";
@@ -86,11 +103,30 @@ export function srcGemm(
   // wall-clock gain here since attention, not GEMM, dominates runtime, and
   // rounding operands to f16 overflowed on longer runs.) sh = tile scalar type.
   const sh = "f32";
+  // Four guarded scalar loads per staged vec4: the four A rows are K apart (or
+  // the four B cols K apart under NT), so only the workgroup-side store is wide.
+  // Each guard here is individually redundant, against the store guards below and
+  // against the other tile's K guard (a leaked A value at the ragged tail meets a
+  // zeroed B at the same kc). They are kept anyway: without them each staging loop
+  // would read out of bounds and its correctness would depend on the other loop.
+  let aStage = "", bStage = "";
+  for (let q = 0; q < 4; q++) {
+    aStage += `      { let gr = blockRow + r + ${q}u; if (gr < M && gk < K) ` +
+      `{ v.${XYZW[q]} = ${aLoad}; } }\n`;
+    bStage += `      { let gc = gc0 + ${q}u; if (gk < K && gc < N) ` +
+      `{ v.${XYZW[q]} = ${bLoad}; } }\n`;
+  }
   // Unroll the tile so every accumulator/fragment is a compile-time-named
   // scalar (stays in registers) rather than a dynamically-indexed array.
   let decl = "", fragA = "", fragB = "", macs = "", stores = "";
-  for (let i = 0; i < TM; i++) fragA += `      let a${i} = As[(tRow + ${i}u) * ${BK}u + kc];\n`;
-  for (let j = 0; j < TN; j++) fragB += `      let b${j} = Bs[kc * ${BN}u + tCol + ${j}u];\n`;
+  for (let i = 0; i < TM; i += 4) {
+    fragA += `      let av${i} = As[kc * ${BM / 4}u + tRow4 + ${i / 4}u];\n`;
+    for (let q = 0; q < 4; q++) fragA += `      let a${i + q} = av${i}.${XYZW[q]};\n`;
+  }
+  for (let j = 0; j < TN; j += 4) {
+    fragB += `      let bv${j} = Bs[kc * ${BN / 4}u + tCol4 + ${j / 4}u];\n`;
+    for (let q = 0; q < 4; q++) fragB += `      let b${j + q} = bv${j}.${XYZW[q]};\n`;
+  }
   for (let i = 0; i < TM; i++) {
     for (let j = 0; j < TN; j++) {
       decl += `  var acc${i}_${j} = 0.0;\n`;
@@ -106,35 +142,34 @@ ${bindF32(0, "AB", "read")}
 ${bindF32(1, "BB", "read")}
 ${bindF32(2, "CB", "read_write")}
 const M: u32 = ${M}u; const N: u32 = ${N}u; const K: u32 = ${K}u;
-var<workgroup> As: array<${sh}, ${BM * BK}>;
-var<workgroup> Bs: array<${sh}, ${BK * BN}>;
+var<workgroup> As: array<vec4<${sh}>, ${(BM * BK) / 4}>;  // [BK][BM/4]: transposed
+var<workgroup> Bs: array<vec4<${sh}>, ${(BK * BN) / 4}>;  // [BK][BN/4]
 @compute @workgroup_size(${WG})
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
   let blockRow = wg.y * ${BM}u;
   let blockCol = wg.x * ${BN}u;
   let tRow = (lidx / ${BN / TN}u) * ${TM}u; // this thread's first row in the tile
   let tCol = (lidx % ${BN / TN}u) * ${TN}u; // this thread's first col in the tile
+  let tRow4 = tRow / 4u;
+  let tCol4 = tCol / 4u;
 ${decl}  var kk = 0u;
   loop {
     if (kk >= K) { break; }
-    // Cooperatively stage the A and B tiles (grid-strided).
-    for (var t = lidx; t < ${BM * BK}u; t += ${WG}u) {
-      let r = t / ${BK}u;
-      let kc = t % ${BK}u;
-      let gr = blockRow + r;
+    // Cooperatively stage the A and B tiles, one vec4 per step (grid-strided).
+    for (var t = lidx; t < ${(BM * BK) / 4}u; t += ${WG}u) {
+      let kc = t / ${BM / 4}u;
+      let r = (t % ${BM / 4}u) * 4u;
       let gk = kk + kc;
-      var v = 0.0;
-      if (gr < M && gk < K) { v = ${aLoad}; }
-      As[r * ${BK}u + kc] = v;
+      var v = vec4<${sh}>(0.0);
+${aStage}      As[kc * ${BM / 4}u + r / 4u] = v;
     }
-    for (var t = lidx; t < ${BK * BN}u; t += ${WG}u) {
-      let kc = t / ${BN}u;
-      let c = t % ${BN}u;
+    for (var t = lidx; t < ${(BK * BN) / 4}u; t += ${WG}u) {
+      let kc = t / ${BN / 4}u;
+      let c = (t % ${BN / 4}u) * 4u;
       let gk = kk + kc;
-      let gc = blockCol + c;
-      var v = 0.0;
-      if (gk < K && gc < N) { v = ${bLoad}; }
-      Bs[kc * ${BN}u + c] = v;
+      let gc0 = blockCol + c;
+      var v = vec4<${sh}>(0.0);
+${bStage}      Bs[kc * ${BN / 4}u + c / 4u] = v;
     }
     workgroupBarrier();
     for (var kc = 0u; kc < ${BK}u; kc++) {
@@ -341,12 +376,77 @@ export interface AttnDims {
   window?: number; // sliding-window size (keys [t-window+1, t]); 0/undefined = full causal
 }
 
+/**
+ * How the flash kernels step along the head dimension. When the head size is a
+ * multiple of 4 every Q/K/V/output row is addressed as `vec4<f32>`, which turns
+ * each 4 scalar loads into one 16-byte load AND splits the head-deep dot product
+ * into 4 independent accumulation chains (the two levers that lifted `srcGemm`,
+ * applied to the loop where the loads actually live). Head sizes that are not a
+ * multiple of 4 keep the scalar form: the emitted source is otherwise identical,
+ * so there is one kernel body, not two. `tests/gpu-parity.ts` covers hd=6 (scalar)
+ * and hd=24/32 (vectorized).
+ */
+interface AttnLanes {
+  ty: string; // element type of a lane
+  hdv: number; // lanes per head
+  qsv: number; // lanes per query row
+  ksv: number; // lanes per key row
+  zero: string; // additive identity of `ty`
+  /** Reduce a lane-wide accumulator to the scalar it stands for. */
+  sum: (v: string) => string;
+}
+
+function attnLanes(a: AttnDims): AttnLanes {
+  const w = a.hd % 4 === 0 ? 4 : 1;
+  return {
+    ty: w === 4 ? "vec4<f32>" : "f32",
+    hdv: a.hd / w,
+    qsv: (a.Hq * a.hd) / w,
+    ksv: (a.Hkv * a.hd) / w,
+    zero: w === 4 ? "vec4<f32>(0.0)" : "0.0",
+    sum: w === 4 ? (v: string) => `${v}.x + ${v}.y + ${v}.z + ${v}.w` : (v: string) => v,
+  };
+}
+
+/**
+ * Query rows srcAttnBwdDkv stages per tile. Its workgroup footprint is
+ * 8·BT·(hd+1) bytes (Q and dOut tiles plus the LSE/D statistics), so a fixed 32
+ * overflows WebGPU's 16 KiB portable floor from hd=64 up: the head size every
+ * published checkpoint uses. Sized down to the largest power of two that fits,
+ * which keeps every device on one kernel rather than making long-context
+ * training depend on the adapter granting more than the spec default.
+ */
+function attnBwdTile(a: AttnDims): number {
+  let bt = 32;
+  while (bt > 1 && 8 * bt * (a.hd + 1) > 16384) bt >>= 1;
+  if (8 * bt * (a.hd + 1) > 16384) {
+    throw new Error(
+      `attention: head dim ${a.hd} cannot fit the 16 KiB portable workgroup-storage floor ` +
+        `even at one query row per tile`,
+    );
+  }
+  return bt;
+}
+
+/** Storage binding whose element type follows the lane width (see AttnLanes). */
+function bindLane(i: number, name: string, access: "read" | "read_write", L: AttnLanes): string {
+  return `@group(0) @binding(${i}) var<storage, ${access}> ${name}: array<${L.ty}>;`;
+}
+
 function attnConsts(a: AttnDims): string {
   const scale = 1 / Math.sqrt(a.hd);
+  const L = attnLanes(a);
   return `const T: u32 = ${a.T}u; const HQ: u32 = ${a.Hq}u; const HKV: u32 = ${a.Hkv}u;
 const HD: u32 = ${a.hd}u; const GROUP: u32 = ${a.Hq / a.Hkv}u;
 const QS: u32 = ${a.Hq * a.hd}u; const KS: u32 = ${a.Hkv * a.hd}u;
+// Lane-indexed strides: identical to HD/QS/KS in the scalar fallback.
+const HDV: u32 = ${L.hdv}u; const QSV: u32 = ${L.qsv}u; const KSV: u32 = ${L.ksv}u;
 const SCALE: f32 = ${f32lit(scale)}; const WINDOW: u32 = ${a.window ?? 0}u;
+// Score scale folded into the log2 domain, so the online softmax can use the
+// exp2 builtin directly: exp(x) costs an extra multiply by log2(e) on hardware
+// whose only exponential instruction is base-2 (all of it). LSE is stored in
+// the same domain, so both backward kernels recompute p with the same exp2.
+const SCALE2: f32 = ${f32lit(scale * Math.LOG2E)};
 // First key attended by query row t under the sliding window (0 = full causal).
 fn winStart(t: u32) -> u32 { if (WINDOW == 0u || t + 1u <= WINDOW) { return 0u; } return t + 1u - WINDOW; }
 // Block-aligned window start for the flash kernels: the lower key bound is made
@@ -540,11 +640,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * bounds diverge and staging wins.
  */
 export function srcAttnFwd(a: AttnDims): string {
+  const L = attnLanes(a);
   return `
-${bindF32(0, "QB", "read")}
-${bindF32(1, "KB", "read")}
-${bindF32(2, "VB", "read")}
-${bindF32(3, "YB", "read_write")}
+${bindLane(0, "QB", "read", L)}
+${bindLane(1, "KB", "read", L)}
+${bindLane(2, "VB", "read", L)}
+${bindLane(3, "YB", "read_write", L)}
 ${bindF32(4, "LSE", "read_write")}
 ${attnConsts(a)}
 @compute @workgroup_size(64)
@@ -554,28 +655,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let h = i / T;
   let t = i % T;
   let kv = h / GROUP;
-  var qr: array<f32, HD>;
-  var acc: array<f32, HD>;
-  for (var d = 0u; d < HD; d++) {
-    qr[d] = QB[t * QS + h * HD + d];
-    acc[d] = 0.0;
+  var qr: array<${L.ty}, HDV>;
+  var acc: array<${L.ty}, HDV>;
+  for (var d = 0u; d < HDV; d++) {
+    qr[d] = QB[t * QSV + h * HDV + d];
+    acc[d] = ${L.zero};
   }
   var m = -3.0e38;
   var l = 0.0;
   for (var s = winStartBlock(t); s <= t; s++) {
-    var dot = 0.0;
-    for (var d = 0u; d < HD; d++) { dot = dot + qr[d] * KB[s * KS + kv * HD + d]; }
+    var dotv = ${L.zero};
+    for (var d = 0u; d < HDV; d++) { dotv = dotv + qr[d] * KB[s * KSV + kv * HDV + d]; }
     if (WINDOW != 0u && s + WINDOW <= t) { continue; } // key before this row's window
-    let sc = dot * SCALE;
-    let mNew = max(m, sc);
-    let corr = exp(m - mNew);
-    let p = exp(sc - mNew);
-    l = l * corr + p;
-    for (var d = 0u; d < HD; d++) { acc[d] = acc[d] * corr + p * VB[s * KS + kv * HD + d]; }
-    m = mNew;
+    let sc = (${L.sum("dotv")}) * SCALE2;
+    // The running max is monotone, so the accumulator only needs rescaling on
+    // the handful of keys that actually raise it; every other key is a plain
+    // multiply-add. On the branch that does raise it, p is exp2(sc-sc) = 1, so
+    // either way exactly one exp2 is evaluated.
+    if (sc > m) {
+      let corr = exp2(m - sc);
+      l = l * corr + 1.0;
+      for (var d = 0u; d < HDV; d++) { acc[d] = acc[d] * corr + VB[s * KSV + kv * HDV + d]; }
+      m = sc;
+    } else {
+      let p = exp2(sc - m);
+      l = l + p;
+      for (var d = 0u; d < HDV; d++) { acc[d] = acc[d] + p * VB[s * KSV + kv * HDV + d]; }
+    }
   }
-  for (var d = 0u; d < HD; d++) { YB[t * QS + h * HD + d] = acc[d] / l; }
-  LSE[h * T + t] = m + log(l);
+  for (var d = 0u; d < HDV; d++) { YB[t * QSV + h * HDV + d] = acc[d] / l; }
+  LSE[h * T + t] = m + log2(l);
 }`;
 }
 
@@ -585,9 +694,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * it inside its O(T) scan.
  */
 export function srcAttnBwdD(a: AttnDims): string {
+  const L = attnLanes(a);
   return `
-${bindF32(0, "GB", "read")}
-${bindF32(1, "YB", "read")}
+${bindLane(0, "GB", "read", L)}
+${bindLane(1, "YB", "read", L)}
 ${bindF32(2, "DB", "read_write")}
 ${attnConsts(a)}
 @compute @workgroup_size(64)
@@ -596,9 +706,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (i >= HQ * T) { return; }
   let h = i / T;
   let t = i % T;
-  var s = 0.0;
-  for (var d = 0u; d < HD; d++) { s = s + GB[t * QS + h * HD + d] * YB[t * QS + h * HD + d]; }
-  DB[h * T + t] = s;
+  var sv = ${L.zero};
+  for (var d = 0u; d < HDV; d++) {
+    sv = sv + GB[t * QSV + h * HDV + d] * YB[t * QSV + h * HDV + d];
+  }
+  DB[h * T + t] = ${L.sum("sv")};
 }`;
 }
 
@@ -612,14 +724,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * measured slower).
  */
 export function srcAttnBwdDq(a: AttnDims): string {
+  const L = attnLanes(a);
   return `
-${bindF32(0, "QB", "read")}
-${bindF32(1, "KB", "read")}
-${bindF32(2, "VB", "read")}
-${bindF32(3, "GB", "read")}
+${bindLane(0, "QB", "read", L)}
+${bindLane(1, "KB", "read", L)}
+${bindLane(2, "VB", "read", L)}
+${bindLane(3, "GB", "read", L)}
 ${bindF32(4, "LSE", "read")}
 ${bindF32(5, "DB", "read")}
-${bindF32(6, "DQ", "read_write")}
+${bindLane(6, "DQ", "read_write", L)}
 ${attnConsts(a)}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -628,29 +741,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let h = i / T;
   let t = i % T;
   let kv = h / GROUP;
-  var qr: array<f32, HD>;
-  var go: array<f32, HD>;
-  var dq: array<f32, HD>;
-  for (var d = 0u; d < HD; d++) {
-    qr[d] = QB[t * QS + h * HD + d];
-    go[d] = GB[t * QS + h * HD + d];
-    dq[d] = 0.0;
+  var qr: array<${L.ty}, HDV>;
+  var go: array<${L.ty}, HDV>;
+  var dq: array<${L.ty}, HDV>;
+  for (var d = 0u; d < HDV; d++) {
+    qr[d] = QB[t * QSV + h * HDV + d];
+    go[d] = GB[t * QSV + h * HDV + d];
+    dq[d] = ${L.zero};
   }
   let lse = LSE[h * T + t];
   let dRow = DB[h * T + t];
   for (var s = winStartBlock(t); s <= t; s++) {
-    var dot = 0.0;
-    var dp = 0.0;
-    for (var d = 0u; d < HD; d++) {
-      dot = dot + qr[d] * KB[s * KS + kv * HD + d];
-      dp = dp + go[d] * VB[s * KS + kv * HD + d];
+    var dotv = ${L.zero};
+    var dpv = ${L.zero};
+    for (var d = 0u; d < HDV; d++) {
+      dotv = dotv + qr[d] * KB[s * KSV + kv * HDV + d];
+      dpv = dpv + go[d] * VB[s * KSV + kv * HDV + d];
     }
     if (WINDOW != 0u && s + WINDOW <= t) { continue; } // key before this row's window
-    let ds = exp(dot * SCALE - lse) * (dp - dRow) * SCALE;
-    for (var d = 0u; d < HD; d++) { dq[d] = dq[d] + ds * KB[s * KS + kv * HD + d]; }
+    let ds = exp2((${L.sum("dotv")}) * SCALE2 - lse) * ((${L.sum("dpv")}) - dRow) * SCALE;
+    for (var d = 0u; d < HDV; d++) { dq[d] = dq[d] + ds * KB[s * KSV + kv * HDV + d]; }
   }
-  for (var d = 0u; d < HD; d++) {
-    DQ[t * QS + h * HD + d] = DQ[t * QS + h * HD + d] + dq[d];
+  for (var d = 0u; d < HDV; d++) {
+    DQ[t * QSV + h * HDV + d] = DQ[t * QSV + h * HDV + d] + dq[d];
   }
 }`;
 }
@@ -667,41 +780,71 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * Staging pays off here (unlike srcAttnFwd/srcAttnBwdDq, ~1.8x at T=4096):
  * each thread's scan starts at its own key t=s, so direct loads would be
  * wavefront-divergent; the shared tile re-aligns the whole block to one
- * uniform t range. Shared footprint 2·32·HD+64 f32 ≈ 8.3 KiB at HD=32, under
- * the 16 KiB spec-default maxComputeWorkgroupStorageSize. Tail threads
- * (s >= T) still run the cooperative loads: barriers must stay uniform.
+ * uniform t range. The tile depth BT is sized so the shared footprint always
+ * fits the 16 KiB spec-default maxComputeWorkgroupStorageSize (attnBwdTile);
+ * at HD=32 that is 32 rows and 8.3 KiB, at HD=64 it is 16 rows and 8.1 KiB.
+ * Tail threads (s >= T) still run the cooperative loads: barriers must stay
+ * uniform.
  */
 export function srcAttnBwdDkv(a: AttnDims): string {
+  const L = attnLanes(a);
+  // Two independent accumulation chains through the head dimension. Unlike the
+  // forward and dQ kernels (where it measured neutral), this one reads both dot
+  // operands from workgroup memory, and splitting the dependency chain lets the
+  // second load issue while the first is still in flight: 1.18-1.20x on M1 Max.
+  // Emitted only for an even lane count; the odd case keeps the single chain
+  // rather than carrying a tail term.
+  const BT = attnBwdTile(a);
+  const split = L.hdv % 2 === 0;
+  const dots = split
+    ? `          var dotv = ${L.zero};
+          var dpv = ${L.zero};
+          var dotv1 = ${L.zero};
+          var dpv1 = ${L.zero};
+          for (var d = 0u; d < HDV; d += 2u) {
+            dotv = dotv + Qs[b + d] * kr[d];
+            dpv = dpv + Gs[b + d] * vr[d];
+            dotv1 = dotv1 + Qs[b + d + 1u] * kr[d + 1u];
+            dpv1 = dpv1 + Gs[b + d + 1u] * vr[d + 1u];
+          }
+          dotv = dotv + dotv1;
+          dpv = dpv + dpv1;`
+    : `          var dotv = ${L.zero};
+          var dpv = ${L.zero};
+          for (var d = 0u; d < HDV; d++) {
+            dotv = dotv + Qs[b + d] * kr[d];
+            dpv = dpv + Gs[b + d] * vr[d];
+          }`;
   return `
-${bindF32(0, "QB", "read")}
-${bindF32(1, "KB", "read")}
-${bindF32(2, "VB", "read")}
-${bindF32(3, "GB", "read")}
+${bindLane(0, "QB", "read", L)}
+${bindLane(1, "KB", "read", L)}
+${bindLane(2, "VB", "read", L)}
+${bindLane(3, "GB", "read", L)}
 ${bindF32(4, "LSE", "read")}
 ${bindF32(5, "DB", "read")}
-${bindF32(6, "DK", "read_write")}
-${bindF32(7, "DV", "read_write")}
+${bindLane(6, "DK", "read_write", L)}
+${bindLane(7, "DV", "read_write", L)}
 ${attnConsts(a)}
-const BT: u32 = 32u;
-var<workgroup> Qs: array<f32, ${32 * a.hd}>;
-var<workgroup> Gs: array<f32, ${32 * a.hd}>;
-var<workgroup> Ls: array<f32, 32>;
-var<workgroup> Ds: array<f32, 32>;
+const BT: u32 = ${BT}u;
+var<workgroup> Qs: array<${L.ty}, ${BT * L.hdv}>;
+var<workgroup> Gs: array<${L.ty}, ${BT * L.hdv}>;
+var<workgroup> Ls: array<f32, ${BT}>;
+var<workgroup> Ds: array<f32, ${BT}>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: vec3<u32>) {
   let kv = wg.y;
   let s = wg.x * 64u + li.x;
   let live = s < T;
-  var kr: array<f32, HD>;
-  var vr: array<f32, HD>;
-  var dk: array<f32, HD>;
-  var dv: array<f32, HD>;
+  var kr: array<${L.ty}, HDV>;
+  var vr: array<${L.ty}, HDV>;
+  var dk: array<${L.ty}, HDV>;
+  var dv: array<${L.ty}, HDV>;
   if (live) {
-    for (var d = 0u; d < HD; d++) {
-      kr[d] = KB[s * KS + kv * HD + d];
-      vr[d] = VB[s * KS + kv * HD + d];
-      dk[d] = 0.0;
-      dv[d] = 0.0;
+    for (var d = 0u; d < HDV; d++) {
+      kr[d] = KB[s * KSV + kv * HDV + d];
+      vr[d] = VB[s * KSV + kv * HDV + d];
+      dk[d] = ${L.zero};
+      dv[d] = ${L.zero};
     }
   }
   // Under a sliding window, keys in this 64-block [wg.x*64, wg.x*64+63] are only
@@ -709,14 +852,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: 
   let t0End = select(T, min(T, wg.x * 64u + 64u + WINDOW), WINDOW != 0u);
   for (var h = kv * GROUP; h < kv * GROUP + GROUP; h++) {
     for (var t0 = wg.x * 64u; t0 < t0End; t0 += BT) {
-      for (var j = li.x; j < BT * HD; j += 64u) {
-        let t = t0 + j / HD;
-        let d = j % HD;
-        var qval = 0.0;
-        var gval = 0.0;
+      for (var j = li.x; j < BT * HDV; j += 64u) {
+        let t = t0 + j / HDV;
+        let d = j % HDV;
+        var qval = ${L.zero};
+        var gval = ${L.zero};
         if (t < T) {
-          qval = QB[t * QS + h * HD + d];
-          gval = GB[t * QS + h * HD + d];
+          qval = QB[t * QSV + h * HDV + d];
+          gval = GB[t * QSV + h * HDV + d];
         }
         Qs[j] = qval;
         Gs[j] = gval;
@@ -737,16 +880,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: 
         var tEnd = min(t0 + BT, T);
         if (WINDOW != 0u) { tEnd = min(tEnd, s + WINDOW); }
         for (var t = max(t0, s); t < tEnd; t++) {
-          let b = (t - t0) * HD;
-          var dot = 0.0;
-          var dp = 0.0;
-          for (var d = 0u; d < HD; d++) {
-            dot = dot + Qs[b + d] * kr[d];
-            dp = dp + Gs[b + d] * vr[d];
-          }
-          let p = exp(dot * SCALE - Ls[t - t0]);
-          let ds = p * (dp - Ds[t - t0]) * SCALE;
-          for (var d = 0u; d < HD; d++) {
+          let b = (t - t0) * HDV;
+${dots}
+          let p = exp2((${L.sum("dotv")}) * SCALE2 - Ls[t - t0]);
+          let ds = p * ((${L.sum("dpv")}) - Ds[t - t0]) * SCALE;
+          for (var d = 0u; d < HDV; d++) {
             dk[d] = dk[d] + ds * Qs[b + d];
             dv[d] = dv[d] + p * Gs[b + d];
           }
@@ -756,38 +894,74 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: 
     }
   }
   if (live) {
-    for (var d = 0u; d < HD; d++) {
-      DK[s * KS + kv * HD + d] = DK[s * KS + kv * HD + d] + dk[d];
-      DV[s * KS + kv * HD + d] = DV[s * KS + kv * HD + d] + dv[d];
+    for (var d = 0u; d < HDV; d++) {
+      DK[s * KSV + kv * HDV + d] = DK[s * KSV + kv * HDV + d] + dk[d];
+      DV[s * KSV + kv * HDV + d] = DV[s * KSV + kv * HDV + d] + dv[d];
     }
   }
 }`;
 }
 
-/** Per-row softmax + NLL; stashes probs for backward, per-row loss for reduce. */
+/** Threads per row in the cross-entropy kernels; also the reduction width. */
+const CE_WG = 256;
+
+/**
+ * Per-row softmax + NLL, one WORKGROUP per row (not one thread): every row is a
+ * V-long reduction, and at one thread per row the whole kernel ran on T threads
+ * with each lane striding V floats apart, so nothing coalesced and the GPU sat
+ * mostly idle. A workgroup per row makes consecutive lanes read consecutive
+ * logits and gives T*CE_WG-way parallelism.
+ *
+ * PROBS holds UNNORMALIZED exp(z - max) and INV holds each row's 1/Σ: the
+ * normalizing pass was a third full [T,V] read-modify-write whose only job was a
+ * divide the backward can apply from a per-row scalar. The loss comes straight
+ * from the row statistics, log(Σ) - (z_target - max), which also drops the
+ * epsilon the old form needed to survive log(0).
+ */
 export function srcCeFwd(T: number, V: number): string {
+  const g = gridRows(T);
   return `
 ${bindF32(0, "LOG", "read")}
 ${bindU32(1, "TGT")}
 ${bindF32(2, "PROBS", "read_write")}
 ${bindF32(3, "LT", "read_write")}
-const T: u32 = ${T}u; const V: u32 = ${V}u;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let t = gid.x;
-  if (t >= T) { return; }
+${bindF32(4, "INV", "read_write")}
+const T: u32 = ${T}u; const V: u32 = ${V}u; const GX: u32 = ${g.x}u;
+var<workgroup> red: array<f32, ${CE_WG}>;
+@compute @workgroup_size(${CE_WG})
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let t = wg.y * GX + wg.x;
+  if (t >= T) { return; }                              // uniform: barriers stay legal
+  let base = t * V;
   var mx = -3.0e38;
-  for (var v = 0u; v < V; v++) { mx = max(mx, LOG[t * V + v]); }
+  for (var v = li; v < V; v += ${CE_WG}u) { mx = max(mx, LOG[base + v]); }
+  red[li] = mx;
+  workgroupBarrier();
+  for (var stride = ${CE_WG / 2}u; stride > 0u; stride = stride >> 1u) {
+    if (li < stride) { red[li] = max(red[li], red[li + stride]); }
+    workgroupBarrier();
+  }
+  let m = red[0];
+  workgroupBarrier();  // red is reused for the sum below
   var sum = 0.0;
-  for (var v = 0u; v < V; v++) {
-    let e = exp(LOG[t * V + v] - mx);
-    PROBS[t * V + v] = e;
+  for (var v = li; v < V; v += ${CE_WG}u) {
+    let e = exp(LOG[base + v] - m);
+    PROBS[base + v] = e;
     sum = sum + e;
   }
-  for (var v = 0u; v < V; v++) { PROBS[t * V + v] = PROBS[t * V + v] / sum; }
-  let tgt = TGT[t];
-  if (tgt == 0xffffffffu) { LT[t] = 0.0; }             // ignore-index: no loss
-  else { LT[t] = -log(PROBS[t * V + tgt] + 1e-12); }
+  red[li] = sum;
+  workgroupBarrier();
+  for (var stride = ${CE_WG / 2}u; stride > 0u; stride = stride >> 1u) {
+    if (li < stride) { red[li] = red[li] + red[li + stride]; }
+    workgroupBarrier();
+  }
+  let s = red[0];
+  if (li == 0u) {
+    INV[t] = 1.0 / s;
+    let tgt = TGT[t];
+    if (tgt == 0xffffffffu) { LT[t] = 0.0; }           // ignore-index: no loss
+    else { LT[t] = log(s) - (LOG[base + tgt] - m); }
+  }
 }`;
 }
 
@@ -813,6 +987,7 @@ fn main() {
  * shared (srcCeReduce).
  */
 export function srcSoftCeFwd(T: number, V: number, K: number): string {
+  const g = gridRows(T);
   return `
 ${bindF32(0, "LOG", "read")}
 ${bindU32(1, "TID")}
@@ -820,30 +995,51 @@ ${bindF32(2, "TQ", "read")}
 ${bindF32(3, "PROBS", "read_write")}
 ${bindF32(4, "LT", "read_write")}
 ${bindF32(5, "SMASS", "read_write")}
-const T: u32 = ${T}u; const V: u32 = ${V}u; const K: u32 = ${K}u;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let t = gid.x;
-  if (t >= T) { return; }
+${bindF32(6, "INV", "read_write")}
+const T: u32 = ${T}u; const V: u32 = ${V}u; const K: u32 = ${K}u; const GX: u32 = ${g.x}u;
+var<workgroup> red: array<f32, ${CE_WG}>;
+@compute @workgroup_size(${CE_WG})
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let t = wg.y * GX + wg.x;
+  if (t >= T) { return; }                              // uniform: barriers stay legal
+  let base = t * V;
   var mx = -3.0e38;
-  for (var v = 0u; v < V; v++) { mx = max(mx, LOG[t * V + v]); }
+  for (var v = li; v < V; v += ${CE_WG}u) { mx = max(mx, LOG[base + v]); }
+  red[li] = mx;
+  workgroupBarrier();
+  for (var stride = ${CE_WG / 2}u; stride > 0u; stride = stride >> 1u) {
+    if (li < stride) { red[li] = max(red[li], red[li + stride]); }
+    workgroupBarrier();
+  }
+  let m = red[0];
+  workgroupBarrier();  // red is reused for the sum below
   var sum = 0.0;
-  for (var v = 0u; v < V; v++) {
-    let e = exp(LOG[t * V + v] - mx);
-    PROBS[t * V + v] = e;
+  for (var v = li; v < V; v += ${CE_WG}u) {
+    let e = exp(LOG[base + v] - m);
+    PROBS[base + v] = e;
     sum = sum + e;
   }
-  for (var v = 0u; v < V; v++) { PROBS[t * V + v] = PROBS[t * V + v] / sum; }
-  if (TID[t * K] == 0xffffffffu) { LT[t] = 0.0; SMASS[t] = 0.0; return; }  // ignored row
-  var acc = 0.0;
-  var mass = 0.0;
-  for (var j = 0u; j < K; j++) {
-    let q = TQ[t * K + j];
-    acc = acc - q * log(PROBS[t * V + TID[t * K + j]] + 1e-12);
-    mass = mass + q;
+  red[li] = sum;
+  workgroupBarrier();
+  for (var stride = ${CE_WG / 2}u; stride > 0u; stride = stride >> 1u) {
+    if (li < stride) { red[li] = red[li] + red[li + stride]; }
+    workgroupBarrier();
   }
-  LT[t] = acc;
-  SMASS[t] = mass;
+  let s = red[0];
+  if (li == 0u) {
+    INV[t] = 1.0 / s;
+    if (TID[t * K] == 0xffffffffu) { LT[t] = 0.0; SMASS[t] = 0.0; return; }  // ignored row
+    // -Σ q·log(p) with p = e/Σ, expanded so no probability is ever read back.
+    var acc = 0.0;
+    var mass = 0.0;
+    for (var j = 0u; j < K; j++) {
+      let q = TQ[t * K + j];
+      acc = acc - q * (LOG[base + TID[t * K + j]] - m);
+      mass = mass + q;
+    }
+    LT[t] = acc + mass * log(s);
+    SMASS[t] = mass;
+  }
 }`;
 }
 
@@ -856,6 +1052,7 @@ ${bindF32(2, "SMASS", "read")}
 ${bindF32(3, "LG", "read")}
 ${bindF32(4, "DIV", "read")}
 ${bindF32(5, "DLOG", "read_write")}
+${bindF32(6, "INV", "read")}
 const N: u32 = ${T * V}u; const V: u32 = ${V}u; const K: u32 = ${K}u;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -863,7 +1060,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (i >= N) { return; }
   let t = i / V;
   if (TID[t * K] == 0xffffffffu) { return; }           // ignored row: no gradient
-  DLOG[i] = DLOG[i] + (LG[0] / DIV[0]) * SMASS[t] * PROBS[i];
+  DLOG[i] = DLOG[i] + (LG[0] / DIV[0]) * SMASS[t] * PROBS[i] * INV[t];
 }`;
 }
 
@@ -900,6 +1097,7 @@ ${bindU32(1, "TGT")}
 ${bindF32(2, "LG", "read")}
 ${bindF32(3, "DIV", "read")}
 ${bindF32(4, "DLOG", "read_write")}
+${bindF32(5, "INV", "read")}
 const N: u32 = ${T * V}u; const T: u32 = ${T}u; const V: u32 = ${V}u;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -911,6 +1109,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let v = i % V;
   var ind = 0.0;
   if (v == tgt) { ind = 1.0; }
-  DLOG[i] = DLOG[i] + (LG[0] / DIV[0]) * (PROBS[i] - ind);
+  DLOG[i] = DLOG[i] + (LG[0] / DIV[0]) * (PROBS[i] * INV[t] - ind);
 }`;
 }

@@ -58,6 +58,7 @@ deno run -A cli.ts pretrain --data your.tokens --out out/continued.gguf \
 | `inspect`                     | a GGUF's metadata, shape, and the flags needed to resume it                                                      |
 | `export`                      | re-export under a release name, with quants                                                                      |
 | `archs`                       | list the architectures this build can train                                                                      |
+| `bench`                       | time the WebGPU kernels at fixed shapes, before and after a change                                               |
 | `demo`                        | the install check                                                                                                |
 | `style-seed`, `style-restyle` | optional: build a chat corpus rewritten in one author's voice (needs the [pi](https://pi.dev/) coding agent CLI) |
 
@@ -81,7 +82,7 @@ Each architecture is a single file in `src/arch/` plus one line in the registry,
 
 ## Honest limits
 
-- Single-digit to low-hundreds of millions of parameters. At 94.7M on one APU it does ~900 tokens/s, so 2B tokens takes about 25 days. JS and WebGPU won't match a CUDA cluster, and no flag changes that.
+- Single-digit to low-hundreds of millions of parameters. At 94.7M on one APU it did ~900 tokens/s on the kernels the published model was trained with, so 2B tokens took about 25 days; the kernels have since been vectorized (2.4x on an M1 Max) but nobody has re-run the APU number. Either way, JS and WebGPU won't match a CUDA cluster, and no flag changes that.
 - Training keeps float master weights and quantizes at export, so you can't really train in Q4_0.
 - Context length is capped by a WebGPU buffer limit, before compute becomes the problem: 8192 on adapters that grant their full buffer size, 2500-3000 on the ones that don't.
 - The GGUF output is structurally verified here, but please check it against `llama-cli` before trusting a specific build.
