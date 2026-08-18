@@ -19,6 +19,7 @@
 // rows sit at init until a fine-tune first uses them.
 
 import { readGGUF } from "../gguf/gguf.ts";
+import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
 import { crossEntropy, mulberry32 } from "../model/autograd.ts";
@@ -54,11 +55,6 @@ const TRAIN_SAMPLE_MB = 12; // BPE converges on a few MB; no need to scan the wh
 function die(msg: string): never {
   throw new UsageError(msg);
 }
-function argmax(row: Float32Array): number {
-  let best = 0;
-  for (let i = 1; i < row.length; i++) if (row[i] > row[best]) best = i;
-  return best;
-}
 async function fileExists(path: string): Promise<boolean> {
   // Stat, don't read: the optimizer-state sidecar is a multi-hundred-MB binary
   // blob, and decoding it as UTF-8 to test existence overflows V8's max string
@@ -68,7 +64,12 @@ async function fileExists(path: string): Promise<boolean> {
   return fs.existsSync(path);
 }
 
-/** Greedy continuation with the GPU forward (one sync/token); stops at eos. */
+/**
+ * End-of-run sample with the GPU forward (one sync/token); stops at eos.
+ *
+ * Uses SAMPLE_PRESET rather than bare greedy: this line is read as a quality
+ * signal, and an unpenalized base model loops on one sentence for all 60 tokens.
+ */
 async function generateGpu(
   gpu: WebGPUBackend,
   model: LanguageModel,
@@ -76,24 +77,14 @@ async function generateGpu(
   prompt: string,
   n: number,
 ): Promise<string> {
-  const ids = tok.encode(prompt);
   gpu.install();
   try {
     gpu.uploadParams(model.params());
-    for (let i = 0; i < n; i++) {
-      const ctx = ids.slice(-model.cfg.maxSeq);
-      const logits = model.forward(ctx);
-      await gpu.sync([logits]);
-      const V = model.cfg.vocabSize;
-      const base = (ctx.length - 1) * V;
-      const next = argmax(logits.data.subarray(base, base + V));
-      ids.push(next);
-      if (next === tok.eosId) break;
-    }
+    const ids = await greedyComplete(model, gpu, tok.encode(prompt), n, [tok.eosId], SAMPLE_PRESET);
+    return tok.decode(ids);
   } finally {
     gpu.uninstall();
   }
-  return tok.decode(ids);
 }
 
 /** Train the shared tokenizer (stage 0) if absent, else load it. Reserves the
