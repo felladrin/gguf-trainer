@@ -11,8 +11,9 @@
 // `tokenize` reads the output unchanged.
 //
 // PIPPA's `bot_definitions` carries Character.AI's own formatting (the {{char}}
-// and {{user}} placeholders, END_OF_DIALOG between example chats); the paper's
-// Appendix A says to preprocess it, and normalizeDefinitions below is that step.
+// and {{user}} placeholders and their many hand-typed variants, END_OF_DIALOG
+// between example chats); the paper's Appendix A says to preprocess it, and
+// substitute/normalizeDefinitions below are that step.
 //
 //   deno run tests/rp-corpus.ts     # the pure rendering logic, no download
 
@@ -50,15 +51,54 @@ export const DEFAULT_RENDER: RenderOpts = { maxChars: 40000, minAsciiRatio: 0.9,
 
 export type Rendered = { text: string } | { reject: string };
 
-/** Character.AI's placeholders, plus the doc marker (an embedded one would forge
- * a false document boundary downstream). */
+/** Macro bodies that name the character. PIPPA has {{c}} and {{char_1}} beside
+ * the documented {{char}}. */
+const BOT_ALIAS = /^(?:char[_ ]?\d*|c|bot|character)$/i;
+/** Macro bodies that name the human: {{u}}, {{u01}}, {{user_3}}, and four
+ * misspellings of {{random_user_N}}. */
+const USER_ALIAS = /^(?:you|u\d*|users?|usser|(?:random[_ ]?)?user[_ ]?\d*)$/i;
+/** A double-delimiter macro, tolerating the mixed pairs people typed by accident
+ * ({{char]}, {[char}}, {{char]]). The opening brace is required, so the [[...]]
+ * some cards use for something else is left alone. */
+const MACRO = /\{[{[]([^{}[\]\n]{1,60})[}\]][}\]]/g;
+/** A single-brace macro. Only substituted when it names someone, because braces
+ * in this corpus also carry prose ({smiles}) and the W++ persona notation. */
+const SINGLE_MACRO = /\{([^{}[\]\n]{1,40})\}/g;
+/** A pasted reference link (wikis, YouTube, Reddit), with its wrapping bracket
+ * when it has one. */
+const URL_REF = /\s*[([]?\s*https?:\/\/[^\s)\]]+[)\]]?/gi;
+
+/** Who a macro names, or null when it names no one. A trailing colon belongs to
+ * the speaker label, not to the name, so it survives the lookup. */
+function macroName(inner: string, botName: string): string | null {
+  const trimmed = inner.trim();
+  const colon = trimmed.endsWith(":") ? ":" : "";
+  const key = (colon ? trimmed.slice(0, -1) : trimmed).trim();
+  if (BOT_ALIAS.test(key) || key.toLowerCase() === botName.toLowerCase()) return botName + colon;
+  if (USER_ALIAS.test(key)) return USER_NAME + colon;
+  return null;
+}
+
+/**
+ * Character.AI's placeholders, pasted reference links, and the doc marker (an
+ * embedded one would forge a false document boundary downstream).
+ *
+ * Resolving only the documented {{char}} and {{user}} is not enough. PIPPA's
+ * cards carry 60 other spellings, and the render left 4,719 macros standing
+ * across 5.6% of documents; a 94.7M model trained on that emitted "{{u01}}:" as
+ * a speaker name, which breaks the "Name:" turn structure a horde client parses.
+ * So the rule for a double-delimiter macro is: resolve the aliases we can name,
+ * unwrap everything else (another character's name, or a stage direction someone
+ * put in braces), and let no brace through. Single braces get the narrower
+ * treatment, since in this corpus they are usually not macros at all.
+ */
 export function substitute(text: string, botName: string): string {
   return text
-    .replaceAll(/\{\{char\}\}/gi, botName)
-    .replaceAll(/\{\{user\}\}/gi, USER_NAME)
-    .replaceAll(/\{\{random_user_\d+\}\}/gi, USER_NAME)
+    .replaceAll(MACRO, (_, inner: string) => macroName(inner, botName) ?? inner.trim())
+    .replaceAll(SINGLE_MACRO, (whole, inner: string) => macroName(inner, botName) ?? whole)
     .replaceAll(/<BOT>/g, botName)
     .replaceAll(/<USER>/g, USER_NAME)
+    .replaceAll(URL_REF, "")
     // Only the renderer gets to emit <START> and the document separator, so a
     // log that happens to contain either cannot move a boundary.
     .replaceAll(/<START>/gi, " ")
