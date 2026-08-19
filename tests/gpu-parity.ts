@@ -660,6 +660,7 @@ async function main() {
   await gemma3ModelParity(gpu);
   await accumulationParity(gpu);
   await reclaimTransientsParity(gpu);
+  await checkpointCadence(gpu);
 
   // 6. Attention kernels (appended by the tiling task):
   //    (a) Materialized path at small T (T < attnFlashMinT): non-multiples of
@@ -1133,4 +1134,65 @@ async function syncFenceGate(gpu: WebGPUBackend) {
   }
   if (!ok) failures++;
   console.log(`  ${ok ? "ok " : "FAIL"} sync() fences GPU even with no readback`);
+}
+
+/**
+ * The two checkpoint triggers, and the fact that either one fires a write.
+ * The wall-clock trigger exists because a step count is a proxy for time that
+ * stops holding the moment step time changes, so a long run bounds what an
+ * interruption costs in minutes instead. ANDing the triggers rather than ORing
+ * them would quietly stretch that bound back out to the step cadence, which is
+ * a silent failure everywhere except here.
+ */
+async function checkpointCadence(gpu: WebGPUBackend) {
+  const cfg = microConfig();
+  const rngTok = mulberry32(0x5ec2);
+  const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
+  const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
+
+  const firedAt = async (cadence: { checkpointEvery?: number; checkpointEveryMs?: number }) => {
+    const model = new Gemma3Model(cfg, mulberry32(5));
+    const g = model.paramGroups();
+    const hit: number[] = [];
+    await trainLMGpuResident(model, gpu, {
+      tokens,
+      seqLen: 8,
+      steps: 6,
+      batchPerStep: 1,
+      optimizer: new MuonGpu(gpu, g.muon, g.aux, hyper),
+      logEvery: 100,
+      rng: mulberry32(7),
+      onCheckpoint: (step) => {
+        hit.push(step);
+      },
+      ...cadence,
+    });
+    return hit;
+  };
+
+  // A step takes milliseconds, so 1e-3 ms is due at every step and 1e9 ms at none.
+  const cases: [string, { checkpointEvery?: number; checkpointEveryMs?: number }, number[]][] = [
+    ["steps only", { checkpointEvery: 2 }, [2, 4]],
+    ["wall clock only", { checkpointEveryMs: 1e-3 }, [1, 2, 3, 4, 5]],
+    ["both, only steps due", { checkpointEvery: 2, checkpointEveryMs: 1e9 }, [2, 4]],
+    ["both, only the clock due", { checkpointEvery: 1e9, checkpointEveryMs: 1e-3 }, [
+      1,
+      2,
+      3,
+      4,
+      5,
+    ]],
+    ["neither set", {}, []],
+    ["clock set but never due", { checkpointEveryMs: 1e9 }, []],
+  ];
+
+  for (const [why, cadence, want] of cases) {
+    const got = await firedAt(cadence);
+    const ok = JSON.stringify(got) === JSON.stringify(want);
+    if (!ok) {
+      failures++;
+      console.log(`    MISMATCH ${why}: fired at [${got}], expected [${want}]`);
+    }
+    console.log(`  ${ok ? "ok " : "FAIL"} checkpoint cadence (${why})`);
+  }
 }
