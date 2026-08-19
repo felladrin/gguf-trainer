@@ -201,27 +201,14 @@ it: on one box it is out of reach. Reaching ~100 tokens/param is two months and 
 this ladder actually available. That, not architecture and not hyperparameters, is the ceiling on
 quality here.
 
-**External evidence, weighed (2026-08-19).** Two community posts were read for lessons; neither is
-peer-reviewed and both are recorded here as external claims, not as measurements of ours.
-
-[Extreme overtraining in tiny language models](https://huggingface.co/blog/Banaxi-Tech/ovdadadadd)
-(Banaxi-Tech, 2026-08-12) trains a 0.9M-param model to 200B tokens (222,000:1) and reports a custom
-composite index peaking at 20B tokens (22,000:1) then falling 27% by 180B. Read the direction, not
-the number: it is one run at one model size with a bespoke metric, no code and no citations, so
-carrying 22,000:1 across to 94.7M params (which would be 2.1T tokens) is not something its data
-supports. What it does corroborate, alongside SmolLM2, is that the useful ratio for small models
-sits orders of magnitude above Chinchilla, and that a far end exists where more tokens start to
-hurt. We are at the opposite end of that range, by more than a factor of a thousand.
-
-[Training a 2.7B MoE from scratch for $200](https://huggingface.co/blog/vovaRL/hybernation-models-blog)
-(vovaRL, 2026-07-29) is mostly not transferable: relay training across contributors' rented GPUs and
-MoE routing are both out of scope for a single-box dense trainer in portable WGSL. Two points carry.
-It chooses WSD over cosine specifically so a run can be stopped and resumed at leg boundaries, which
-is now this project's normal operating mode and independently supports the schedule already in use.
-And it insists on measuring under enforced memory limits instead of trusting the OS page cache,
-which generalizes to a rule worth holding here: an A/B taken while the box is doing something else
-measures the something else. Kernel comparisons in this file are taken on an idle GPU for that
-reason, and one taken during a live training run has already been seen to invert.
+There is also a far end to this, which is worth knowing about even though it is not the end we are
+near. [Extreme overtraining in tiny language models](https://huggingface.co/blog/Banaxi-Tech/ovdadadadd)
+(2026-08-12) reports a 0.9M-param model whose scores peak around 22,000 tokens/param and decline
+from there out to 222,000. That measurement is at 0.9M params, so the ratio itself does not carry to
+94.7M (it would imply 2.1T tokens), and it is a single external run rather than something measured
+here. The direction is what matters, and it agrees with SmolLM2: the useful ratio for small models
+sits orders of magnitude above Chinchilla, with an eventual point of diminishing returns. We are at
+the opposite end of that range by more than a factor of a thousand.
 
 ## Correctness / robustness
 
