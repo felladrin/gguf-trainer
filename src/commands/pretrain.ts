@@ -383,6 +383,14 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const ckptEvery = flags.get("ckpt")
     ? Number(flags.get("ckpt"))
     : Math.min(1000, Math.max(1, Math.round(steps / 20)));
+  // Opt-in wall-clock cadence, so what an interruption costs is bounded in
+  // minutes rather than in steps. Both can be on; either one fires a write.
+  const ckptEveryMs = v.has("checkpoint-every-minutes")
+    ? v.num("checkpoint-every-minutes") * 60_000
+    : undefined;
+  if (ckptEveryMs !== undefined && !(ckptEveryMs > 0)) {
+    die("--checkpoint-every-minutes must be greater than 0");
+  }
 
   // Peak resident GPU storage-buffer memory (pool + optimizer state). Both only
   // grow, so this is the peak, and the headroom-to-ceiling signal for sizing the
@@ -414,6 +422,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     logEvery: Math.max(1, Math.round(steps / 100)),
     rng: mulberry32(7 + startStep), // vary batches across resume segments
     checkpointEvery: ckptEvery,
+    checkpointEveryMs: ckptEveryMs,
     onCheckpoint: async (localStep) => {
       const b = await exportGGUF();
       const optBytes = await writeOptState();
@@ -573,6 +582,12 @@ const SHARED_FLAGS: Flag[] = [
     describe: "write the GGUF every N steps (default: min(1000, steps/20))",
   },
   {
+    name: "checkpoint-every-minutes",
+    type: "number",
+    placeholder: "MIN",
+    describe: "also write it whenever this many minutes have passed since the last one",
+  },
+  {
     name: "checkpoint-precision",
     type: "string",
     placeholder: "f32|f16",
@@ -633,7 +648,9 @@ compute with the field that differs. Put the checkpoint's .optstate sidecar next
 the optimizer resumes warm.
 
 The run writes its GGUF every --checkpoint-every steps, atomically, so an interrupted run
-always leaves a loadable model plus an .optstate to resume from.`,
+always leaves a loadable model plus an .optstate to resume from. Add
+--checkpoint-every-minutes to write on wall clock as well, which is the cadence to set when
+you care about how much work an interruption costs rather than how many steps it costs.`,
   examples: [
     "pretrain --data corpus.tokens --out model.gguf --steps 20000 --hidden 640 --layers 12",
     "pretrain --data more.tokens --out continued.gguf --steps 5000 --hidden 640 --layers 12 --resume Minueza-3-95M-Base.F32.gguf",

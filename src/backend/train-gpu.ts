@@ -98,8 +98,15 @@ export interface TrainGpuResidentOpts {
    * Mid-run checkpoint: every `checkpointEvery` steps, sync the device-resident
    * weights back to the host and call `onCheckpoint` (e.g. to export a GGUF), so
    * a long run survives interruption. Skipped when either is unset.
+   *
+   * `checkpointEveryMs` is the wall-clock companion; either trigger fires one.
+   * A step count only stands in for time, and stops standing in for it the
+   * moment step time changes (faster kernels, a different sequence length, a
+   * busier box), while what a long run wants to bound is how much work an
+   * interruption costs in minutes.
    */
   checkpointEvery?: number;
+  checkpointEveryMs?: number;
   onCheckpoint?: (step: number) => void | Promise<void>;
   /**
    * WSD decay-phase data injection (MiniCPM / Xmodel-2 trick): from `injectFromStep`
@@ -158,6 +165,7 @@ export async function trainLMGpuResident(
   const injectMaxStart = inject ? inject.length - opts.seqLen - 1 : 0;
 
   const history: { step: number; loss: number }[] = [];
+  let lastCheckpointAt = performance.now();
 
   // MuonClip reads/rewrites qNorm/kNorm on the host, but they are device-resident
   // now (AdamWGpu), so when clipping is on we read just those tiny norm tensors
@@ -217,12 +225,13 @@ export async function trainLMGpuResident(
         opts.onLog?.(step, avg);
       }
 
-      if (
-        opts.onCheckpoint && opts.checkpointEvery && step > 0 &&
-        step % opts.checkpointEvery === 0
-      ) {
+      const dueByStep = !!opts.checkpointEvery && step % opts.checkpointEvery === 0;
+      const dueByTime = !!opts.checkpointEveryMs &&
+        performance.now() - lastCheckpointAt >= opts.checkpointEveryMs;
+      if (opts.onCheckpoint && step > 0 && (dueByStep || dueByTime)) {
         await opt.syncWeightsToHost(); // pull device-resident weights before export
         await opts.onCheckpoint(step);
+        lastCheckpointAt = performance.now();
       }
     }
   } finally {
