@@ -48,7 +48,7 @@ all, so expect repetition here even from a healthy checkpoint. Judge coherence o
 first sentence or two; for readable output, export the model and run llama.cpp with a
 repetition penalty.`,
   examples: [
-    'generate --model model.gguf --prompt "Once upon a time"',
+    'generate --model model.gguf --prompt "Once upon a time, there was a little"',
     'generate --model model.gguf --prompt "The capital of France is" --max-tokens 40 --cpu',
   ],
   flags: [
