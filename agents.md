@@ -240,7 +240,7 @@ src/data/           token files, chat templates, HF dataset fetching and parsing
 tests/              gradcheck (finite differences), gpu-parity (GPU vs CPU), pure-logic checks
 docs/               how to add an architecture, design rationale, optimization notes
 docs/notes/         point-in-time records of the Minueza-3 run, kept as evidence
-scripts/            eval-completions.sh, plus the historical Minueza-3 run scripts
+scripts/            the eval batteries and corpus builders, plus the historical Minueza-3 run scripts
 ```
 
 ## Rules for changing this code
