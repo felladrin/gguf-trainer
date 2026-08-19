@@ -19,15 +19,27 @@ architecture and `readme.md` "Honest limits" for the ceiling this project accept
 | Attention share of runtime | ~78%                     | kernel profiling, `timestamp-query`                 |
 | f16 vs f32 compute         | same speed               | attention-bound; f16 only speeds the ~9% GEMM slice |
 
-> The attention, GEMM and cross-entropy kernels were rewritten on 2026-08-18 (see lever 1 below);
-> every row above predates that and describes the old kernels. The shape of the conclusions holds,
-> the absolute numbers do not. Re-measure on Strix with `bench` before quoting them.
+> SUPERSEDED (2026-08-19). Every row above predates the 2026-08-18 kernel rewrite, and the two
+> conclusions that used to follow from it are no longer true. Kept for the record; read the block
+> below instead.
 
-Two facts follow from this and drive everything below:
+## Measured baseline (2026-08-19, post-rewrite, Strix)
 
-1. **We are compute-bound on attention, not memory-bound.** The GPU is pinned at 100% while only
-   ~30% of RAM is in use. More memory or a bigger batch cannot raise tokens/second: only cheaper
-   attention can.
+| Metric                  | Value                     | How measured                                       |
+| :---------------------- | :------------------------ | :------------------------------------------------- |
+| Throughput              | 0.0969 st/s (10.6 s/step) | 94.7M, seq 2048, batch 8, instantaneous            |
+| Throughput              | 1588 tok/s (1.71x)        | against 903 tok/s on the old kernels               |
+| GPU busy                | **~42%**                  | `gpu_busy_percent`, 20 samples, live run alone     |
+| Host CPU                | ~400% of 32 cores         | `top` on the trainer process                       |
+| Host RSS                | 34.9 GB                   | `smaps_rollup` of the training process             |
+| Peak GPU (pool + state) | 39.3 GB                   | trainer's own readout, unchanged                   |
+| Profiled kernel time    | ~330 ms of a 10.6 s step  | `bench`, idle GPU, summed over a step's dispatches |
+
+The two facts that now drive everything below:
+
+1. **The step is host-bound, not GPU-bound.** The GPU idles ~58% of the time while four host cores
+   stay busy. Cheaper kernels can no longer raise tokens/second on this box; only cheaper host work
+   can. See lever 1c, which is where the time actually goes.
 2. **Batch is sequential gradient accumulation, not a real batch dimension.** The training loop runs
    one sequence per forward/backward and sums the gradients (`train-gpu.ts`), so batch size trades
    step count for per-step time at a fixed tokens/second. It changes gradient noise, not throughput.
@@ -96,10 +108,30 @@ End-to-end, 8 real pretrain steps at the 95M geometry, seq 2048, batch 2, on the
 **204 -> 490 tokens/s (2.40x)**, with the per-step loss identical to four decimals at every step and
 identical peak memory.
 
-NOT YET MEASURED ON STRIX: the numbers above are M1 Max (Metal). The changes are machine-independent
-in kind (fewer instructions for the same arithmetic, no vendor path), but the _share_ each one buys
-depends on the silicon, and the Strix box was mid-run. Re-run `bench` there and record the numbers
-before quoting a speedup for the AMD target.
+MEASURED ON STRIX (2026-08-19, idle GPU, min of 4 runs x 8 iterations), which the M1 Max table above
+had been missing:
+
+| kernel                            | GPU ms |
+| :-------------------------------- | -----: |
+| `linear`, tied readout, fwd + bwd |  5.322 |
+| `attention.bwdDkv`, dense         |  1.177 |
+| `crossEntropy`, T=2048 V=32768    |  0.769 |
+| `attention.bwdDkv`, window 1024   |  0.730 |
+| `attention.bwdDq`, dense          |  0.469 |
+| `attention.fwd`, dense            |  0.440 |
+| `linear`, FFN up, fwd + bwd       |  0.363 |
+| `attention.bwdDq`, window 1024    |  0.301 |
+| `attention.fwd`, window 1024      |  0.263 |
+| `linear`, QKV, fwd + bwd          |  0.182 |
+| `rmsnorm`                         |  0.038 |
+
+End to end the rewrite is **1.71x on Strix** (903 -> 1588 tok/s), against 2.40x on the M1 Max. The
+startup parity probe also tightened from |Δ|=6.0e-5 to |Δ|=2.4e-7, which is the exp2-domain softmax
+and the independent vec4 accumulation chains being more accurate, not only faster.
+
+The ranking inverted in the process: the tied readout GEMM is now 4.5x the largest attention kernel,
+so "attention is ~78% of runtime" no longer describes this trainer. It is also moot, because the
+whole kernel column sums to ~330 ms of a 10.6 s step (lever 1c).
 
 Still standing, and still a research effort: the O(T^2) pair count itself. CONSTRAINT unchanged:
 only approaches that stay portable, plain WGSL that runs cross-vendor (AMD/Apple/NVIDIA), no vendor
@@ -131,19 +163,88 @@ third pass over `[T,V]` existed only to apply a divide that the backward can app
 That also removes the `+1e-12` the loss needed to survive `log(0)`, since the loss is now
 `log(sum) - (z_target - max)` straight from the row statistics.
 
+A LARGER GEMM TILE WAS MEASURED AND REJECTED (2026-08-19). Six configurations, on Strix, comparing
+the `linear` kernel column:
+
+| BM/BN/BK/TM/TN         |    LDS | readout | ffn-up |   qkv |
+| :--------------------- | -----: | ------: | -----: | ----: |
+| 64/64/16/4/4 (current) |  8 KiB |   5.328 |  0.381 | 0.182 |
+| 128/128/16/8/8         | 16 KiB |   5.724 |  0.324 | 0.187 |
+| 128/128/8/8/8          |  8 KiB |   5.385 |  0.331 | 0.183 |
+| 64/64/8/4/4            |  4 KiB |    6.41 |   0.49 |  0.20 |
+| 128/64/16/8/4          | 12 KiB |    5.91 |   0.39 |  0.20 |
+| 64/128/16/4/8          | 12 KiB |    6.44 |   0.47 |  0.21 |
+
+A 128x128 tile with an 8x8 micro-tile fits the 16 KiB portable floor at 256 threads, so it was the
+obvious candidate. It makes the readout GEMM WORSE and buys ~0.06 ms on the FFN GEMM, which is ~1.4
+ms per micro-batch out of ~1500. Not applied.
+
+Worth recording is how close this came to landing. An identical A/B run while a training run had the
+GPU showed the readout going 5.60 -> 5.24 and looked like a clean 1.07x across all three shapes; the
+direction reversed once the GPU was idle. An A/B taken while the box is doing something else
+measures the something else. Kernel numbers in this file are min-of-4 on an idle GPU for that
+reason.
+
+Also note the device is running at the WebGPU portable defaults, not at what the hardware offers:
+`initWebGPU` requests only the buffer limits, so the granted `maxComputeWorkgroupStorageSize` is
+16 KiB against an adapter maximum of 64 KiB, `maxComputeInvocationsPerWorkgroup` is 256 against
+1024, and `shader-f16` is supported but never requested. The startup banner reports the granted
+values, which reads as a hardware statement but is really a statement about what was asked for.
+Raising them is only worth doing if a kernel is ever the constraint again, and the 16 KiB floor is a
+deliberate portability invariant that `tests/kernel-limits.ts` guards, so any use of more would have
+to be adaptive rather than a raised floor.
+
 Bind-group caching for the main loop (the `prepareDispatch` pattern the optimizers use) was measured
 and NOT done: instrumenting `createBindGroup` over a real run gives 2346 calls and 71.5 ms per step
 against an ~18 s step, i.e. 0.4%. It is also the exact pattern `prepareDispatch` warns about, since
 the main loop's buffers are pooled transients that get recycled. Revisit only if the per-step GPU
 work drops by an order of magnitude.
 
-### 2. True micro-batching (medium, uncertain payoff)
+### 1c. The step is host-bound: where the 10.6 s actually goes (2026-08-19)
+
+Wiring up the `onStepTime` hook the trainer already exposes, then splitting the phase inside the
+micro-batch loop:
+
+| phase                                        |           time |
+| :------------------------------------------- | -------------: |
+| optimizer (Muon + AdamW, all 28 tensors)     |           5 ms |
+| `model.forward()`, per micro-batch, x8       | 1400 - 1650 ms |
+| `backward()`, per micro-batch, x8            |     11 - 20 ms |
+| end-of-step `gpu.sync()` (all GPU execution) |        1150 ms |
+
+`model.forward()` is the whole step, and it is host time spent recording dispatches, not GPU time.
+Proxying the ops backend shows it is not one op either: the cost tracks tensor size across all of
+them (`linear` 235 ms over 85 calls, `rmsNorm` 36 ms over 49, `gelu` 34 ms over 12).
+
+That points at allocation, and the `Tensor` constructor is why:
+
+```ts
+this.data = data;
+this.grad = new Float32Array(data.length);
+```
+
+Every tensor gets TWO full-size host `Float32Array`s, including every intermediate activation under
+the GPU backend, where both live on the device and are never read. Measured: **one forward allocates
+4.34 GB of host array across 244 tensors.** Eight micro-batches are retained for the accumulation
+step, so a step churns ~35 GB, which is exactly the 34.9 GB resident above.
+
+Honest accounting: warm-page allocation of 4.34 GB costs 2-4 ms, cold costs 126 ms, and an isolated
+forward's op overhead is ~400 ms. That explains ~500 ms of the ~1500 ms per micro-batch. The
+remainder is most likely GC against ~35 GB of live arrays, but that is NOT proven and should not be
+quoted as if it were.
+
+The fix this implies is lazy `data`/`grad` allocation, so a tensor materializes host storage only
+when something reads it: unchanged under the CPU backend, and under the GPU backend only synced
+tensors ever allocate. Not built yet, and it is the largest lever measured so far.
+
+### 2. True micro-batching (superseded premise, 2026-08-19)
 
 Packing the `batchPerStep` sequences into one real batch dimension would enlarge the GEMMs and cut
-per-launch + sync overhead. But GEMM is only ~9% of runtime and the GPU is already saturated at
-batch 1, so the upside is capped by how much launch/sync overhead actually exists. Worth a
-measurement spike (time seq 2048 at batch 1 vs the per-sequence cost inside batch 8) before
-committing to the rewrite of the model forward.
+per-launch + sync overhead. The old reasoning against it was that "GEMM is only ~9% of runtime and
+the GPU is already saturated at batch 1": the GPU is NOT saturated, it idles ~58%. But the
+conclusion survives for a different reason, which is that GPU work is only ~330 ms of the step at
+all, so enlarging the GEMMs cannot buy much either. Fix lever 1c first, then re-ask this one against
+whatever the profile looks like afterwards.
 
 ## Memory / scale levers
 
@@ -218,6 +319,33 @@ Checkpoints now write a `<ckpt>.optstate` sidecar (Muon momentum + Adam moments 
 weights and restore it on `--resume`; absent -> cold start as before. `readStateBuffer` in the
 backend does the readback. Validated: bit-exact round-trip, GPU parity unchanged, end-to-end resume.
 (Phase A's early checkpoints predate this and have no sidecar, so they resume cold.)
+
+### 5b. A resumed segment runs 15% slow for its first ~750 steps (2026-08-19)
+
+Two independent resumes of the same run, from different checkpoints, both spent ~750 local steps at
+0.084 st/s and then stepped to 0.0969 within one 75-step logging interval, landing on an identical
+plateau:
+
+| local step in segment | segment from 1000 | segment from 4350 |
+| --------------------: | ----------------: | ----------------: |
+|                   750 |            0.0850 |            0.0839 |
+|                   825 |            0.0962 |            0.0954 |
+|                   900 |            0.0969 |            0.0969 |
+
+Reproducible to the same local step across two segments, so it is step-keyed and deterministic, not
+thermal or environmental. **The operational consequence: every restart costs ~21 minutes of
+throughput on top of the steps it loses**, which is far more than the 30-minute checkpoint window
+suggests. Do not stop a run casually.
+
+Cause NOT identified. Ruled out: the LR schedule (correctly offset, `schedule = (localStep) =>
+fullSchedule(startStep + localStep)`, so warmup ends at a global step both segments were long past),
+memory pressure (PSI zero across cpu/memory/io, no direct reclaim, no swap), thermals, competing
+processes, and transparent hugepages (madvise mode, the trainer holds zero). V8 heap growth is also
+unlikely: RSS is byte-identical before and after the jump.
+
+Confounded and untested: checkpoints land every ~152 steps at this cadence, so the fifth one falls
+at local step ~750 in both segments. "Fifth checkpoint" and "local step 750" are the same event in
+this data. A segment run with a different `--checkpoint-every-minutes` would separate them for free.
 
 ### 6. rsync hygiene (cheap)
 
