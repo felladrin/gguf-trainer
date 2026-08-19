@@ -25,15 +25,15 @@ architecture and `readme.md` "Honest limits" for the ceiling this project accept
 
 ## Measured baseline (2026-08-19, post-rewrite, Strix)
 
-| Metric                  | Value                     | How measured                                       |
-| :---------------------- | :------------------------ | :------------------------------------------------- |
-| Throughput              | 0.0969 st/s (10.6 s/step) | 94.7M, seq 2048, batch 8, instantaneous            |
-| Throughput              | 1588 tok/s (1.71x)        | against 903 tok/s on the old kernels               |
-| GPU busy                | **~42%**                  | `gpu_busy_percent`, 20 samples, live run alone     |
-| Host CPU                | ~400% of 32 cores         | `top` on the trainer process                       |
-| Host RSS                | 34.9 GB                   | `smaps_rollup` of the training process             |
-| Peak GPU (pool + state) | 39.3 GB                   | trainer's own readout, unchanged                   |
-| Profiled kernel time    | ~330 ms of a 10.6 s step  | `bench`, idle GPU, summed over a step's dispatches |
+| Metric                  | Value                     | How measured                                                          |
+| :---------------------- | :------------------------ | :-------------------------------------------------------------------- |
+| Throughput              | 0.0969 st/s (10.6 s/step) | 94.7M, seq 2048, batch 8, instantaneous                               |
+| Throughput              | 1588 tok/s (1.71x)        | against 903 tok/s on the old kernels                                  |
+| GPU busy                | **~42%** / 52.5%          | `gpu_busy_percent`; 42% during the run, 52.5% re-measured uncontended |
+| Host CPU                | ~400% of 32 cores         | `top` on the trainer process                                          |
+| Host RSS                | 1.06 GB steady            | sampled every 10s over 150 steps; flat from 300s on                   |
+| Peak GPU (pool + state) | 39.3 GB                   | trainer's own readout, unchanged                                      |
+| Profiled kernel time    | ~330 ms of a 10.6 s step  | `bench`, idle GPU, summed over a step's dispatches                    |
 
 The two facts that now drive everything below:
 
@@ -233,9 +233,50 @@ forward's op overhead is ~400 ms. That explains ~500 ms of the ~1500 ms per micr
 remainder is most likely GC against ~35 GB of live arrays, but that is NOT proven and should not be
 quoted as if it were.
 
-The fix this implies is lazy `data`/`grad` allocation, so a tensor materializes host storage only
-when something reads it: unchanged under the CPU backend, and under the GPU backend only synced
-tensors ever allocate. Not built yet, and it is the largest lever measured so far.
+#### It was built, and it bought nothing (2026-08-19, later the same day)
+
+Lazy `data`/`grad` did exactly what it was supposed to. `Tensor` allocates host storage on first
+read, `size` comes from the shape so asking for it never allocates, and the CPU ops bind their
+arrays to a local once per op instead of going through the getter per element (without that hoist
+the CPU gradcheck ran 14% slower, 3.74 s to 4.27 s; with it, 3.75 s, level with baseline).
+
+Instrumented over 2 steps at the real shape, 16 micro-batch forwards, 4,568 tensors:
+
+|                  | per forward |        over 2 steps |
+| :--------------- | ----------: | ------------------: |
+| eager allocation |    4,395 MB |             70.3 GB |
+| lazy allocation  |       48 MB |             0.77 GB |
+| avoided          |             | **69.5 GB (98.9%)** |
+
+Only 420 of 4,568 tensors ever touch host `data` and 174 ever touch host `grad`, which confirms the
+4.34 GB figure above almost exactly. And it changed nothing:
+
+| 150 steps, seq 2048, batch 8, interleaved arms, idle GPU |       eager |        lazy |
+| :------------------------------------------------------- | ----------: | ----------: |
+| throughput                                               | 2,651 tok/s | 2,627 tok/s |
+| steady-state RSS                                         |    1,057 MB |    1,058 MB |
+| final loss                                               |       5.045 |       5.045 |
+
+So two claims above this line were wrong, and both were mine. The allocation does NOT explain the
+34.9 GB resident: steady-state RSS is 1.06 GB on both arms and flat from 300 s on, because V8's
+young-generation collector absorbs 4.4 GB per forward of short-lived `Float32Array` for free at this
+rate. And allocation was NOT why the step is host-bound: removing 98.9% of it moved throughput by
+less than 1%, inside the noise.
+
+Where the 34.9 GB came from is unresolved. It was read once with `smaps_rollup` during the live run;
+150 steps of the identical configuration will not reproduce it.
+
+What survives: the step really is host-bound. Re-measured uncontended at the same shape,
+`gpu_busy_percent` averages 52.5% over 40 samples (max 86%), so the GPU still idles about half the
+step. The host time is in the dispatch path itself, not in allocating host arrays. Anyone taking
+this on next should profile bind-group and pipeline setup per dispatch, not memory.
+
+One loose end worth naming: this configuration reaches 0.161 st/s where the roleplay run logged
+0.093, with byte-identical GPU allocation (39278 MB, pool 37714 + state 1564). A 1.7x gap that is
+not yet attributed. The likeliest explanation is that the ten-hour run shared the GPU with the
+benchmarking in this document, which is the same contention that reversed lever 3's GEMM tile
+result. Treat the 10.6 s/step baseline at the top of this file as an upper bound until that is
+settled.
 
 ### 2. True micro-batching (superseded premise, 2026-08-19)
 
@@ -243,8 +284,9 @@ Packing the `batchPerStep` sequences into one real batch dimension would enlarge
 per-launch + sync overhead. The old reasoning against it was that "GEMM is only ~9% of runtime and
 the GPU is already saturated at batch 1": the GPU is NOT saturated, it idles ~58%. But the
 conclusion survives for a different reason, which is that GPU work is only ~330 ms of the step at
-all, so enlarging the GEMMs cannot buy much either. Fix lever 1c first, then re-ask this one against
-whatever the profile looks like afterwards.
+all, so enlarging the GEMMs cannot buy much either. Lever 1c's proposed fix turned out to be a dead
+end, so there is no longer a "fix that first"; the open question is where the dispatch-path host
+time actually goes.
 
 ## Memory / scale levers
 
