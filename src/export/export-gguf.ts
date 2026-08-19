@@ -22,7 +22,7 @@ set -euo pipefail
 MODEL="\${1:-${ggufFile}}"
 
 # One-shot completion (base model: no chat template, raw next-token):
-llama-cli -m "$MODEL" -c ${cfg.maxSeq} -n 128 -p "Once upon a time"
+llama-cli -m "$MODEL" -c ${cfg.maxSeq} -n 128 -p "Once upon a time, there was a little"
 
 # Or serve an OpenAI-compatible endpoint:
 # llama-server -m "$MODEL" -c ${cfg.maxSeq} --host 127.0.0.1 --port 8080

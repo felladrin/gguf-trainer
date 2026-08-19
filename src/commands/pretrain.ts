@@ -20,6 +20,7 @@
 
 import { readGGUF } from "../gguf/gguf.ts";
 import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";
+import { lossTrend } from "../loss-trend.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
 import { crossEntropy, mulberry32 } from "../model/autograd.ts";
@@ -65,23 +66,48 @@ async function fileExists(path: string): Promise<boolean> {
 }
 
 /**
- * End-of-run sample with the GPU forward (one sync/token); stops at eos.
+ * The first two prompts of scripts/eval-completions.sh, so the glance at the end
+ * of a run and the offline battery cannot disagree.
  *
- * Uses SAMPLE_PRESET rather than bare greedy: this line is read as a quality
+ * Two rather than one, because a single greedy prompt is a coin flip: SAMPLE_PRESET
+ * cannot break an alternating loop (each turn of the cycle refreshes the penalty
+ * window), and the roleplay run printed "The world was in turmoil. The world was in
+ * peace." on "Once upon a time" while all ten prompts of the battery were clean.
+ */
+const SAMPLE_PROMPTS = [
+  "Once upon a time, there was a little",
+  "The old man walked slowly toward the",
+];
+
+/**
+ * End-of-run samples with the GPU forward (one sync/token); each stops at eos.
+ *
+ * Uses SAMPLE_PRESET rather than bare greedy: these lines are read as a quality
  * signal, and an unpenalized base model loops on one sentence for all 60 tokens.
  */
 async function generateGpu(
   gpu: WebGPUBackend,
   model: LanguageModel,
   tok: BPETokenizer,
-  prompt: string,
+  prompts: string[],
   n: number,
 ): Promise<string> {
   gpu.install();
   try {
     gpu.uploadParams(model.params());
-    const ids = await greedyComplete(model, gpu, tok.encode(prompt), n, [tok.eosId], SAMPLE_PRESET);
-    return tok.decode(ids);
+    const out: string[] = [];
+    for (const prompt of prompts) {
+      const ids = await greedyComplete(
+        model,
+        gpu,
+        tok.encode(prompt),
+        n,
+        [tok.eosId],
+        SAMPLE_PRESET,
+      );
+      out.push(tok.decode(ids));
+    }
+    return out.join("\n\n");
   } finally {
     gpu.uninstall();
   }
@@ -402,7 +428,8 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     })`;
   };
 
-  let firstLoss = 0, lastLoss = 0;
+  const losses: number[] = [];
+  let lastLoss = 0;
   const t0 = Date.now();
   await trainLMGpuResident(model, gpu, {
     tokens: src,
@@ -439,7 +466,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     },
     onLog: (localStep, loss) => {
       const step = startStep + localStep;
-      if (localStep === 0) firstLoss = loss;
+      losses.push(loss);
       lastLoss = loss;
       const el = (Date.now() - t0) / 1000;
       const rate = localStep / Math.max(1, el);
@@ -456,14 +483,18 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     const el = (Date.now() - t0) / 1000;
     const localSteps = steps - startStep;
     const tokPerSec = (localSteps * tokensPerStep) / Math.max(1, el);
+    const trend = lossTrend(losses);
+    const lossPart = trend
+      ? `loss ${trend.first.toFixed(3)} -> ${trend.last.toFixed(3)} ` +
+        `(mean of first/last ${trend.window})`
+      : "no logged losses";
     console.log(
-      `\nTraining: loss ${firstLoss.toFixed(3)} -> ${lastLoss.toFixed(3)} in ${
-        (el / 60).toFixed(1)
-      }min, ${tokPerSec.toFixed(0)} tok/s, peak ${mem()}`,
+      `\nTraining: ${lossPart} in ${(el / 60).toFixed(1)}min, ` +
+        `${tokPerSec.toFixed(0)} tok/s, peak ${mem()}`,
     );
   }
 
-  console.log(`\nSample:\n${await generateGpu(gpu, model, tok, "Once upon a time", 60)}`);
+  console.log(`\nSample:\n${await generateGpu(gpu, model, tok, SAMPLE_PROMPTS, 60)}`);
 
   const bytes = await exportGGUF();
   const optBytes = await writeOptState();
