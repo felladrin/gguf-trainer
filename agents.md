@@ -249,7 +249,8 @@ scripts/            eval-completions.sh, plus the historical Minueza-3 run scrip
   WGSL kernel needs a CPU-parity check in `tests/gpu-parity.ts`. A kernel that declares
   `var<workgroup>` storage also needs an entry in `tests/kernel-limits.ts`, which asserts the
   emitted WGSL stays under WebGPU's 16 KiB portable floor: no runtime here validates that limit, so
-  nothing else will tell you. All suites must pass: `deno task test`.
+  nothing else will tell you. All suites must pass: `deno task test`, which type-checks the tree
+  first (`deno task check`) because `deno run` does not.
 - The reference backend stays dependency-free and runtime-agnostic (Deno, Bun, Node).
 - The `gemma3` tensor names and metadata keys are a contract with llama.cpp. Changing them breaks
   every published checkpoint.

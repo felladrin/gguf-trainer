@@ -78,7 +78,7 @@ Each architecture is a single file in `src/arch/` plus one line in the registry,
 - Muon (Newton-Schulz orthogonalized momentum) and AdamW, both GPU-resident, with MuonClip, muP init transfer and a WSD schedule.
 - The whole op set as WGSL, forward and backward, including flash-style and sliding-window attention and a fused cross-entropy.
 - Checkpoint resume through GGUF plus an optimizer-state sidecar, so a long run survives an interruption.
-- `deno task test` runs finite-difference gradient checks on every op (with a negative control, so we know it can catch a wrong backward) and GPU-vs-CPU parity on every kernel.
+- `deno task test` type-checks the tree, then runs finite-difference gradient checks on every op (with a negative control, so we know it can catch a wrong backward) and GPU-vs-CPU parity on every kernel.
 
 ## Honest limits
 
