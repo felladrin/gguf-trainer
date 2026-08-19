@@ -42,6 +42,53 @@ ok(
 ok(substitute("<BOT> saw <USER>", "Ayaka") === "Ayaka saw You", "angle-bracket placeholders");
 ok(!substitute("a <|endoftext|> b", "Ayaka").includes("<|endoftext|>"), "doc marker stripped");
 
+// PIPPA's cards spell the name macros 60 other ways, and every one of them has to
+// resolve or unwrap: a surviving brace is what taught a checkpoint to open a turn
+// with "{{u01}}:".
+ok(substitute("{{c}} and {{u}}", "Ayaka") === "Ayaka and You", "one-letter aliases");
+ok(substitute("{{u01}}: hi", "Ayaka") === "You: hi", "numbered short user alias");
+ok(substitute("{{user_3}} left", "Ayaka") === "You left", "numbered user alias");
+ok(substitute("{{randomuser}} and {{random_user_}}", "Ayaka") === "You and You", "near-misses");
+ok(substitute("{{Ayaka}} waved", "Ayaka") === "Ayaka waved", "the bot's own name in braces");
+ok(
+  substitute("{{char:}} hi", "Ayaka") === "Ayaka: hi",
+  "a colon belongs to the label, not the name",
+);
+// Unwrap, do not drop: these are another character's name and a stage direction,
+// and the sentence needs them.
+ok(substitute("{{Elesa}} smiled", "Ayaka") === "Elesa smiled", "another character unwraps");
+ok(substitute("Yes {{she nods}}", "Ayaka") === "Yes she nods", "a stage direction unwraps");
+ok(!/[{}]/.test(substitute("{{chat}} {{Creator}} {{1}}", "Ayaka")), "no double-brace survives");
+
+// Typos where one delimiter became a bracket, all of which appear in PIPPA.
+for (const bad of ["{{char]}", "{[char}}", "{{char]]"]) {
+  ok(substitute(`${bad} waited`, "Ayaka") === "Ayaka waited", `mixed delimiters: ${bad}`);
+}
+ok(substitute("[[stay]] put", "Ayaka") === "[[stay]] put", "double brackets are not macros");
+
+// Single braces are usually prose or the W++ persona notation, so only a name resolves.
+ok(substitute("{char} met {user}", "Ayaka") === "Ayaka met You", "single-brace name macros");
+ok(
+  substitute("{smiles} warmly", "Ayaka") === "{smiles} warmly",
+  "single-brace prose is left alone",
+);
+ok(
+  substitute('[Person("Nazera")\n{\nRace("Human")\n}]', "Ayaka") ===
+    '[Person("Nazera")\n{\nRace("Human")\n}]',
+  "the W++ persona block survives, its braces span lines",
+);
+
+// Pasted reference links are not roleplay, and the model learned to emit them.
+ok(substitute("see https://a.b/c for more", "Ayaka") === "see for more", "a bare link goes");
+ok(
+  substitute("ref (https://a.b/c) here", "Ayaka") === "ref here",
+  "a wrapped link takes its parens",
+);
+ok(
+  substitute("Ayaka: hi\nhttps://a.b/c\nYou: yo", "Ayaka") === "Ayaka: hi\nYou: yo",
+  "a link on its own line leaves no blank line behind",
+);
+
 // normalizeDefinitions
 const defs = normalizeDefinitions("{{char}}: Hi.\nEND_OF_DIALOG\n{{user}}: Yo.", "Ayaka");
 ok(defs.includes("Ayaka: Hi."), "definitions get substituted");
