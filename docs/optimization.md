@@ -169,12 +169,46 @@ grow with batch. Phase B can budget batch 4.
 The cost of long context is throughput, not memory: 8192 runs ~28% fewer tok/s than 2048 at equal
 tokens/step (SWA covers 5 of 6 layers; the global layers still pay O(T²)).
 
-### 4. More unique data (cheap data, expensive compute)
+### 4. More unique data: the binding constraint on quality (revised 2026-08-19)
 
-The corpus is 722M unique tokens; the run does 2 epochs (~1.44B). `corpus` can emit
-more parts for near-zero cost, but training them is the expense: at 70M tok/day each additional
-~2.6B tokens is ~37 days. This is where the real gap to Minueza-2-96M (185B tokens) lives: closing
-it is a compute-time decision, not a tooling one.
+The corpus is 722M unique tokens; the run does 2 epochs (~1.44B). `corpus` can emit more parts for
+near-zero cost, but training them is the expense. Stated in tokens per parameter, the axis the
+small-model literature argues on, against the models in the head-to-head table under lever 9:
+
+| model                      | params | train tokens | tokens/param |
+| :------------------------- | -----: | -----------: | -----------: |
+| ours, `phaseA-final-88000` |  94.7M |        1.44B |           15 |
+| Minueza-2-96M              |    96M |         185B |        1,927 |
+| SmolLM2-135M               |   135M |          ~2T |      ~14,800 |
+
+15 tokens per parameter is Chinchilla-optimal (~20:1), and therefore optimal for nothing this
+project wants: Chinchilla minimizes loss for a fixed _training_ budget, not quality per parameter at
+a fixed _model size_. Every model that beats us above trained two to three orders of magnitude
+longer per parameter.
+
+Throughput is 1588 tok/s sustained after the 2026-08-18 kernel rewrite (Strix, seq 2048 batch 8,
+instantaneous rate over the roleplay run), i.e. **137M tokens/day**, up from the 70M this section
+used to assume. The arithmetic is still discouraging:
+
+| target                         | total tokens | still to train | days at 137M/day |
+| :----------------------------- | -----------: | -------------: | ---------------: |
+| 100 tokens/param               |         9.5B |           8.0B |               58 |
+| Minueza-2's 1,927 tokens/param |         185B |           184B |    1,340 (3.7 y) |
+| SmolLM2's ~14,800 tokens/param |         1.4T |           1.4T |        ~28 years |
+
+So closing the gap to Minueza-2 is not "a compute-time decision" as this section previously called
+it: on one box it is out of reach. Reaching ~100 tokens/param is two months and is the only rung on
+this ladder actually available. That, not architecture and not hyperparameters, is the ceiling on
+quality here.
+
+There is also a far end to this, which is worth knowing about even though it is not the end we are
+near. [Extreme overtraining in tiny language models](https://huggingface.co/blog/Banaxi-Tech/ovdadadadd)
+(2026-08-12) reports a 0.9M-param model whose scores peak around 22,000 tokens/param and decline
+from there out to 222,000. That measurement is at 0.9M params, so the ratio itself does not carry to
+94.7M (it would imply 2.1T tokens), and it is a single external run rather than something measured
+here. The direction is what matters, and it agrees with SmolLM2: the useful ratio for small models
+sits orders of magnitude above Chinchilla, with an eventual point of diminishing returns. We are at
+the opposite end of that range by more than a factor of a thousand.
 
 ## Correctness / robustness
 
