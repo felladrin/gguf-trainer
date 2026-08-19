@@ -1,5 +1,5 @@
 // Evaluate a trained GGUF on multiple-choice benchmarks (ARC-Challenge,
-// HellaSwag) and word/token perplexity, using the trainer's OWN forward, no
+// ARC-Easy, HellaSwag, PIQA) and word/token perplexity, using the trainer's OWN forward, no
 // external eval framework, so it stays as portable as the rest of the project.
 //
 // Scoring is the standard length-normalized log-likelihood: for each candidate
@@ -47,6 +47,10 @@ interface Task {
   toItem(row: Row): MCItem | null;
   /** Render the "prompt + answer" text for a choice (few-shot exemplars reuse it). */
   render(ctx: string, choice: string): string;
+  /** Chance accuracy, for reading a result: 4-option tasks 25, 2-option PIQA 50. */
+  chance: number;
+  /** Replaces the HF-parquet fetch for a dataset the datasets-server cannot convert. */
+  load?(limit: number): Promise<Row[]>;
 }
 
 /** ARC choices arrive as a { text: [...], label: [...] } struct; answerKey is a label. */
@@ -74,13 +78,67 @@ function hellaswagItem(row: Row): MCItem | null {
   return { context: ctx, choices: endings.map(String), gold };
 }
 
-const TASKS: Record<string, Task> = {
+/** PIQA: a goal and two candidate solutions, gold given by a 0/1 label. */
+export function piqaItem(row: Row): MCItem | null {
+  const goal = row["goal"], sol1 = row["sol1"], sol2 = row["sol2"];
+  const gold = Number(row["label"]);
+  if (typeof goal !== "string" || typeof sol1 !== "string" || typeof sol2 !== "string") return null;
+  if (gold !== 0 && gold !== 1) return null;
+  return { context: goal, choices: [sol1, sol2], gold };
+}
+
+/**
+ * Join PIQA's questions to its gold labels, which ship as a parallel file of one
+ * integer per line aligned by position. A length mismatch means every label is
+ * against the wrong question, which would still score and would look like a
+ * plausible near-chance result, so it aborts instead.
+ */
+export function attachPiqaLabels(rows: Row[], labelsText: string): Row[] {
+  const labels = labelsText.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+  if (labels.length !== rows.length) {
+    die(
+      `piqa: ${rows.length} questions but ${labels.length} labels, refusing to score misaligned data`,
+    );
+  }
+  return rows.map((r, i) => ({ ...r, label: Number(labels[i]) }));
+}
+
+// PIQA's canonical dataset ships a Python loading script, so the HF
+// datasets-server never converts it to parquet and fetchParquetUrls finds
+// nothing for it. Read the authors' own distribution, which is the same thing
+// that script downloads, rather than a third-party mirror whose contents we
+// would have to take on trust.
+const PIQA_BASE = "https://yonatanbisk.com/piqa/data";
+
+async function loadPiqa(limit: number): Promise<Row[]> {
+  const get = async (name: string): Promise<Uint8Array> => {
+    const resp = await fetch(`${PIQA_BASE}/${name}`);
+    if (!resp.ok) die(`fetch ${name} -> ${resp.status} ${resp.statusText}`);
+    return new Uint8Array(await resp.arrayBuffer());
+  };
+  const rows = await parseDataFile("valid.jsonl", await get("valid.jsonl"));
+  const labelled = attachPiqaLabels(rows, new TextDecoder().decode(await get("valid-labels.lst")));
+  return limit ? labelled.slice(0, limit) : labelled;
+}
+
+const ARC_RENDER = (c: string, a: string) => `Question: ${c}\nAnswer: ${a}`;
+
+export const TASKS: Record<string, Task> = {
   arc: {
     id: "allenai/ai2_arc",
     config: "ARC-Challenge",
     split: "test",
     toItem: arcItem,
-    render: (c, a) => `Question: ${c}\nAnswer: ${a}`,
+    render: ARC_RENDER,
+    chance: 25,
+  },
+  "arc-easy": {
+    id: "allenai/ai2_arc",
+    config: "ARC-Easy",
+    split: "test",
+    toItem: arcItem,
+    render: ARC_RENDER,
+    chance: 25,
   },
   hellaswag: {
     id: "Rowan/hellaswag",
@@ -88,10 +146,21 @@ const TASKS: Record<string, Task> = {
     split: "validation",
     toItem: hellaswagItem,
     render: (c, a) => `${c} ${a}`,
+    chance: 25,
+  },
+  piqa: {
+    id: "ybisk/piqa",
+    config: "plain_text",
+    split: "validation",
+    toItem: piqaItem,
+    render: ARC_RENDER,
+    chance: 50,
+    load: loadPiqa,
   },
 };
 
 async function loadRows(task: Task, limit: number): Promise<Row[]> {
+  if (task.load) return task.load(limit);
   const urls = await fetchParquetUrls(task.id, task.config, task.split);
   if (!urls.length) die(`no parquet for ${task.id} [${task.config}/${task.split}]`);
   const rows: Row[] = [];
@@ -161,7 +230,8 @@ async function run(v: Values) {
       // just expose the hook. (Full ppl harness: feed a .txt via --limit lines.)
       die("ppl task: run against a held-out corpus; not wired to a default source yet");
     }
-    const task = TASKS[taskName] ?? die(`unknown task "${taskName}" (arc|hellaswag)`);
+    const task = TASKS[taskName] ??
+      die(`unknown task "${taskName}" (${Object.keys(TASKS).join("|")})`);
     const rows = await loadRows(task, limit ? limit + shots : 0);
     const items = rows.map((r) => task.toItem(r)).filter((x): x is MCItem => x !== null);
     if (items.length < shots + 1) die(`too few parsed items (${items.length}) for ${shots}-shot`);
@@ -195,7 +265,7 @@ async function run(v: Values) {
     }
     const pct = (n: number) => (100 * n / Math.max(1, done)).toFixed(2);
     console.log(
-      `\n${taskName} (${done} items, ${shots}-shot): ` +
+      `\n${taskName} (${done} items, ${shots}-shot, chance ${task.chance}): ` +
         `acc_norm ${pct(correctNorm)}%  acc ${pct(correctRaw)}%  ` +
         `(${((Date.now() - t0) / 1000).toFixed(0)}s)`,
     );
@@ -206,16 +276,22 @@ async function run(v: Values) {
 
 export const evalChoiceCommand: Command = {
   name: "eval-choice",
-  summary: "Score a model on a multiple-choice benchmark (ARC, HellaSwag) or plain perplexity.",
+  summary: "Score a model on a multiple-choice benchmark (ARC, HellaSwag, PIQA) or perplexity.",
   details: `Runs the trainer's own forward pass, so it scores a GGUF without llama.cpp. Each
 option is scored by its length-normalized log-likelihood and the highest wins, which is the
 standard multiple-choice protocol.
 
-Expect low absolute numbers from a small model: 25.0 is chance on both ARC-Challenge and
-HellaSwag. Use it to compare checkpoints of the same model, where the trend is the signal.`,
+Expect low absolute numbers from a small model. Chance is 25.0 on arc, arc-easy and hellaswag,
+and 50.0 on piqa, which has two options. Use it to compare checkpoints of the same model, where
+the trend is the signal.
+
+The arc task is ARC-Challenge and arc-easy is ARC-Easy. Those four tasks are the components of the
+Open SLM Leaderboard's Intelligence Index, so running all four makes a checkpoint directly
+comparable to that board.`,
   examples: [
     "eval-choice --model model.gguf --task hellaswag --limit 500",
     "eval-choice --model model.gguf --task arc",
+    "eval-choice --model model.gguf --task piqa",
   ],
   flags: [
     {
@@ -229,7 +305,7 @@ HellaSwag. Use it to compare checkpoints of the same model, where the trend is t
       name: "task",
       type: "string",
       default: "arc",
-      choices: ["arc", "hellaswag", "ppl"],
+      choices: ["arc", "arc-easy", "hellaswag", "piqa", "ppl"],
       describe: "benchmark to run",
     },
     {
