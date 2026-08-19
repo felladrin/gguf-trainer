@@ -347,6 +347,48 @@ Not built yet: the teacher-logit precompute pass over the SFT `.tokens` and the 
 `[T,V]` probability buffers (268 MB each at seq 2048, 1.07 GB at seq 8192); if that ever binds, fuse
 both targets into a single op sharing one softmax.
 
+### 11. What the sub-150M field does differently (2026-08-19)
+
+The [Open SLM Leaderboard](https://huggingface.co/spaces/AxiomicLabs/Open_SLM_Leaderboard) ranks 131
+models under 150M on an Intelligence Index over HellaSwag, ARC-Easy, ARC-Challenge and PIQA, each
+normalized so chance maps to 0 and ArithMark-3 weighted 0.65. Three things separate the top of the
+80-155M cohort from this project, and not one of them is an optimizer or a kernel. Two models is not
+a controlled study, so read these as where to look, not as proven causes.
+
+**Token budget, restated against real competitors.** Lever 4 makes this argument from Minueza-2 and
+SmolLM2; the board says the same thing with models that are not outliers:
+
+| model              | params | tokens | tokens/param | Int Index |
+| :----------------- | -----: | -----: | -----------: | --------: |
+| SmolLM2-135M       |   135M |    ~2T |       14,815 |     27.13 |
+| GPT-X2.5-135M      |   135M |    75B |          556 |     25.17 |
+| BananaMind-2-Pro   |   139M |   100B |          719 |     24.96 |
+| Supra2-100M-Base   |   101M |    30B |          298 |     19.41 |
+| ours, phaseA-final |  94.7M |  1.44B |       **15** |  unscored |
+
+**Depth over width, and a 3x FFN rather than 4x.** Both top non-HuggingFace models spend parameters
+on layers instead of on a wide FFN:
+
+| model            | layers | hidden |   FFN | ratio | heads (Q/KV) | trained ctx |
+| :--------------- | -----: | -----: | ----: | ----: | :----------- | ----------: |
+| GPT-X2.5-135M    |     30 |    576 | 1,728 |  3.0x | 9 / 3        |       8,192 |
+| BananaMind-2-Pro |     24 |    640 | 1,920 |  3.0x | 8 / 4        |       3,072 |
+| ours             | **12** |    640 | 2,560 |  4.0x | 10 / 5       |       2,048 |
+
+`gemma3Config` derives the FFN as ~4x hidden, so trying 3x and spending the savings on depth is a
+one-config experiment, not a code change. Worth an A/B before the next from-scratch run.
+
+**A data mixture we do not have.** Both report nearly the same blend: FineWeb-Edu ~50%, DCLM ~26%,
+Cosmopedia-v2 ~13.5%, FineMath-4+ ~8%, Python ~2%. Ours is FineWeb-Edu and nothing else from that
+list. No FineMath is the most likely reason arithmetic and ARC sit at chance for us, and it is the
+cheapest of the three gaps to close.
+
+Both also use plain AdamW at peak lr 1.5e-3 with a 2,000-step warmup, so Muon is not what separates
+them from us. GPT-X2.5 uses WSD with the decay confined to the last 10%, against our 20% cooldown.
+
+Not transferable, despite ranking 7th at 90M: `palmer-006` discloses no token count, no datasets and
+no optimizer, and describes a merge plus a light finetune of an unnamed base.
+
 ## Explicitly not worth doing
 
 - **Guarded/clamped f16 compute**, no speed to recover; attention-bound, GEMM is a thin slice. f32
@@ -354,9 +396,14 @@ both targets into a single op sharing one softmax.
 - **Using all 128 GB**, we are compute-bound; extra RAM buys nothing at this model size. It only
   matters as headroom for a much larger model, which the throughput ceiling makes impractical
   anyway.
-- **Switching to PyTorch + ROCm for speed**: the attention wall is the GPU, not the framework; ROCm
-  on gfx1151 also lacks flash-attention. See the project direction: portability is the goal, not
-  chasing SOTA on this hardware.
+- **Switching to PyTorch + ROCm for speed**: still not doing it, but the old reason was wrong and is
+  worth retiring rather than repeating. It said "the attention wall is the GPU, not the framework".
+  GPT-X2.5-135M trained 75B tokens on a single RTX 3080 Ti in ~800 hours, which is ~26,000 tokens/s
+  on a LARGER model than ours against our 1588 on Strix. A mature stack on lesser hardware being 16x
+  faster is exactly the framework being implicated, so that clause does not survive. What still
+  holds, and is the whole reason, is the project direction: portable plain WGSL that runs
+  cross-vendor is the goal, not chasing throughput on this box. ROCm on gfx1151 also lacks
+  flash-attention.
 - **Soft-label KD from off-the-shelf teachers** (e.g. Gemma-3-1B as teacher): vocab mismatch (our
   custom u16 BPE vs their 262k tokenizer), and cross-tokenizer KD (GOLD/ULD) is research-grade
   machinery. Data-level KD is already the corpus strategy (TinyStories and smol-smoltalk are
