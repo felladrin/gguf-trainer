@@ -211,6 +211,11 @@ Measured on one AMD Strix Halo APU (128 GB unified memory), f32:
 | 94.7M | batch 8 x seq 2048 | ~900 tokens/s  | 39.3 GB  |
 | 94.7M | batch 8 x seq 1024 | ~1050 tokens/s | 28.9 GB  |
 
+**Those two rows predate the 2026-08-18 kernel rewrite and are the floor, not the current number.**
+The attention, GEMM and cross-entropy kernels were vectorized after they were taken; the same run on
+an M1 Max went 204 -> 490 tokens/s. Nobody has re-run it on Strix yet. Run `bench` on the machine in
+front of you before planning around a throughput figure, and see `docs/optimization.md` lever 1.
+
 That is 1.9 billion tokens in about 25 days of wall clock, which is what the published model cost.
 Plan in those units: a "quick experiment" is 100M tokens and a day. This is not a CUDA cluster and
 no flag makes it one. Sub-100M models are the honest target.
@@ -241,8 +246,11 @@ scripts/            eval-completions.sh, plus the historical Minueza-3 run scrip
 ## Rules for changing this code
 
 - Any new autograd op needs a finite-difference gradient check in `tests/gradcheck.ts`, and any new
-  WGSL kernel needs a CPU-parity check in `tests/gpu-parity.ts`. Both suites must pass:
-  `deno task test`.
+  WGSL kernel needs a CPU-parity check in `tests/gpu-parity.ts`. A kernel that declares
+  `var<workgroup>` storage also needs an entry in `tests/kernel-limits.ts`, which asserts the
+  emitted WGSL stays under WebGPU's 16 KiB portable floor: no runtime here validates that limit, so
+  nothing else will tell you. All suites must pass: `deno task test`, which type-checks the tree
+  first (`deno task check`) because `deno run` does not.
 - The reference backend stays dependency-free and runtime-agnostic (Deno, Bun, Node).
 - The `gemma3` tensor names and metadata keys are a contract with llama.cpp. Changing them breaks
   every published checkpoint.

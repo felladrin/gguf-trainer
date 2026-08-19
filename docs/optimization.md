@@ -19,6 +19,10 @@ architecture and `readme.md` "Honest limits" for the ceiling this project accept
 | Attention share of runtime | ~78%                     | kernel profiling, `timestamp-query`                 |
 | f16 vs f32 compute         | same speed               | attention-bound; f16 only speeds the ~9% GEMM slice |
 
+> The attention, GEMM and cross-entropy kernels were rewritten on 2026-08-18 (see lever 1 below);
+> every row above predates that and describes the old kernels. The shape of the conclusions holds,
+> the absolute numbers do not. Re-measure on Strix with `bench` before quoting them.
+
 Two facts follow from this and drive everything below:
 
 1. **We are compute-bound on attention, not memory-bound.** The GPU is pinned at 100% while only
@@ -30,18 +34,108 @@ Two facts follow from this and drive everything below:
 
 ## Throughput levers (the binding constraint)
 
-### 1. Attention kernel: the ~78% slice (hard, standing)
+### 1. Attention kernel: the ~78% slice: PARTLY RESOLVED (2026-08-18), 2.4x end-to-end on M1 Max
 
-This is the only lever that moves the wall-clock. Full attention is "at floor" on gfx1151: no
-WMMA/tensor-core path, and the tiled/flash-style forward already attempted did not break
-the ceiling. SWA (sliding window 1024) is the one real win in place: it caps per-token cost on 5 of
-every 6 layers. Remaining ideas, none proven: a fused windowed-attention kernel that never
-materializes the full score matrix; better workgroup occupancy for the global (full-attention)
-layers; exploiting the 5:1 SWA:global ratio to skip work. Expect this to be a research effort, not a
-quick fix. It is also the same wall PyTorch+ROCm hits on this GPU, so it is not a "switch
-frameworks" problem. CONSTRAINT: only pursue approaches that stay portable, plain WGSL that runs
-cross-vendor (AMD/Apple/ NVIDIA), no vendor intrinsics or hardware-specific paths. A kernel that
-only helps gfx1151 at the cost of the "runs anywhere" story is out of scope.
+The 2026-07-08 reading of this line was that attention sat at a hardware floor. It did not; it sat
+at a _codegen_ floor. Three restructurings had been tried and reverted (f16, split-K, query-register
+tiling), and their failure was read as "the kernel is done". None of them touched the thing that was
+actually costing the time: **every load in the head-dimension loops was scalar**, and the private
+arrays holding a thread's Q row and output accumulator were f32 arrays indexed by a loop variable,
+exactly the pattern that made the rolled GEMM 3x slower than the unrolled one.
+
+Measured on an M1 Max with the new `bench` subcommand, min of 4 runs x 8 iterations, 95M geometry
+(T=2048, 10 query heads over 5 KV heads, head-dim 64), GPU time per kernel:
+
+| kernel                       |   before |   after | change |
+| :--------------------------- | -------: | ------: | -----: |
+| `srcAttnBwdDkv`, window 1024 | 225.7 ms | 55.2 ms |  4.09x |
+| `srcAttnBwdDkv`, dense       | 376.2 ms | 89.7 ms |  4.19x |
+| `srcAttnFwd`, window 1024    |  44.2 ms | 22.6 ms |  1.96x |
+| `srcAttnFwd`, dense          |  81.3 ms | 35.6 ms |  2.28x |
+| `srcAttnBwdDq`, window 1024  |  46.0 ms | 30.8 ms |  1.49x |
+| `srcAttnBwdDq`, dense        |  84.8 ms | 50.3 ms |  1.69x |
+
+The first correction the measurement made was to the target itself: **`srcAttnBwdDkv` was ~70% of
+the attention slice**, not the forward kernel. The 78%-attention figure above was never broken out
+per kernel, so the optimization effort had been aimed at the wrong one of the four.
+
+Three changes, all plain portable WGSL, no intrinsics:
+
+1. **vec4 lanes.** Q/K/V/output rows are addressed as `vec4<f32>` whenever the head dim is a
+   multiple of 4, so a head-deep step is 1 load instead of 4 and the dot product carries 4
+   independent accumulation chains instead of 1: the same two levers that lifted `srcGemm`. Head
+   dims that are not a multiple of 4 keep the scalar form from the same codegen.
+2. **exp2 domain.** The online softmax runs in log2 with the score scale pre-folded, and LSE is
+   stored in the same domain so both backward kernels pick it up. `exp` is not the hardware
+   instruction anywhere; `exp2` is.
+3. **Conditional rescale** in the forward: the running max is monotone, so the accumulator is only
+   rescaled on the keys that actually raise it, and on that branch `p` is exactly 1.
+
+Plus two changes to `srcAttnBwdDkv` alone: a two-chain unroll of the head loop (1.18-1.20x there,
+neutral in the other two, which is why it is not applied to them), and a query tile sized to fit the
+16 KiB portable workgroup-storage floor. The old fixed 32-row tile needed 16640 B at head-dim 64,
+over the floor, so the head size every published checkpoint uses was over budget on any
+implementation that validates the limit. Halving it to 16 rows fits in 8320 B and is also 1.18x
+FASTER on M1 Max: smaller tiles buy occupancy. (Two separate 1.18x factors compound into the
+table's 4.09x, this one and the two-chain unroll above.)
+
+That the bug had never been hit is not luck, and not a missing parity shape either: an hd=64 parity
+case would have passed. What kept it working was the absence of any check. Probed on an M1 Max,
+Deno's wgpu accepted a 16640-byte shader on a device reporting a granted
+`maxComputeWorkgroupStorageSize` of **16384**, with an empty validation scope. The kernel was over
+budget on every device it ever ran on, and was simply never told.
+
+That is also why the gate is `tests/kernel-limits.ts` and not a GPU test. It parses the emitted WGSL
+and asserts no kernel `wgsl.ts` builds declares more workgroup storage than the 16 KiB floor, across
+every head dim the trainer accepts. A GPU test would have passed on the runtime the trainer actually
+uses while the shape still failed for anyone on a stack that does validate. The check is also
+independent of the fix by construction: `attnBwdTile` sizes the tile from a formula, the test sums
+the array declarations, and neither consults the other.
+
+End-to-end, 8 real pretrain steps at the 95M geometry, seq 2048, batch 2, on the M1 Max:
+**204 -> 490 tokens/s (2.40x)**, with the per-step loss identical to four decimals at every step and
+identical peak memory.
+
+NOT YET MEASURED ON STRIX: the numbers above are M1 Max (Metal). The changes are machine-independent
+in kind (fewer instructions for the same arithmetic, no vendor path), but the _share_ each one buys
+depends on the silicon, and the Strix box was mid-run. Re-run `bench` there and record the numbers
+before quoting a speedup for the AMD target.
+
+Still standing, and still a research effort: the O(T^2) pair count itself. CONSTRAINT unchanged:
+only approaches that stay portable, plain WGSL that runs cross-vendor (AMD/Apple/NVIDIA), no vendor
+intrinsics or hardware-specific paths. A kernel that only helps gfx1151 at the cost of the "runs
+anywhere" story is out of scope.
+
+### 1b. GEMM and cross-entropy kernels (2026-08-18)
+
+The same vec4 audit applied to the other two kernel families, measured the same way:
+
+| kernel                                          |   before |    after | change |
+| :---------------------------------------------- | -------: | -------: | -----: |
+| `srcGemm`, tied readout [2048,640]x[32768,640]T | 337.7 ms | 183.0 ms |  1.85x |
+| `srcGemm`, FFN up [2048,640]x[2560,640]T        |  19.2 ms |  15.8 ms |  1.22x |
+| `srcGemm`, QKV [2048,640]x[1280,640]T           |  10.2 ms |   9.8 ms |  1.04x |
+| cross-entropy fwd+bwd, T=2048 V=32768           |  73.7 ms |   4.7 ms |  15.7x |
+
+GEMM: both staged tiles are held as vec4 and both micro-tile fragments are read as vec4, which
+needs the A tile staged transposed (`As[k][m]`), because in the old `As[m][k]` layout a thread's
+four rows were BK apart and a strided fragment cannot be one load. BK went 8 -> 16 (measured 1.09x
+on top of vec4 at half the 16 KiB portable workgroup-storage floor; BK=32 was no faster and spends
+the whole floor).
+
+Cross-entropy: the old kernel ran **one thread per row**, so a [2048, 32768] softmax executed on
+2048 threads with each lane striding a full row apart, coalescing nothing. It is now one workgroup
+of 256 per row with a workgroup reduction, which is both 128x the parallelism and coalesced. On top
+of that, `PROBS` now holds unnormalized `exp(z - max)` with a per-row `1/sum` beside it: the old
+third pass over `[T,V]` existed only to apply a divide that the backward can apply from a scalar.
+That also removes the `+1e-12` the loss needed to survive `log(0)`, since the loss is now
+`log(sum) - (z_target - max)` straight from the row statistics.
+
+Bind-group caching for the main loop (the `prepareDispatch` pattern the optimizers use) was measured
+and NOT done: instrumenting `createBindGroup` over a real run gives 2346 calls and 71.5 ms per step
+against an ~18 s step, i.e. 0.4%. It is also the exact pattern `prepareDispatch` warns about, since
+the main loop's buffers are pooled transients that get recycled. Revisit only if the per-step GPU
+work drops by an order of magnitude.
 
 ### 2. True micro-batching (medium, uncertain payoff)
 

@@ -7,8 +7,9 @@
     "cli": "deno run -A cli.ts",
     "demo": "deno run -A cli.ts demo",
     "help": "deno run -A cli.ts help",
-    "test": "deno run tests/eta-fmt.ts && deno run tests/export-extras.ts && deno run tests/style-pipeline.ts && deno run tests/generate-penalty.ts && deno run -A tests/arch-roundtrip.ts && deno run -A tests/gradcheck.ts && deno run tests/gpu-parity.ts",
-    "test:node": "node --experimental-strip-types tests/eta-fmt.ts && node --experimental-strip-types tests/export-extras.ts && node --experimental-strip-types tests/arch-roundtrip.ts && node --experimental-strip-types tests/gradcheck.ts && node --experimental-strip-types tests/gpu-parity.ts",
+    "test": "deno check src/ tests/ cli.ts && deno run tests/eta-fmt.ts && deno run tests/export-extras.ts && deno run tests/style-pipeline.ts && deno run tests/generate-penalty.ts && deno run tests/kernel-limits.ts && deno run -A tests/arch-roundtrip.ts && deno run -A tests/gradcheck.ts && deno run tests/gpu-parity.ts",
+    "test:node": "node --experimental-strip-types tests/eta-fmt.ts && node --experimental-strip-types tests/export-extras.ts && node --experimental-strip-types tests/kernel-limits.ts && node --experimental-strip-types tests/arch-roundtrip.ts && node --experimental-strip-types tests/gradcheck.ts && node --experimental-strip-types tests/gpu-parity.ts",
+    "check": "deno check src/ tests/ cli.ts",
     "fmt": "deno fmt",
     "lint": "deno lint"
   },

@@ -316,8 +316,18 @@ attention lever**. Both f16-compute (f16 multiply) and f16-storage (f16 Q/K/V, h
 reads) were implemented for the flash-attention kernels and measured: **compute 0.98×, storage 1.06×
 at seqLen 4096 and only 1.02× at 8192** (the win _shrinks_ at longer context). Both were reverted.
 
-**Attention is at its practical floor: three restructurings tried, all reverted (do not
-re-tread).** Where the step actually goes, profiled on Strix Halo
+**SUPERSEDED 2026-08-18: attention was NOT at its floor.** The conclusion below is correct about
+what it tested and wrong about what it concluded. All three reverted restructurings changed the
+kernel's _shape_ (precision, thread-to-key mapping, register tiling); none of them changed its
+_instruction mix_, which is where the time was. Vectorizing the head-dimension loops to vec4, moving
+the softmax to exp2, and rescaling the accumulator only when the running max moves gave 1.5-3.5x per
+kernel and 2.04x end-to-end on M1 Max, all in plain portable WGSL. See `docs/optimization.md` lever
+
+1. The measurement below also never split attention per kernel: `srcAttnBwdDkv` alone was ~70% of
+   the slice, so the three attempts had been aimed at the forward kernel, which was ~15%.
+
+**(Historical, as written) Attention is at its practical floor: three restructurings tried, all
+reverted (do not re-tread).** Where the step actually goes, profiled on Strix Halo
 (`hidden=768, 4 layers, seqLen=4096`): **attention 77.9%**, linear 9.3%, muon 5.6%, rmsnorm 4.4%, CE
 1.0%, everything else <1%. Attention dominates long context, so it got three independent kernel
 rewrites, each measured on-target, each net-negative or neutral, each reverted:
@@ -353,15 +363,18 @@ wants it.)
 
 **Remaining perf roadmap (priority order, revised by the findings above):**
 
-1. **vec4 vectorization** of the elementwise kernels (bandwidth-bound; cheap, measurable on M1).
-   Small absolute win (<5% of the step) but low-risk.
+1. **vec4 vectorization**: DONE 2026-08-18 for the attention, GEMM and cross-entropy kernels, which
+   is where the scalar loads actually were, not the elementwise ones this line was scoped to.
+   2.04x end-to-end on M1 Max; see `docs/optimization.md` lever 1. The elementwise kernels are
+   still scalar and still worth <5% of the step.
 2. **Full f16 _storage_ for memory**: activations in f16 buffers to fit a **bigger batch** at 8K on
    the 128 GB APU (bigger batch → better GEMM occupancy → indirect throughput). The direct attention
    throughput benefit is known to be marginal, so the motivation is memory/batch, not attention
    speed. Needs dynamic **loss scaling** + per-buffer dtype; validate stability on Strix Halo.
 3. **Cross-entropy memory at large vocab.** CE materializes `PROBS`/`DLOG` `[T,V]`; at 8K × 32k
    vocab that is ~1 GB each. A fused online-softmax CE (like the flash attention path) would remove
-   it.
+   it. (Partly addressed 2026-08-18: the normalizing pass over `[T,V]` is gone and CE is 15.7x
+   faster, but the two buffers are still materialized. The memory item stands.)
 4. **Sliding-window / local attention** (algorithmic, breaks O(T²) → O(T·W)): the only change that
    makes 8K genuinely faster rather than a constant factor, but it changes model semantics; gated on
    a user decision.

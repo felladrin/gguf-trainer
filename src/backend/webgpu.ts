@@ -33,6 +33,7 @@ import {
   f32lit,
   GEMM_BM,
   GEMM_BN,
+  gridRows,
   MAX_WG,
   srcAttnBwdD,
   srcAttnBwdDkv,
@@ -135,6 +136,9 @@ interface GpuDevice {
   onuncapturederror?: ((ev: { error?: { message?: string } }) => void) | null;
 }
 
+/** WebGPU caps a query set at 4096 entries, and a profiled dispatch spends two. */
+const MAX_QUERY_PAIRS = 2048;
+
 /** One kernel's accumulated GPU time from timestamp-query profiling. */
 export interface KernelTime {
   label: string;
@@ -221,6 +225,10 @@ class BufferPool {
   }
 
   acquire(bytes: number): { buf: GpuBuffer; size: number } {
+    // The 256-byte rounding is load-bearing beyond pooling: bind groups pass no
+    // offset or size, so a pooled buffer is always bound whole, and the flash
+    // attention kernels bind these same buffers as array<vec4<f32>>, which needs
+    // the bound size to be a multiple of 16. Do not round this down.
     const size = Math.max(256, Math.ceil(bytes / 256) * 256);
     const list = this.free.get(size);
     if (list && list.length > 0) return { buf: list.pop()!, size };
@@ -504,10 +512,13 @@ export class WebGPUBackend implements OpsBackend {
    * Requires the device to have granted timestamp-query (see initWebGPU).
    * `capDispatches` bounds how many dispatches a single sync() window can time;
    * running past it sets the overflow flag stopProfile() returns (never silent).
+   * It is capped at MAX_QUERY_PAIRS: WGPU rejects a query set larger than 4096
+   * entries, and one dispatch costs two.
    */
-  startProfile(capDispatches = 4096) {
+  startProfile(capDispatches = MAX_QUERY_PAIRS) {
     if (!this.timestampSupported) throw new Error("timestamp-query not available on this device");
     if (this.prof) return;
+    capDispatches = Math.max(1, Math.min(capDispatches, MAX_QUERY_PAIRS));
     const bytes = capDispatches * 2 * 8;
     this.prof = {
       qs: this.device.createQuerySet({ type: "timestamp", count: capDispatches * 2 }),
@@ -816,6 +827,10 @@ export class WebGPUBackend implements OpsBackend {
       // no [Hq,T,T] allocation, so context length is no longer capped by
       // maxStorageBufferBindingSize.
       const lse = this.acquireTransient(Hq * T * 4);
+      // Sub-labelled per kernel: the flash path's three backward kernels have
+      // very different costs, and a single "attention" total hides which one a
+      // change moved (see `bench`).
+      this.curLabel = "attention.fwd";
       this.dispatch(
         srcAttnFwd(a),
         [eq.data, ek.data, ev.data, eo.data, lse],
@@ -823,14 +838,16 @@ export class WebGPUBackend implements OpsBackend {
       );
       out._backward = () => {
         this.ensureBackwardBegun();
-        this.curLabel = "attention";
         const dRow = this.acquireTransient(Hq * T * 4);
+        this.curLabel = "attention.bwdD";
         this.dispatch(srcAttnBwdD(a), [eo.grad, eo.data, dRow], ceilDiv(Hq * T, 64));
+        this.curLabel = "attention.bwdDq";
         this.dispatch(
           srcAttnBwdDq(a),
           [eq.data, ek.data, ev.data, eo.grad, lse, dRow, eq.grad],
           ceilDiv(Hq * T, 64),
         );
+        this.curLabel = "attention.bwdDkv";
         this.dispatch(
           srcAttnBwdDkv(a),
           [eq.data, ek.data, ev.data, eo.grad, lse, dRow, ek.grad, ev.grad],
@@ -866,10 +883,19 @@ export class WebGPUBackend implements OpsBackend {
     let kept = 0;
     for (const g of targets) if (g >= 0) kept++;
     const divBuf = this.uploadF32([kept > 0 ? kept : 1]); // mean over kept rows (== T unmasked)
+    // probs holds unnormalized exp(z-max); rowInv holds each row's 1/Σ, which
+    // the backward applies (srcCeFwd).
     const probs = this.acquireTransient(T * V * 4);
     const perRow = this.acquireTransient(T * 4);
+    const rowInv = this.acquireTransient(T * 4);
     const { t: loss, e: eo } = this.makeOut([1], [logits]);
-    this.dispatch(srcCeFwd(T, V), [el.data, tgtBuf, probs, perRow], ceilDiv(T, 64));
+    const gRows = gridRows(T);
+    this.dispatch(
+      srcCeFwd(T, V),
+      [el.data, tgtBuf, probs, perRow, rowInv],
+      gRows.x,
+      gRows.y,
+    );
     this.dispatch(srcCeReduce(T), [perRow, divBuf, eo.data], 1);
     loss._backward = () => {
       // backward(loss, seed) already wrote the seed into the HOST grad array;
@@ -877,7 +903,11 @@ export class WebGPUBackend implements OpsBackend {
       this.ensureBackwardBegun();
       this.curLabel = "crossEntropy";
       this.queue.writeBuffer(eo.grad, 0, loss.grad);
-      this.dispatch(srcCeBwd(T, V), [probs, tgtBuf, eo.grad, divBuf, el.grad], ceilDiv(T * V, 256));
+      this.dispatch(
+        srcCeBwd(T, V),
+        [probs, tgtBuf, eo.grad, divBuf, el.grad, rowInv],
+        ceilDiv(T * V, 256),
+      );
     };
     return loss;
   }
@@ -907,11 +937,14 @@ export class WebGPUBackend implements OpsBackend {
     const probs = this.acquireTransient(T * V * 4);
     const perRow = this.acquireTransient(T * 4);
     const rowMass = this.acquireTransient(T * 4);
+    const rowInv = this.acquireTransient(T * 4);
     const { t: loss, e: eo } = this.makeOut([1], [logits]);
+    const gRows = gridRows(T);
     this.dispatch(
       srcSoftCeFwd(T, V, k),
-      [el.data, idBuf, qBuf, probs, perRow, rowMass],
-      ceilDiv(T, 64),
+      [el.data, idBuf, qBuf, probs, perRow, rowMass, rowInv],
+      gRows.x,
+      gRows.y,
     );
     this.dispatch(srcCeReduce(T), [perRow, divBuf, eo.data], 1);
     loss._backward = () => {
@@ -922,7 +955,7 @@ export class WebGPUBackend implements OpsBackend {
       // ordered, so the second safely read-modify-writes what the first wrote.
       this.dispatch(
         srcSoftCeBwdP(T, V, k),
-        [probs, idBuf, rowMass, eo.grad, divBuf, el.grad],
+        [probs, idBuf, rowMass, eo.grad, divBuf, el.grad, rowInv],
         ceilDiv(T * V, 256),
       );
       this.dispatch(
