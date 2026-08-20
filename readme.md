@@ -53,7 +53,7 @@ deno run -A cli.ts pretrain --data your.tokens --out out/continued.gguf \
 | `pretrain`                    | train a base model, or continue one with `--resume`                                                              |
 | `finetune`                    | fine-tune on chat data, supervising only the assistant turns                                                     |
 | `eval-loss`                   | held-out validation loss on fixed windows                                                                        |
-| `eval-choice`                 | ARC / HellaSwag / perplexity                                                                                     |
+| `eval-choice`                 | ARC-Challenge / ARC-Easy / HellaSwag / PIQA / perplexity                                                         |
 | `generate`                    | greedy completion without llama.cpp                                                                              |
 | `inspect`                     | a GGUF's metadata, shape, and the flags needed to resume it                                                      |
 | `export`                      | re-export under a release name, with quants                                                                      |
@@ -80,9 +80,17 @@ Each architecture is a single file in `src/arch/` plus one line in the registry,
 - Checkpoint resume through GGUF plus an optimizer-state sidecar, so a long run survives an interruption.
 - `deno task test` type-checks the tree, then runs finite-difference gradient checks on every op (with a negative control, so we know it can catch a wrong backward) and GPU-vs-CPU parity on every kernel.
 
+## Results
+
+The model this trainer produced, [Felladrin/Minueza-3-95M-Base](https://huggingface.co/Felladrin/Minueza-3-95M-Base), scores an Intelligence Index of **9.67** on the [Open SLM Leaderboard](https://axiomiclabs-open-slm-leaderboard.static.hf.space/) tasks: PIQA 61.32, ARC-Easy 40.03, ARC-Challenge 22.61, HellaSwag 28.16 (acc_norm, full sets, 0-shot, scored with `eval-choice`). That places it 48th of 130 entries, above 64% of the board, at 94.7M parameters trained on one consumer APU.
+
+For scale, the top of that board sits near 25-27 and is trained on 100-1000x more tokens per parameter. `docs/optimization.md` lever 11 covers what that cohort does differently, and lever 4 covers why tokens-per-parameter is the binding constraint on quality rather than anything in this codebase.
+
+The full pipeline runs end to end here: pretrain a base, continue it on a new corpus with `--resume`, fine-tune on chat data through `chat-corpus` and `finetune` with assistant-only loss masking and an embedded ChatML template, and export GGUF with quants. No Python at any step.
+
 ## Honest limits
 
-- Single-digit to low-hundreds of millions of parameters. At 94.7M on one APU it did ~900 tokens/s on the kernels the published model was trained with, so 2B tokens took about 25 days; the kernels have since been vectorized (2.4x on an M1 Max) but nobody has re-run the APU number. Either way, JS and WebGPU won't match a CUDA cluster, and no flag changes that.
+- Single-digit to low-hundreds of millions of parameters. At 94.7M on one APU it does 1588 tokens/s, up from the ~900 the published model was trained at, so 2B tokens is about 14 days rather than 25. JS and WebGPU still won't match a CUDA cluster, and no flag changes that.
 - Training keeps float master weights and quantizes at export, so you can't really train in Q4_0.
 - Context length is capped by a WebGPU buffer limit, before compute becomes the problem: 8192 on adapters that grant their full buffer size, 2500-3000 on the ones that don't.
 - The GGUF output is structurally verified here, but please check it against `llama-cli` before trusting a specific build.

@@ -206,15 +206,15 @@ Violating any of these wastes a run. They are checked where possible; a few cann
 
 Measured on one AMD Strix Halo APU (128 GB unified memory), f32:
 
-| Model | Shape              | Throughput     | Peak GPU |
-| ----- | ------------------ | -------------- | -------- |
-| 94.7M | batch 8 x seq 2048 | ~900 tokens/s  | 39.3 GB  |
-| 94.7M | batch 8 x seq 1024 | ~1050 tokens/s | 28.9 GB  |
+| Model | Shape              | Throughput                              | Peak GPU |
+| ----- | ------------------ | --------------------------------------- | -------- |
+| 94.7M | batch 8 x seq 2048 | 1588 tokens/s                           | 39.3 GB  |
+| 94.7M | batch 8 x seq 2048 | ~900 tokens/s (pre-2026-08-18 kernels)  | 39.3 GB  |
+| 94.7M | batch 8 x seq 1024 | ~1050 tokens/s (pre-2026-08-18 kernels) | 28.9 GB  |
 
-**Those two rows predate the 2026-08-18 kernel rewrite and are the floor, not the current number.**
-The attention, GEMM and cross-entropy kernels were vectorized after they were taken; the same run on
-an M1 Max went 204 -> 490 tokens/s. Nobody has re-run it on Strix yet. Run `bench` on the machine in
-front of you before planning around a throughput figure, and see `docs/optimization.md` lever 1.
+The 2026-08-18 kernel rewrite vectorized attention, GEMM and cross-entropy: 1.71x end-to-end on
+Strix, 2.40x on an M1 Max. Run `bench` on the machine in front of you before planning around any of
+these, and see `docs/optimization.md` lever 1.
 
 That is 1.9 billion tokens in about 25 days of wall clock, which is what the published model cost.
 Plan in those units: a "quick experiment" is 100M tokens and a day. This is not a CUDA cluster and

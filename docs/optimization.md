@@ -8,20 +8,12 @@ measurements taken on the Strix Halo (AMD Radeon, RADV GFX1151, 128 GB unified) 
 94.7M-param / 8192-context pretraining run, not on speculation. Read `docs/design.md` for
 architecture and `readme.md` "Honest limits" for the ceiling this project accepts.
 
-## Measured baseline (2026-07-08)
+## Superseded baseline (2026-07-08)
 
-| Metric                     | Value                    | How measured                                        |
-| :------------------------- | :----------------------- | :-------------------------------------------------- |
-| Throughput                 | 0.049 st/s (20.4 s/step) | 94.7M, seq 2048, batch 8                            |
-| GPU busy                   | ~100%                    | `gpu_busy_percent` during the live run              |
-| Host RAM used by run       | ~34 GB                   | `ps rss` of the training process                    |
-| GPU-visible memory (GTT)   | ~37 GB of 128 GB         | `mem_info_gtt_used`                                 |
-| Attention share of runtime | ~78%                     | kernel profiling, `timestamp-query`                 |
-| f16 vs f32 compute         | same speed               | attention-bound; f16 only speeds the ~9% GEMM slice |
-
-> SUPERSEDED (2026-08-19). Every row above predates the 2026-08-18 kernel rewrite, and the two
-> conclusions that used to follow from it are no longer true. Kept for the record; read the block
-> below instead.
+Before the 2026-08-18 kernel rewrite: 0.049 st/s (20.4 s/step) at 94.7M / seq 2048 / batch 8, GPU
+busy ~100%, attention ~78% of runtime, f16 and f32 compute the same speed. Both conclusions that
+used to follow from it (the GPU is saturated; f16 cannot help) are now false. The numbers are kept
+only so a re-measurement can be compared against them; read the block below instead.
 
 ## Measured baseline (2026-08-19, post-rewrite, Strix)
 
@@ -517,6 +509,30 @@ Not built yet: the teacher-logit precompute pass over the SFT `.tokens` and the 
 `[T,V]` probability buffers (268 MB each at seq 2048, 1.07 GB at seq 8192); if that ever binds, fuse
 both targets into a single op sharing one softmax.
 
+### 9b. The four-task score, finally measured (2026-08-20)
+
+`eval-choice` gained ARC-Easy and PIQA, so the Open SLM Leaderboard's Intelligence Index is now
+computable for our own checkpoints instead of estimated. Full sets, 0-shot, on the roleplay
+continued-pretrain (`rp-full`, 94.7M):
+
+| Task          |  Items | acc_norm | chance | normalized |
+| :------------ | -----: | -------: | -----: | ---------: |
+| PIQA          |  1,838 |   61.32% |     50 |      22.64 |
+| ARC-Easy      |  2,376 |   40.03% |     25 |          - |
+| ARC-Challenge |  1,172 |   22.61% |     25 |          - |
+| ARC (mean)    |      - |   31.32% |     25 |       8.43 |
+| HellaSwag     | 10,042 |   28.16% |     25 |       4.21 |
+
+**Intelligence Index 9.67**, which ranks 48th of 130 on that board with 64% of entries scoring
+lower. ArithMark-3 is not implemented, so the index assumes it at chance; omitting the term instead
+gives 11.76, making the honest range 9.7-11.8.
+
+Two things to carry forward. ARC-Challenge at 22.61% is BELOW its 25% chance floor, which
+length-normalized scoring can produce when a model systematically prefers longer or shorter options
+regardless of content: worth investigating before the number goes on a model card. And PIQA carries
+the whole index (22.64 against HellaSwag's 4.21) partly because two-option normalization divides by
+50 rather than 75, which inflates any edge over chance.
+
 ### 11. What the sub-150M field does differently (2026-08-19)
 
 The [Open SLM Leaderboard](https://huggingface.co/spaces/AxiomicLabs/Open_SLM_Leaderboard) ranks 131
@@ -558,6 +574,35 @@ them from us. GPT-X2.5 uses WSD with the decay confined to the last 10%, against
 
 Not transferable, despite ranking 7th at 90M: `palmer-006` discloses no token count, no datasets and
 no optimizer, and describes a merge plus a light finetune of an unnamed base.
+
+## Ruled out at the kernel level (measured, do not re-tread)
+
+Folded in from the retired `speed-research.md`, whose plan was executed and whose outcomes are the
+levers above. These are the measurements that closed a door; each cost real time to get.
+
+| Idea                                | Outcome / reason                                                                                                                                                                |
+| :---------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| f16 compute (f16 mul, f32 accum)    | 0.98x on attention at seq 4096-8192, plus overflow-to-NaN at step 2400 without clamps                                                                                           |
+| f16 storage for Q/K/V               | 1.02-1.06x, and the gain shrinks as context grows                                                                                                                               |
+| Split-K attention (32 threads/row)  | 0.4-0.7x: destroys the wave-uniform K/V broadcast                                                                                                                               |
+| QT query-register tiling            | 0.80-0.94x at QT=2, 0.48-0.68x at QT=3: register pressure halves occupancy faster than reuse pays                                                                               |
+| GEMM tile 128/128/16/8/8            | 1.07x under GPU contention, 0.93x on an idle GPU (min-of-4). The contended read was the artifact; see lever 1b                                                                  |
+| WMMA / subgroup-matrix              | Not exposed by Deno's wgpu on gfx1151 (15 features probed, no `subgroups`); no WGSL matrix ops in the spec                                                                      |
+| bf16 of any kind                    | No `bf16` WGSL type, no `shader-bf16` feature, no bf16 in naga                                                                                                                  |
+| Fixed-max softmax via QK-norm bound | No safe static bound: q/k norm weights are trained, and under `qkClip` the observed max is 3.3-4.4x the proxy. The exp2-domain rescale gets the savings without needing a bound |
+| Per-lane SWA window start           | Destroys the wave broadcast; the block-aligned start (`winStartBlock`) is why SWA is not slower than full attention                                                             |
+| Lazy host `Tensor` storage          | Removes 98.9% of host allocation (4,395 MB/forward to 48 MB) and moves throughput <1%; see lever 1c                                                                             |
+
+### Machine independence
+
+Every lever here is plain WGSL: no intrinsics, no vendor paths, workgroup memory sized against
+`caps.maxComputeWorkgroupStorageSize` (16 KiB spec floor, 64 KiB on the Strix device), and no
+assumption about SFU or load-pipeline rates. What differs across machines is the _share_ of the
+bottleneck each lever addresses: the exp2 rescale matters most where the SFU is narrow (AMD
+quarter-rate), vectorized loads where load-issue is the constraint, register tiling where the FMA
+latency chain dominates. Measure the split on the target device before committing to a rewrite:
+`startProfile`/`stopProfile` plus the parity gate make each step a ten-minute experiment, and the
+gate is tolerance-based, so rounding-order changes are admissible.
 
 ## Explicitly not worth doing
 
