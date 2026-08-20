@@ -86,7 +86,7 @@ Scored with `eval-choice` on the Open SLM Leaderboard's four tasks, full sets, 0
 
 Two qualifiers that matter. This is a self-computed index, not a submitted entry, and the board's fifth task (ArithMark-3) is not implemented here, so it is assumed at chance; omitting the term instead gives 11.76. And it was measured on a roleplay continuation of the published base, not on the published [Minueza-3-95M-Base](https://huggingface.co/Felladrin/Minueza-3-95M-Base) file itself, which has not been scored on all four tasks yet.
 
-For placement, 9.67 would sit above 82 of the 129 entries on that board with complete task data, at 94.7M parameters trained on one consumer APU. The cohort above it is trained on 35 to 1000 times more tokens per parameter; `docs/optimization.md` lever 11 covers what they do differently, and lever 4 covers why tokens-per-parameter, not anything in this codebase, is the ceiling on quality.
+For placement, 9.67 would sit above 82 of the 129 entries on that board with complete task data, at 94.7M parameters trained on one consumer APU. The cohort above it is trained on 14 to 700 times more tokens per parameter; `docs/optimization.md` lever 11 covers what they do differently, and lever 4 covers why tokens-per-parameter, not anything in this codebase, is the ceiling on quality.
 
 ## Honest limits
 
