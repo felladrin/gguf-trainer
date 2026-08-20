@@ -28,7 +28,13 @@ import {
 } from "../data/chat.ts";
 import { BPETokenizer } from "../tokenizer/bpe.ts";
 import type { TokenizerData } from "../tokenizer/bpe.ts";
-import { diskTokenSource, tokenBytes, writeTokenFile } from "../data/tokens.ts";
+import {
+  diskTokenSource,
+  type IdArray as IdArrayT,
+  idArrayFor,
+  tokenBytes,
+  writeTokenFile,
+} from "../data/tokens.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -144,8 +150,8 @@ async function run(v: Values) {
   // ~10^8 tokens, and a single joined string would exceed the ~512MB string cap.
   console.log("encoding corpus (per conversation, with assistant-only mask) …");
   const t0 = performance.now();
-  const IdArray = tokenBytes(tok.vocabSize) === 2 ? Uint16Array : Uint32Array;
-  let ids: Uint16Array | Uint32Array = new IdArray(1 << 24);
+  const IdArray = idArrayFor(tok.vocabSize);
+  let ids: IdArrayT = new IdArray(1 << 24);
   let sup = new Uint8Array(1 << 24);
   let len = 0;
   const decode = (x: number[]) => tok.decode(x);

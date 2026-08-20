@@ -29,6 +29,21 @@ export function tokenBytes(vocabSize: number): 2 | 4 {
   return vocabSize <= 0x10000 ? 2 : 4;
 }
 
+/** Growable id buffers must match the file width, or a large vocab wraps. */
+export type IdArray = Uint16Array | Uint32Array;
+
+/**
+ * The typed-array constructor an id buffer for this vocab must use.
+ *
+ * A u16 buffer does not fail on a vocab past 65,536: it truncates each id into a
+ * smaller one that is itself a legal id, so nothing downstream can detect it.
+ * Qwen3 is 151,936 tokens, Llama-3 128,256, Gemma 262,144, so any encoder that
+ * may see a resumed foreign vocab has to ask before allocating.
+ */
+export function idArrayFor(vocabSize: number): Uint16ArrayConstructor | Uint32ArrayConstructor {
+  return tokenBytes(vocabSize) === 2 ? Uint16Array : Uint32Array;
+}
+
 /** Wrap an in-memory token array (typed or plain) as a TokenSource. */
 export function memTokenSource(data: ArrayLike<number>): TokenSource {
   return {

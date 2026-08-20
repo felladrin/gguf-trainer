@@ -8,7 +8,7 @@
 // The on-disk round-trip at both widths is covered by gradcheck.ts; this file is
 // about picking the width and about what goes wrong when it is picked wrong.
 // Run:  deno run tests/large-vocab.ts
-import { tokenBytes } from "../src/data/tokens.ts";
+import { idArrayFor, tokenBytes } from "../src/data/tokens.ts";
 
 function ok(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -37,12 +37,31 @@ const u32 = new Uint32Array(ids.length);
 u32.set(ids);
 ok(Array.from(u32).join(",") === ids.join(","), "u32 preserves every id exactly");
 
-// The width a caller must pick for each vocab, which is the whole contract.
-for (const v of [32768, 49152, 151936]) {
-  const A = tokenBytes(v) === 2 ? Uint16Array : Uint32Array;
-  const buf = new A(1);
-  buf[0] = v - 1; // the largest id that vocab can produce
-  ok(buf[0] === v - 1, `vocab ${v}: the top id survives its own width`);
+// idArrayFor is the fix: every encoder asks it for the width instead of assuming
+// u16. This is the part that fails on a tree without the change.
+ok(idArrayFor(32768) === Uint16Array, "a vocab that fits gets a u16 buffer");
+ok(idArrayFor(49152) === Uint16Array, "SmolLM2's vocab gets a u16 buffer");
+ok(idArrayFor(65537) === Uint32Array, "one past the ceiling gets a u32 buffer");
+ok(idArrayFor(151936) === Uint32Array, "Qwen3's vocab gets a u32 buffer");
+
+// The contract that matters at the call site: the largest id a vocab can produce
+// must survive a round-trip through the buffer idArrayFor hands back.
+for (const v of [32768, 49152, 128256, 151936, 262144]) {
+  const buf = new (idArrayFor(v))(1);
+  buf[0] = v - 1;
+  ok(buf[0] === v - 1, `vocab ${v}: top id ${v - 1} survives its own buffer width`);
 }
+
+// And the same loop against a hard-coded u16 buffer, which is what the encoders
+// used to do: the two large vocabs must be the ones that break.
+const broken = [32768, 49152, 128256, 151936, 262144].filter((v) => {
+  const buf = new Uint16Array(1);
+  buf[0] = v - 1;
+  return buf[0] !== v - 1;
+});
+ok(
+  broken.join(",") === "128256,151936,262144",
+  `a u16 buffer must corrupt exactly the large vocabs, got [${broken.join(",")}]`,
+);
 
 console.log("large-vocab: all checks passed");

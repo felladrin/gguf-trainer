@@ -38,7 +38,8 @@ import type { TokenizerData } from "../tokenizer/bpe.ts";
 import { CURRICULUM_SPECIALS } from "../data/chat.ts";
 import { llamaRunScript } from "../export/export-gguf.ts";
 import { wsdSchedule } from "../train/schedule.ts";
-import { diskTokenSource, tokenBytes, writeTokenFile } from "../data/tokens.ts";
+import { diskTokenSource, idArrayFor, tokenBytes, writeTokenFile } from "../data/tokens.ts";
+import type { IdArray as IdArrayT } from "../data/tokens.ts";
 import type { TokenSource } from "../data/tokens.ts";
 import { parseQuantList } from "../gguf/quantize.ts";
 import type { QuantName } from "../gguf/quantize.ts";
@@ -154,11 +155,11 @@ async function siblingTokenizer(tokensPath: string): Promise<BPETokenizer> {
  * The width follows the vocab: u16 for a vocab trained here, u32 for a resumed
  * foreign one. Qwen3 is 151,936 tokens and Llama-3 128,256, so a fixed u16 buffer
  * would wrap their ids silently rather than fail. */
-function encodeCorpus(tok: BPETokenizer, corpus: string): Uint16Array | Uint32Array {
+function encodeCorpus(tok: BPETokenizer, corpus: string): IdArrayT {
   const docs = corpus.split(DOC_SEP).map((d) => d.trim()).filter((d) => d.length > 0);
-  const IdArray = tokenBytes(tok.vocabSize) === 2 ? Uint16Array : Uint32Array;
+  const IdArray = idArrayFor(tok.vocabSize);
   let cap = 1 << 20, n = 0;
-  let ids: Uint16Array | Uint32Array = new IdArray(cap);
+  let ids: IdArrayT = new IdArray(cap);
   const push = (id: number) => {
     if (n >= cap) {
       cap *= 2;
