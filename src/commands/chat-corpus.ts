@@ -11,16 +11,18 @@
 //
 // Writes <out>.tokens, <out>.mask, <out>.tokenizer.json, <out>.template.txt.
 //
-// This NEVER trains a vocab: the embedding matrix
-// froze at pretraining, so a new vocab would be incompatible with the
-// checkpoint. The base tokenizer already reserves every curriculum special
-// (CURRICULUM_SPECIALS), which is checked below before anything is encoded.
+// This NEVER trains a vocab: the embedding matrix froze at pretraining, so a new
+// vocab would be incompatible with the checkpoint. What the render needs is the
+// three CHATML_SPECIALS, checked below before anything is encoded. A base trained
+// here reserves all of CURRICULUM_SPECIALS up front; a resumed foreign checkpoint
+// reserves its own set instead, and the difference is reported, not fatal.
 
 import { Template } from "@huggingface/jinja";
 import { fetchParquetUrls } from "../data/hf.ts";
 import { parseDataFile } from "../data/parse.ts";
 import {
   assistantLossMask,
+  CHATML_SPECIALS,
   CURRICULUM_SPECIALS,
   DEFAULT_CHAT_TEMPLATE,
   detectMapping,
@@ -30,7 +32,7 @@ import { BPETokenizer } from "../tokenizer/bpe.ts";
 import type { TokenizerData } from "../tokenizer/bpe.ts";
 import {
   diskTokenSource,
-  type IdArray as IdArrayT,
+  type IdArray,
   idArrayFor,
   tokenBytes,
   writeTokenFile,
@@ -64,13 +66,12 @@ async function run(v: Values) {
   // both carry ChatML but neither carries our <tools>/</tools>. Demanding the full
   // set there would block `finetune --resume` against any published checkpoint,
   // which is a workflow this trainer advertises.
-  const REQUIRED = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
-  const missing = REQUIRED.filter((s) => tok.idOf(s) === undefined);
+  const missing = CHATML_SPECIALS.filter((s) => tok.encode(s).length !== 1);
   if (missing.length) {
     die(
-      `${tokenizerPath} lacks [${missing.join(", ")}], which the ChatML render needs. ` +
-        `A base trained here gets them from \`tokenize --curriculum-specials\`; a foreign ` +
-        `checkpoint must already carry ChatML.`,
+      `${tokenizerPath} does not encode [${missing.join(", ")}] atomically, which the ChatML ` +
+        `render needs. A base trained here gets them from \`tokenize --curriculum-specials\`; a ` +
+        `foreign checkpoint must already carry ChatML in its specials list, not just its vocab.`,
     );
   }
   const absent = CURRICULUM_SPECIALS.filter((s) => tok.idOf(s) === undefined);
@@ -150,8 +151,8 @@ async function run(v: Values) {
   // ~10^8 tokens, and a single joined string would exceed the ~512MB string cap.
   console.log("encoding corpus (per conversation, with assistant-only mask) …");
   const t0 = performance.now();
-  const IdArray = idArrayFor(tok.vocabSize);
-  let ids: IdArrayT = new IdArray(1 << 24);
+  const IdBuffer = idArrayFor(tok.vocabSize);
+  let ids: IdArray = new IdBuffer(1 << 24);
   let sup = new Uint8Array(1 << 24);
   let len = 0;
   const decode = (x: number[]) => tok.decode(x);
@@ -160,7 +161,7 @@ async function run(v: Values) {
     const m = assistantLossMask(e, imStart, imEnd, decode);
     if (len + e.length + 1 > ids.length) {
       const cap = Math.max(ids.length * 2, len + e.length + 1);
-      const grownIds = new IdArray(cap);
+      const grownIds = new IdBuffer(cap);
       grownIds.set(ids.subarray(0, len));
       ids = grownIds;
       const grownSup = new Uint8Array(cap);

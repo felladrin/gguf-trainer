@@ -9,6 +9,8 @@
 // about picking the width and about what goes wrong when it is picked wrong.
 // Run:  deno run tests/large-vocab.ts
 import { idArrayFor, tokenBytes } from "../src/data/tokens.ts";
+import { BPETokenizer } from "../src/tokenizer/bpe.ts";
+import { encodeCorpus } from "../src/commands/pretrain.ts";
 
 function ok(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -63,5 +65,24 @@ ok(
   broken.join(",") === "128256,151936,262144",
   `a u16 buffer must corrupt exactly the large vocabs, got [${broken.join(",")}]`,
 );
+
+// The real encoder, on a vocab past the ceiling. This is the assertion that fails
+// on a tree without the fix, and it fails with a WRONG VALUE rather than an import
+// error: 69999 & 0xffff is 4463, which is itself a legal id.
+{
+  const tokens = Array.from({ length: 70000 }, (_, i) => `t${i}`);
+  tokens[69999] = "<|endoftext|>";
+  const tok = BPETokenizer.fromData({
+    tokens,
+    merges: [],
+    bosId: 69999,
+    eosId: 69999,
+    specials: ["<|endoftext|>"],
+  });
+  ok(tok.vocabSize === 70000, `fixture vocab is past the u16 ceiling, got ${tok.vocabSize}`);
+  const ids = Array.from(encodeCorpus(tok, "a<|endoftext|>b"));
+  ok(ids.includes(69999), `eos 69999 survives the encode buffer, got [${ids.join(",")}]`);
+  ok(!ids.includes(4463), "and is not truncated to 4463, the u16 wrap of that id");
+}
 
 console.log("large-vocab: all checks passed");

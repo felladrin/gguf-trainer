@@ -7,7 +7,8 @@
 
 import { readGGUF } from "../gguf/gguf.ts";
 import type { GGUFFile } from "../gguf/gguf.ts";
-import { readFileBytes } from "../io.ts";
+import { readFileBytes, writeFileBytes } from "../io.ts";
+import { tokenizerFromGGUF } from "../export/load-gguf.ts";
 import { archFromGGUF } from "../model/registry.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -22,6 +23,28 @@ async function run(v: Values) {
     throw new UsageError(`cannot read ${path}`);
   });
   const g = readGGUF(bytes);
+
+  // The corpus commands reuse the base model's vocab verbatim (a new one would not
+  // match the frozen embedding matrix), and they read it from a sibling
+  // .tokenizer.json. A downloaded checkpoint carries its vocab in GGUF metadata
+  // instead, so without this there is no way to get from one to the other.
+  if (v.has("dump-tokenizer")) {
+    const out = v.str("dump-tokenizer");
+    const t = tokenizerFromGGUF(g);
+    await writeFileBytes(out, new TextEncoder().encode(JSON.stringify(t)));
+    const atomic = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
+      .filter((x) => t.specials?.includes(x));
+    console.log(
+      `wrote ${out}: ${t.tokens.length} tokens, ${t.merges.length} merges, ` +
+        `${t.specials?.length ?? 0} specials, eos ${t.eosId}`,
+    );
+    console.log(
+      atomic.length === 3
+        ? "ChatML present: this vocab can drive `chat-corpus`"
+        : `ChatML incomplete (${atomic.join(" ") || "none"}): \`chat-corpus\` will refuse it`,
+    );
+    return;
+  }
 
   const meta: Record<string, unknown> = {};
   for (const [k, val] of g.metadata) {
@@ -111,10 +134,16 @@ export const inspectCommand: Command = {
 
 The "Resume with:" line is the point: it prints the exact architecture flags \`pretrain\`
 and \`finetune\` need to continue that checkpoint. A mismatch there is the most common
-reason a resume aborts.`,
+reason a resume aborts.
+
+--dump-tokenizer writes that checkpoint's vocab out as a .tokenizer.json. Every corpus
+command reuses the base model's vocab verbatim rather than training a new one, so this
+is the step that makes a DOWNLOADED checkpoint usable: convert it to GGUF, dump its
+tokenizer, then point \`chat-corpus --tokenizer\` at the result.`,
   examples: [
     "inspect --model Minueza-3-95M-Base.F32.gguf",
     "inspect --model model.gguf --json",
+    "inspect --model smollm2.gguf --dump-tokenizer data/smollm2.tokenizer.json",
   ],
   flags: [
     {
@@ -125,6 +154,14 @@ reason a resume aborts.`,
       describe: "the GGUF file to read",
     },
     { name: "json", type: "boolean", describe: "machine-readable output" },
+    {
+      name: "dump-tokenizer",
+      type: "string",
+      placeholder: "PATH",
+      describe:
+        "write the checkpoint's vocab as a .tokenizer.json, so `chat-corpus` and `finetune` can " +
+        "encode a corpus against a downloaded model",
+    },
     { name: "tensors", type: "boolean", describe: "also list every tensor name and shape" },
     {
       name: "full",
