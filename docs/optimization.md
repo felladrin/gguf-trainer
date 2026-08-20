@@ -36,6 +36,69 @@ The two facts that now drive everything below:
    one sequence per forward/backward and sums the gradients (`train-gpu.ts`), so batch size trades
    step count for per-step time at a fixed tokens/second. It changes gradient noise, not throughput.
 
+## Where the step goes: the arithmetic
+
+Folded in from the retired `speed-research.md`. The FLOP accounting does not change when kernels
+are rewritten, and the instruction analysis is why the attention kernel was the target: it is a
+property of the kernel source, not of the silicon.
+
+### FLOP accounting
+
+FLOP accounting (2 FLOPs/MAC, per (head, t, s) attention pair at head-dim 64):
+
+- forward: QK dot 2d + PV 2d = 256 FLOPs
+- `srcAttnBwdDq`: QK 2d + dP 2d + dQ update 2d = 384 FLOPs
+- `srcAttnBwdDkv`: QK 2d + dP 2d + dK 2d + dV 2d = 512 FLOPs
+- `srcAttnBwdD`: 2d per row (negligible)
+
+Pairs per micro-batch at T=2048, window 1024, 10 heads: SWA layer
+Σ_t min(t+1, W) = 1.57M/head → 15.7M; global layer T(T+1)/2 = 2.1M/head → 21M. With 10 SWA +
+2 global layers × 8 micro-batches: **~1.6G pairs/step → ~1.8 TFLOP of useful attention FLOPs**.
+Note T=2048 with W=1024 makes a SWA layer cost ~73% of a global layer; the 5:1 SWA ratio only
+pays off above T=2W (at T=8192 a global layer costs 4x an SWA layer, which is the measured 28%
+throughput drop at long context).
+
+Linear GEMMs: ~6 FLOPs/token/param on the 73.7M non-embedding params → ~7.2 TFLOP/step
+(includes the tied-readout logits GEMM, ~206 GFLOP/step of it). Muon Newton-Schulz: 5 quintic
+iterations × 3 [640³]-class GEMMs per 2-D param → ~1.2 TFLOP/step.
+
+### Why the attention kernel sat 17-35x below the GEMM kernel
+
+Instruction accounting for the forward kernel, per wave per key-step (one key-step processes 32
+query rows, one per lane; the two backward kernels repeat the shape, heavier):
+
+- **128 scalar load instructions** (64 K-row + 64 V-row), wave-uniform and cache-served; as
+  vec4 they would be 32;
+- **128 FMA instructions**, but the QK dot is a **64-deep serial accumulation chain** (one
+  `dot` accumulator), which is the only latency hazard at full occupancy;
+- **2 MUFU instructions** (`corr` + `p`), plus the 2 base-conversion multiplies `exp()` implies:
+  WGSL `exp` lowers to multiply-by-log2(e) + `v_exp2_f32`, and the SFU runs **quarter-rate** on
+  AMD silicon (one `v_exp2_f32` per 4 clocks per SIMD32 on RDNA2, same SFU class on
+  RDNA3/3.5). At 2 MUFU instructions per 32-pair key-step that is ~8 SFU cycles per ~274 issue
+  slots: the SFU has wide headroom today, so exp-count is a second-order lever and **issue slots
+  are the first-order constraint**;
+- for reference the FP32 FMA ceiling is 128 FLOPs/CU/cycle single-issue (256 with the RDNA3.5
+  VOPD dual-issue path, which a scalar loop does not reliably trigger).
+
+That is ~8.6 issue slots per (head, t, s) pair, of which 4 are loads. Contrast `srcGemm`,
+measured at ~2-4 TFLOP/s in the same stack: 4x4 unrolled accumulators (16 independent chains,
+4x ILP), cooperative coalesced staging through workgroup memory, and a K-loop whose per-step
+instruction count is amortized over 16 MACs per fragment load. The attention kernel uses none of
+the three: scalar loads, a 1-wide accumulator chain, and an exp per rescale. That is the target;
+it is a property of the kernel source, not of the silicon, which is why the fix is
+machine-independent.
+
+Hardware references used above: per-CU VALU rates and VOPD for gfx1151 from the ROCm profiler
+speed-of-light docs ([rocm.docs.amd.com](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/develop/conceptual/rdna/system-speed-of-light.html)),
+SFU/TFU behavior and `v_exp_f32` from the ROCm HIP hardware-implementation chapter
+([rocm.docs.amd.com](https://rocm.docs.amd.com/projects/HIP/en/latest/understand/hardware_implementation.html)),
+the quarter-rate SFU figure from the RDNA2 instruction analysis at
+[nelcit.github.io](https://nelcit.github.io/shader-clippy/blog/pow-const-squared). WebGPU's
+portable workgroup-storage floor is 16 KiB ([MDN](https://developer.mozilla.org/en-US/docs/Web/API/GPUSupportedLimits));
+the Strix device grants 64 KiB (journal probe), and the backend already captures the granted cap
+in `DeviceCaps.maxComputeWorkgroupStorageSize`, so any tile choice can be sized against it at
+runtime.
+
 ## Throughput levers (the binding constraint)
 
 ### 1. Attention kernel: the ~78% slice: PARTLY RESOLVED (2026-08-18), 2.4x end-to-end on M1 Max
@@ -577,8 +640,7 @@ no optimizer, and describes a merge plus a light finetune of an unnamed base.
 
 ## Ruled out at the kernel level (measured, do not re-tread)
 
-Folded in from the retired `speed-research.md`, whose plan was executed and whose outcomes are the
-levers above. These are the measurements that closed a door; each cost real time to get.
+Measurements that closed a door; each cost real time to get.
 
 | Idea                                | Outcome / reason                                                                                                                                                                |
 | :---------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -623,3 +685,22 @@ gate is tolerance-based, so rounding-order changes are admissible.
   custom u16 BPE vs their 262k tokenizer), and cross-tokenizer KD (GOLD/ULD) is research-grade
   machinery. Data-level KD is already the corpus strategy (TinyStories and smol-smoltalk are
   teacher-generated); same-vocab distillation stays available via the checkpoint anchor (#10).
+
+## References
+
+- Repo measurements: `docs/notes/journal.md` (kernel rewrites, reverted attempts),
+  `docs/notes/journal.md` (kernel rewrites, reverted attempts, remaining roadmap),
+  `docs/design.md` (precision and backend bring-up).
+- RDNA3.5 (gfx1151) speed-of-light rates, VOPD: [rocm.docs.amd.com](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/develop/conceptual/rdna/system-speed-of-light.html)
+- RDNA SFU/TFU, `v_exp_f32`, LDS bandwidth, Wave32: [rocm.docs.amd.com](https://rocm.docs.amd.com/projects/HIP/en/latest/understand/hardware_implementation.html)
+- SFU quarter-rate (RDNA2, applied by class): [nelcit.github.io](https://nelcit.github.io/shader-clippy/blog/pow-const-squared)
+- WebGPU limit defaults (16 KiB workgroup storage floor): [developer.mozilla.org](https://developer.mozilla.org/en-US/docs/Web/API/GPUSupportedLimits)
+- WGSL spec (`exp2`, atomics, workgroup memory): [w3.org](https://www.w3.org/TR/WGSL)
+- Bind-group reuse guidance: [toji.dev](https://toji.dev/webgpu-best-practices)
+- Prior art, browser WGSL training (forward+backward+AdamW, online-softmax attention; small
+  scale, no published throughput at 95M): [github.com](https://github.com/toprakdeviren/webgpu-llm)
+- Fused linear-cross-entropy prior art (CUDA/Triton; concept reference for C2):
+  [github.com](https://github.com/linkedin/Liger-Kernel), [github.com](https://github.com/mgmalek/efficient_cross_entropy)
+- FlashAttention-3 (what full 2D tiling + tensor cores buys on NVIDIA; context for why the same
+  structure is not automatically fast on a no-TC, no-subgroup WebGPU path):
+  [arxiv.org](https://arxiv.org/abs/2407.08608)
