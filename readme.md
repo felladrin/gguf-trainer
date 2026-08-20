@@ -91,7 +91,7 @@ For placement, 9.67 would sit above 82 of the 129 entries on that board with com
 ## Honest limits
 
 - **A model this size is a demonstration, not a product.** At 94.7M and ~21 tokens per parameter it produces locally fluent text and cannot hold a conversation: it does not carry facts across turns, and it will confabulate an answer to anything factual. The index above measures the trainer working, not a model you would deploy.
-- Single-digit to low-hundreds of millions of parameters. At 94.7M on one APU it does 1588 tokens/s, up from the ~900 the published model was trained at, so 2B tokens is about 14 days rather than 25. JS and WebGPU still won't match a CUDA cluster, and no flag changes that.
+- Single-digit to low-hundreds of millions of parameters. At 94.7M on one APU it does 1588 tokens/s, up from the ~900 the published model was trained at, so the published model's 1.95B tokens is about 14 days rather than 25. JS and WebGPU still won't match a CUDA cluster, and no flag changes that.
 - Training keeps float master weights and quantizes at export, so you can't really train in Q4_0.
 - Context length is capped by a WebGPU buffer limit, before compute becomes the problem: 8192 on adapters that grant their full buffer size, 2500-3000 on the ones that don't.
 - The GGUF output is structurally verified here, but please check it against `llama-cli` before trusting a specific build.

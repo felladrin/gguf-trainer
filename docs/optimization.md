@@ -10,7 +10,9 @@ architecture and `readme.md` "Honest limits" for the ceiling this project accept
 
 ## Superseded baseline (2026-07-08)
 
-Before the 2026-08-18 kernel rewrite: 0.049 st/s (20.4 s/step) at 94.7M / seq 2048 / batch 8, GPU
+Before the 2026-08-18 kernel rewrite: 0.049 st/s (20.4 s/step) at 94.7M / seq 2048 / batch 8 (that
+step time implies ~803 tok/s, while every other pre-rewrite figure in this file uses 903 tok/s at
+~18 s/step; the two were taken weeks apart and are not reconciled), GPU
 busy ~100%, attention ~78% of runtime, f16 and f32 compute the same speed. Two things that
 followed from it no longer hold. The GPU is NOT saturated (lever 1). And the reason once given for
 f16, that it "only speeds the ~9% GEMM slice", was never the reason: measured, f16 compute is 0.98x
@@ -22,7 +24,7 @@ against them; read the block below instead.
 
 | Metric                  | Value                     | How measured                                                          |
 | :---------------------- | :------------------------ | :-------------------------------------------------------------------- |
-| Throughput              | 0.0969 st/s (10.6 s/step) | 94.7M, seq 2048, batch 8, instantaneous                               |
+| Throughput              | 0.0969 st/s (10.6 s/step) | 94.7M, seq 2048, batch 8, plateau rate                                |
 | Throughput              | 1588 tok/s (1.76x)        | against 903 tok/s on the old kernels                                  |
 | GPU busy                | **~42%** / 52.5%          | `gpu_busy_percent`; 42% during the run, 52.5% re-measured uncontended |
 | Host CPU                | ~400% of 32 cores         | `top` on the trainer process                                          |
@@ -367,13 +369,14 @@ step. The host time is in the dispatch path itself, not in allocating host array
 this on next should profile bind-group and pipeline setup per dispatch, not memory.
 
 One loose end worth naming: this configuration reaches 0.161 st/s where the roleplay run logged
-0.093, with byte-identical GPU allocation (39278 MB, pool 37714 + state 1564). A 1.7x gap that is
+0.093 as its average (lever 5b: every resume runs ~750 steps slow, which is why the average sits
+below the 0.0969 plateau), with byte-identical GPU allocation (39278 MB, pool 37714 + state 1564). A 1.7x gap that is
 not yet attributed. The likeliest explanation is that the ten-hour run shared the GPU with the
 benchmarking in this document, which is the same contention that reversed lever 1b's GEMM tile
 result. Treat the 10.6 s/step baseline at the top of this file as an upper bound until that is
 settled.
 
-### Ruled out at the kernel level (measured, do not re-tread)
+### 1d. Ruled out at the kernel level (measured, do not re-tread)
 
 Measurements that closed a door; each cost real time to get.
 
@@ -392,8 +395,8 @@ Measurements that closed a door; each cost real time to get.
 
 #### Machine independence
 
-Every lever here is plain WGSL: no intrinsics, no vendor paths, workgroup memory sized against the
-16 KiB spec floor rather than against the granted cap (see the retraction above: sizing to a
+Every lever in this file, taken and rejected alike, is plain WGSL: no intrinsics, no vendor paths, workgroup memory sized against the
+16 KiB spec floor rather than against the granted cap (see the retraction under "Where the step goes: the arithmetic": sizing to a
 device's granted 64 KiB ships a kernel that only runs on that device), and no assumption about SFU
 or load-pipeline rates. What differs across machines is the _share_ of the
 bottleneck each lever addresses: the exp2 rescale matters most where the SFU is narrow (AMD
@@ -454,7 +457,7 @@ a fixed _model size_. Every model that beats us above trained two to three order
 longer per parameter.
 
 Throughput is 1588 tok/s sustained after the 2026-08-18 kernel rewrite (Strix, seq 2048 batch 8,
-instantaneous rate over the roleplay run), i.e. **137M tokens/day**, up from the 70M this section
+the plateau rate of the roleplay run), i.e. **137M tokens/day**, up from the 70M this section
 used to assume. The arithmetic is still discouraging:
 
 | target                         | total tokens | still to train | days at 137M/day |
@@ -577,8 +580,8 @@ order, on CPU.
 
 **The "Minueza-3" naming now has data behind it, on HellaSwag.** We clear Minueza-2-96M by 1.43
 points (28.46 vs 27.03; combined uncertainty ~0.63, so ~2.3σ) and Minueza-32M-Base by 2.7. On
-ARC-Challenge only SmolLM2 (31.44 ±2.69) is clearly above chance. Supra2 (27.42 ±2.58) is within
-its own error bar of it, and the remaining five sit between 21.74 and 23.41, so no ranking among
+ARC-Challenge only SmolLM2 (31.44 ±2.69) is clearly above chance. Supra2 (27.42 ±2.58) is within one
+error bar of chance, and the remaining five sit between 21.74 and 23.41, so no ranking among
 them is meaningful, ours included. Two consistency checks: HellaSwag scored 28.4704 and
 28.4605 on two independent runs of our model (task order is deterministic), and Supra2's 35.31 here
 is close to the 0.36 acc_norm its card reports under the EleutherAI LM-Eval Harness, which suggests
