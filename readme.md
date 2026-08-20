@@ -82,14 +82,15 @@ Each architecture is a single file in `src/arch/` plus one line in the registry,
 
 ## Results
 
-The model this trainer produced, [Felladrin/Minueza-3-95M-Base](https://huggingface.co/Felladrin/Minueza-3-95M-Base), scores an Intelligence Index of **9.67** on the [Open SLM Leaderboard](https://axiomiclabs-open-slm-leaderboard.static.hf.space/) tasks: PIQA 61.32, ARC-Easy 40.03, ARC-Challenge 22.61, HellaSwag 28.16 (acc_norm, full sets, 0-shot, scored with `eval-choice`). That places it 48th of 130 entries, above 64% of the board, at 94.7M parameters trained on one consumer APU.
+Scored with `eval-choice` on the Open SLM Leaderboard's four tasks, full sets, 0-shot: PIQA 61.32, ARC-Easy 40.03, ARC-Challenge 22.61, HellaSwag 28.16 (acc_norm). Computed the board's way that is an **Intelligence Index of 9.67**, against 25-27 at the top of that board.
 
-For scale, the top of that board sits near 25-27 and is trained on 100-1000x more tokens per parameter. `docs/optimization.md` lever 11 covers what that cohort does differently, and lever 4 covers why tokens-per-parameter is the binding constraint on quality rather than anything in this codebase.
+Two qualifiers that matter. This is a self-computed index, not a submitted entry, and the board's fifth task (ArithMark-3) is not implemented here, so it is assumed at chance; omitting the term instead gives 11.76. And it was measured on a roleplay continuation of the published base, not on the published [Minueza-3-95M-Base](https://huggingface.co/Felladrin/Minueza-3-95M-Base) file itself, which has not been scored on all four tasks yet.
 
-The full pipeline runs end to end here: pretrain a base, continue it on a new corpus with `--resume`, fine-tune on chat data through `chat-corpus` and `finetune` with assistant-only loss masking and an embedded ChatML template, and export GGUF with quants. No Python at any step.
+For placement, 9.67 would sit above 82 of the 129 entries on that board with complete task data, at 94.7M parameters trained on one consumer APU. The cohort above it is trained on 35 to 1000 times more tokens per parameter; `docs/optimization.md` lever 11 covers what they do differently, and lever 4 covers why tokens-per-parameter, not anything in this codebase, is the ceiling on quality.
 
 ## Honest limits
 
+- **A model this size is a demonstration, not a product.** At 94.7M and ~15 tokens per parameter it produces locally fluent text and cannot hold a conversation: it does not carry facts across turns, and it will confabulate an answer to anything factual. The index above measures the trainer working, not a model you would deploy.
 - Single-digit to low-hundreds of millions of parameters. At 94.7M on one APU it does 1588 tokens/s, up from the ~900 the published model was trained at, so 2B tokens is about 14 days rather than 25. JS and WebGPU still won't match a CUDA cluster, and no flag changes that.
 - Training keeps float master weights and quantizes at export, so you can't really train in Q4_0.
 - Context length is capped by a WebGPU buffer limit, before compute becomes the problem: 8192 on adapters that grant their full buffer size, 2500-3000 on the ones that don't.

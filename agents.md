@@ -212,11 +212,14 @@ Measured on one AMD Strix Halo APU (128 GB unified memory), f32:
 | 94.7M | batch 8 x seq 2048 | ~900 tokens/s (pre-2026-08-18 kernels)  | 39.3 GB  |
 | 94.7M | batch 8 x seq 1024 | ~1050 tokens/s (pre-2026-08-18 kernels) | 28.9 GB  |
 
-The 2026-08-18 kernel rewrite vectorized attention, GEMM and cross-entropy: 1.71x end-to-end on
-Strix, 2.40x on an M1 Max. Run `bench` on the machine in front of you before planning around any of
-these, and see `docs/optimization.md` lever 1.
+The 2026-08-18 kernel rewrite vectorized attention, GEMM and cross-entropy: 903 -> 1588 tok/s on
+Strix (1.76x) and 2.40x on an M1 Max. 1588 is the SUSTAINED rate inside a real run; the same shape
+measured 2651 tok/s over 150 steps on an idle GPU, and that 1.7x gap is not yet attributed (see
+`docs/optimization.md` lever 1c). Run `bench` on the machine in front of you before planning around
+any of these.
 
-That is 1.9 billion tokens in about 25 days of wall clock, which is what the published model cost.
+The published model was trained on the pre-rewrite kernels, so its 1.9 billion tokens cost about
+25 days of wall clock; at 1588 tok/s the same run is about 14.
 Plan in those units: a "quick experiment" is 100M tokens and a day. This is not a CUDA cluster and
 no flag makes it one. Sub-100M models are the honest target.
 

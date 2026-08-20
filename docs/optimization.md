@@ -38,9 +38,39 @@ The two facts that now drive everything below:
 
 ## Where the step goes: the arithmetic
 
-Folded in from the retired `speed-research.md`. The FLOP accounting does not change when kernels
-are rewritten, and the instruction analysis is why the attention kernel was the target: it is a
-property of the kernel source, not of the silicon.
+Folded in from the retired `speed-research.md`. The FLOP accounting does not change when kernels are
+rewritten. The instruction analysis that follows it is the PRE-MEASUREMENT reasoning, kept because
+the gap between what it predicted and what was measured is the useful part, and it is wrong in
+places that are called out inline. Lever 1 is the current ledger.
+
+| Lever                         | Predicted             | Measured (M1 Max)                                | Outcome                                                                       |
+| :---------------------------- | :-------------------- | :----------------------------------------------- | :---------------------------------------------------------------------------- |
+| A1 vec4 inner loop            | 1.3-1.5x on the slice | 1.9-2.5x on the slice                            | done, under-called                                                            |
+| A2 exp2 + conditional rescale | 1.01-1.03x            | 1.16-1.36x per kernel                            | done, badly under-called: `exp` is not one instruction                        |
+| A3 partial accumulators       | neutral or 1.2x       | 1.18-1.20x in `srcAttnBwdDkv`, neutral elsewhere | done in that one kernel only                                                  |
+| B1 GEMM BK + vec4 fragments   | 1.1-1.3x              | 1.85x on the tied readout                        | done; needed the A tile staged transposed, which the analysis did not foresee |
+| C1 CE, drop the divide pass   | ~1.02x of the step    | 15.7x on CE                                      | done, but the divide pass was not the problem: one thread per row was         |
+| D1 bind-group cache           | removes 10-50 ms/step | 71.5 ms/step = 0.4%                              | measured, NOT done                                                            |
+
+Three things the plan got wrong, all of which the first measurement caught, which is why building
+the benchmark first was the right call:
+
+1. **The target.** The accounting below is for `srcAttnFwd`. Profiled per kernel, `srcAttnBwdDkv` was
+   ~70% of the attention slice and `srcAttnFwd` ~15%: the whole discussion aimed at the wrong kernel.
+2. **The SFU argument.** "Issue slots are the first-order constraint, exp-count is second-order" is
+   refuted below. `exp` -> `exp2` alone gave 1.16-1.36x per kernel, including in `srcAttnBwdDkv`,
+   which has no conditional rescale at all, so `exp` does not lower to one multiply plus one
+   hardware instruction.
+3. **Cross-entropy.** Scoped as saving one pass out of four. The actual defect was a kernel running
+   on T threads total with no coalescing; a workgroup per row plus the fused pass gave 15.7x.
+
+Parked, measured but not acted on while the step is host-bound (kernels are ~330 ms of a 10.6 s
+step): `srcEmbeddingBwd` scaling (~0.3% of the step at 32768x640, multi-percent at 2x vocab, so
+revisit if the vocab grows), `srcRmsNormBwdW`'s ~16x overfetch (~1% of the step), a RoPE table
+precompute, and sliding-window warmup (~2-3% of the run at T=2048, worse at T>=4096). Chunked online
+cross-entropy over the vocab axis, which would avoid materializing the `[T,V]` logits and buy
+headroom for bigger batches at 8K, is deferred rather than executed: see lever 3 for the 1 GiB
+logits tensor it targets.
 
 ### FLOP accounting
 
@@ -95,9 +125,12 @@ SFU/TFU behavior and `v_exp_f32` from the ROCm HIP hardware-implementation chapt
 the quarter-rate SFU figure from the RDNA2 instruction analysis at
 [nelcit.github.io](https://nelcit.github.io/shader-clippy/blog/pow-const-squared). WebGPU's
 portable workgroup-storage floor is 16 KiB ([MDN](https://developer.mozilla.org/en-US/docs/Web/API/GPUSupportedLimits));
-the Strix device grants 64 KiB (journal probe), and the backend already captures the granted cap
-in `DeviceCaps.maxComputeWorkgroupStorageSize`, so any tile choice can be sized against it at
-runtime.
+the Strix device grants 64 KiB (journal probe), and the backend captures the granted cap in
+`DeviceCaps.maxComputeWorkgroupStorageSize`. Sizing a tile against that GRANTED cap is exactly what
+must not happen, and this sentence originally proposed it: it emits a kernel that runs on the
+machine that built it and fails only for someone else, and no runtime here validates the difference.
+`attnBwdTile` sizes against the 16 KiB floor unconditionally, and `tests/kernel-limits.ts` holds it
+there.
 
 ## Throughput levers (the binding constraint)
 
@@ -538,6 +571,32 @@ generating past a turn boundary on both files), so the variant only helps runtim
 heuristic. All 134 tensors are byte-identical (sha256 per tensor) between the two files, which is
 also the cleanest proof that our conversion path reproduces theirs exactly.
 
+### 9b. The four-task score, finally measured (2026-08-20)
+
+`eval-choice` gained ARC-Easy and PIQA, so the Open SLM Leaderboard's Intelligence Index is now
+computable for our own checkpoints instead of estimated. Full sets, 0-shot, on the roleplay
+continued-pretrain (`rp-full`, 94.7M):
+
+| Task          |  Items | acc_norm | chance | normalized |
+| :------------ | -----: | -------: | -----: | ---------: |
+| PIQA          |  1,838 |   61.32% |     50 |      22.64 |
+| ARC-Easy      |  2,376 |   40.03% |     25 |          - |
+| ARC-Challenge |  1,172 |   22.61% |     25 |          - |
+| ARC (mean)    |      - |   31.32% |     25 |       8.43 |
+| HellaSwag     | 10,042 |   28.16% |     25 |       4.21 |
+
+**Intelligence Index 9.67**, which ranks 48th of 130 on that board with 64% of entries scoring
+lower. ArithMark-3 is not implemented, so the index assumes it at chance; omitting the term instead
+gives 11.76, making the honest range 9.7-11.8.
+
+Three things to carry forward. ARC-Challenge at 22.61% is below its 25% chance floor, but lever 9's
+head-to-head shows six of seven models between 21.74 and 23.41 under length-normalized scoring, so
+this is a property of the ruler at this scale, not a defect of ours. PIQA carries the whole index
+(22.64 against HellaSwag's 4.21) partly because two-option normalization divides by 50 rather than
+75, which inflates any edge over chance. And against lever 9's 32.20 on a 2000-item HellaSwag
+subset: the full set gives 28.16 here, and llama.cpp gave 28.46 on the full set for Phase A, so that
+subset was biased by about 4 points rather than noisy by ~1 as lever 9 claims.
+
 ### 10. Phase B KL anchor against the base checkpoint (medium): OP DONE
 
 The continual-learning use of distillation (HF post `sergiopaniego/distillation-2026`): during Phase
@@ -572,30 +631,6 @@ Not built yet: the teacher-logit precompute pass over the SFT `.tokens` and the 
 `[T,V]` probability buffers (268 MB each at seq 2048, 1.07 GB at seq 8192); if that ever binds, fuse
 both targets into a single op sharing one softmax.
 
-### 9b. The four-task score, finally measured (2026-08-20)
-
-`eval-choice` gained ARC-Easy and PIQA, so the Open SLM Leaderboard's Intelligence Index is now
-computable for our own checkpoints instead of estimated. Full sets, 0-shot, on the roleplay
-continued-pretrain (`rp-full`, 94.7M):
-
-| Task          |  Items | acc_norm | chance | normalized |
-| :------------ | -----: | -------: | -----: | ---------: |
-| PIQA          |  1,838 |   61.32% |     50 |      22.64 |
-| ARC-Easy      |  2,376 |   40.03% |     25 |          - |
-| ARC-Challenge |  1,172 |   22.61% |     25 |          - |
-| ARC (mean)    |      - |   31.32% |     25 |       8.43 |
-| HellaSwag     | 10,042 |   28.16% |     25 |       4.21 |
-
-**Intelligence Index 9.67**, which ranks 48th of 130 on that board with 64% of entries scoring
-lower. ArithMark-3 is not implemented, so the index assumes it at chance; omitting the term instead
-gives 11.76, making the honest range 9.7-11.8.
-
-Two things to carry forward. ARC-Challenge at 22.61% is BELOW its 25% chance floor, which
-length-normalized scoring can produce when a model systematically prefers longer or shorter options
-regardless of content: worth investigating before the number goes on a model card. And PIQA carries
-the whole index (22.64 against HellaSwag's 4.21) partly because two-option normalization divides by
-50 rather than 75, which inflates any edge over chance.
-
 ### 11. What the sub-150M field does differently (2026-08-19)
 
 The [Open SLM Leaderboard](https://huggingface.co/spaces/AxiomicLabs/Open_SLM_Leaderboard) ranks 131
@@ -607,13 +642,14 @@ a controlled study, so read these as where to look, not as proven causes.
 **Token budget, restated against real competitors.** Lever 4 makes this argument from Minueza-2 and
 SmolLM2; the board says the same thing with models that are not outliers:
 
-| model              | params | tokens | tokens/param | Int Index |
-| :----------------- | -----: | -----: | -----------: | --------: |
-| SmolLM2-135M       |   135M |    ~2T |       14,815 |     27.13 |
-| GPT-X2.5-135M      |   135M |    75B |          556 |     25.17 |
-| BananaMind-2-Pro   |   139M |   100B |          719 |     24.96 |
-| Supra2-100M-Base   |   101M |    30B |          298 |     19.41 |
-| ours, phaseA-final |  94.7M |  1.44B |       **15** |  unscored |
+| model              | params |       tokens | tokens/param | Int Index |
+| :----------------- | -----: | -----------: | -----------: | --------: |
+| SmolLM2-135M       |   135M |          ~2T |       14,815 |     27.13 |
+| GPT-X2.5-135M      |   135M |          75B |          556 |     25.17 |
+| BananaMind-2-Pro   |   139M |         100B |          719 |     24.96 |
+| Supra2-100M-Base   |   101M |          30B |          298 |     19.41 |
+| ours, phaseA-final |  94.7M |        1.44B |       **15** |  unscored |
+| ours, rp-full      |  94.7M | 1.44B + 123M |       **15** |      9.67 |
 
 **Depth over width, and a 3x FFN rather than 4x.** Both top non-HuggingFace models spend parameters
 on layers instead of on a wide FFN:
@@ -657,9 +693,10 @@ Measurements that closed a door; each cost real time to get.
 
 ### Machine independence
 
-Every lever here is plain WGSL: no intrinsics, no vendor paths, workgroup memory sized against
-`caps.maxComputeWorkgroupStorageSize` (16 KiB spec floor, 64 KiB on the Strix device), and no
-assumption about SFU or load-pipeline rates. What differs across machines is the _share_ of the
+Every lever here is plain WGSL: no intrinsics, no vendor paths, workgroup memory sized against the
+16 KiB spec floor rather than against the granted cap (see the retraction above: sizing to a
+device's granted 64 KiB ships a kernel that only runs on that device), and no assumption about SFU
+or load-pipeline rates. What differs across machines is the _share_ of the
 bottleneck each lever addresses: the exp2 rescale matters most where the SFU is narrow (AMD
 quarter-rate), vectorized loads where load-issue is the constraint, register tiling where the FMA
 latency chain dominates. Measure the split on the target device before committing to a rewrite:
@@ -699,7 +736,7 @@ gate is tolerance-based, so rounding-order changes are admissible.
 - Bind-group reuse guidance: [toji.dev](https://toji.dev/webgpu-best-practices)
 - Prior art, browser WGSL training (forward+backward+AdamW, online-softmax attention; small
   scale, no published throughput at 95M): [github.com](https://github.com/toprakdeviren/webgpu-llm)
-- Fused linear-cross-entropy prior art (CUDA/Triton; concept reference for C2):
+- Fused linear-cross-entropy prior art (CUDA/Triton; concept reference for the deferred chunked-CE idea above):
   [github.com](https://github.com/linkedin/Liger-Kernel), [github.com](https://github.com/mgmalek/efficient_cross_entropy)
 - FlashAttention-3 (what full 2D tiling + tensor cores buys on NVIDIA; context for why the same
   structure is not automatically fast on a no-TC, no-subgroup WebGPU path):
