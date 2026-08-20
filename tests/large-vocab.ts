@@ -11,6 +11,9 @@
 import { idArrayFor, tokenBytes } from "../src/data/tokens.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { encodeCorpus } from "../src/commands/pretrain.ts";
+import { GGUFWriter, readGGUF } from "../src/gguf/gguf.ts";
+import { tokenizerFromGGUF } from "../src/export/load-gguf.ts";
+import { CHATML_SPECIALS } from "../src/data/chat.ts";
 
 function ok(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -87,6 +90,41 @@ ok(
   ok(ids.includes(69999), `eos 69999 survives the encode buffer, got [${ids.join(",")}]`);
   ok(!ids.includes(4463), "and is not truncated to 4463, the u16 wrap of that id");
   ok(ids.includes(0), `the ordinary-encode path also reached the buffer, got [${ids.join(",")}]`);
+}
+
+// `inspect --dump-tokenizer` is how a downloaded checkpoint's vocab reaches the
+// corpus commands, and tokenizerFromGGUF is the whole of its logic. Round-trip a
+// synthetic large-vocab GGUF rather than a real 1.1 GB download.
+{
+  const tokens = [
+    "<|endoftext|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    ...Array.from(
+      { length: 99997 },
+      (_, i) => `w${i}`,
+    ),
+  ];
+  const w = new GGUFWriter();
+  w.meta_string("general.architecture", "llama");
+  w.meta_arr_str("tokenizer.ggml.tokens", tokens);
+  w.meta_arr_str("tokenizer.ggml.merges", ["w0 w1"]);
+  // llama.cpp marks turn tokens CONTROL (3); tokenizerFromGGUF recovers specials
+  // from that, and falls back to the <|...|> shape only when no types are present.
+  w.meta_arr_i32("tokenizer.ggml.token_type", tokens.map((t, i) => (i < 3 ? 3 : 1)));
+  w.meta_u32("tokenizer.ggml.bos_token_id", 0);
+  w.meta_u32("tokenizer.ggml.eos_token_id", 2);
+  const t = tokenizerFromGGUF(readGGUF(w.build()));
+
+  ok(t.tokens.length === 100000, `vocab survives the round-trip, got ${t.tokens.length}`);
+  ok(tokenBytes(t.tokens.length) === 4, "and it is a vocab that needs u32");
+  ok(t.eosId === 2, `eos comes back, got ${t.eosId}`);
+  for (const sp of CHATML_SPECIALS) {
+    ok(t.specials?.includes(sp) === true, `${sp} is recovered as an atomic special`);
+  }
+  // The verdict inspect prints, and the condition chat-corpus enforces.
+  const atomic = CHATML_SPECIALS.filter((x) => t.specials?.includes(x));
+  ok(atomic.length === CHATML_SPECIALS.length, "so this vocab can drive chat-corpus");
 }
 
 console.log("large-vocab: all checks passed");

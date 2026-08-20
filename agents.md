@@ -96,8 +96,9 @@ deno run -A cli.ts finetune --data data/sft.tokens --mask data/sft.mask \
 ```
 
 The flags above are SmolLM2-135M's; paste whatever step 2 prints for your base, ALL of
-it. `--max-seq` is compared too, so dropping it resumes against a default of 8192 and a
-base with a longer context (Qwen3 is 40960) aborts on the mismatch.
+it. `--max-seq` is compared too, so dropping it resumes against the default
+`max(8192, seq-len)` and a base with a longer context (Qwen3 is 40960) aborts on the
+mismatch.
 
 The base must already carry ChatML (`<|im_start|>`, `<|im_end|>`, `<|endoftext|>`) as
 atomic specials; `--dump-tokenizer` says whether it does. Its other special tokens do
