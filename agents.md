@@ -86,10 +86,14 @@ extra step versus continuing a model trained here:
 deno run -A cli.ts inspect --model base.gguf --dump-tokenizer data/base.tokenizer.json
 # 3. Build the SFT corpus against THAT vocab
 deno run -A cli.ts chat-corpus --data chats.jsonl --tokenizer data/base.tokenizer.json --out data/sft
-# 4. Fine-tune, repeating the flags step 2 printed
+# 4. Fine-tune, repeating the architecture flags step 2 printed. They are not
+#    optional: without them the config is built from defaults and the resume aborts.
 deno run -A cli.ts finetune --data data/sft.tokens --mask data/sft.mask \
-  --template data/sft.template.txt --resume base.gguf --out out/tuned.gguf --steps 400
+  --template data/sft.template.txt --resume base.gguf --out out/tuned.gguf --steps 400 \
+  --arch llama --hidden 576 --layers 30 --head-dim 64 --heads 9 --kv-heads 3 --ffn-dim 1536
 ```
+
+The flags above are SmolLM2-135M's; use whatever step 2 prints for your base.
 
 The base must already carry ChatML (`<|im_start|>`, `<|im_end|>`, `<|endoftext|>`) as
 atomic specials; `--dump-tokenizer` says whether it does. Its other special tokens do

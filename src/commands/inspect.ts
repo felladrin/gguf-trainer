@@ -9,6 +9,7 @@ import { readGGUF } from "../gguf/gguf.ts";
 import type { GGUFFile } from "../gguf/gguf.ts";
 import { readFileBytes, writeFileBytes } from "../io.ts";
 import { tokenizerFromGGUF } from "../export/load-gguf.ts";
+import { CHATML_SPECIALS } from "../data/chat.ts";
 import { archFromGGUF } from "../model/registry.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -32,18 +33,22 @@ async function run(v: Values) {
     const out = v.str("dump-tokenizer");
     const t = tokenizerFromGGUF(g);
     await writeFileBytes(out, new TextEncoder().encode(JSON.stringify(t)));
-    const atomic = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
-      .filter((x) => t.specials?.includes(x));
-    console.log(
-      `wrote ${out}: ${t.tokens.length} tokens, ${t.merges.length} merges, ` +
-        `${t.specials?.length ?? 0} specials, eos ${t.eosId}`,
-    );
-    console.log(
-      atomic.length === 3
-        ? "ChatML present: this vocab can drive `chat-corpus`"
-        : `ChatML incomplete (${atomic.join(" ") || "none"}): \`chat-corpus\` will refuse it`,
-    );
-    return;
+    // chat-corpus refuses a vocab that cannot encode these three atomically, so
+    // say now rather than after a dataset download. Same constant it checks.
+    const atomic = CHATML_SPECIALS.filter((x) => t.specials?.includes(x));
+    if (!v.has("json")) {
+      console.log(
+        `wrote ${out}: ${t.tokens.length} tokens, ${t.merges.length} merges, ` +
+          `${t.specials?.length ?? 0} specials, eos ${t.eosId}`,
+      );
+      console.log(
+        atomic.length === CHATML_SPECIALS.length
+          ? "ChatML present: this vocab can drive `chat-corpus`"
+          : `ChatML incomplete (${atomic.join(" ") || "none"}): \`chat-corpus\` will refuse it`,
+      );
+    }
+    // Deliberately no early return: the "Resume with:" line below is what the
+    // fine-tune step needs, and a recipe that dumps the vocab wants both.
   }
 
   const meta: Record<string, unknown> = {};
@@ -129,10 +134,9 @@ function resumeFlags(g: GGUFFile): string {
 
 export const inspectCommand: Command = {
   name: "inspect",
-  summary: "Print a GGUF file's metadata, shape and resume flags.",
-  details: `Reads the header only, so it is instant even on a multi-GB file.
-
-The "Resume with:" line is the point: it prints the exact architecture flags \`pretrain\`
+  summary: "Print a GGUF file's metadata, shape and resume flags; optionally extract its vocab.",
+  details:
+    `The "Resume with:" line is the point: it prints the exact architecture flags \`pretrain\`
 and \`finetune\` need to continue that checkpoint. A mismatch there is the most common
 reason a resume aborts.
 

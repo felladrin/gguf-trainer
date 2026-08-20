@@ -70,7 +70,10 @@ ok(
 // on a tree without the fix, and it fails with a WRONG VALUE rather than an import
 // error: 69999 & 0xffff is 4463, which is itself a legal id.
 {
+  // One real byte token so the `for (const id of tok.encode(doc)) push(id)` path
+  // is fed a genuine id too, not only the eos that `push(tok.eosId)` supplies.
   const tokens = Array.from({ length: 70000 }, (_, i) => `t${i}`);
+  tokens[0] = "a";
   tokens[69999] = "<|endoftext|>";
   const tok = BPETokenizer.fromData({
     tokens,
@@ -83,6 +86,7 @@ ok(
   const ids = Array.from(encodeCorpus(tok, "a<|endoftext|>b"));
   ok(ids.includes(69999), `eos 69999 survives the encode buffer, got [${ids.join(",")}]`);
   ok(!ids.includes(4463), "and is not truncated to 4463, the u16 wrap of that id");
+  ok(ids.includes(0), `the ordinary-encode path also reached the buffer, got [${ids.join(",")}]`);
 }
 
 console.log("large-vocab: all checks passed");
