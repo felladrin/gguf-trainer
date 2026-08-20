@@ -12,15 +12,17 @@ architecture and `readme.md` "Honest limits" for the ceiling this project accept
 
 Before the 2026-08-18 kernel rewrite: 0.049 st/s (20.4 s/step) at 94.7M / seq 2048 / batch 8, GPU
 busy ~100%, attention ~78% of runtime, f16 and f32 compute the same speed. Both conclusions that
-used to follow from it (the GPU is saturated; f16 cannot help) are now false. The numbers are kept
-only so a re-measurement can be compared against them; read the block below instead.
+used to follow from it are now false: the GPU is NOT saturated, and "f16 only speeds the ~9% GEMM
+slice" is not why f16 does not help. f16 still does not help, but for a better reason (0.98x
+measured, see the ruled-out table). The numbers are kept only so a re-measurement can be compared
+against them; read the block below instead.
 
 ## Measured baseline (2026-08-19, post-rewrite, Strix)
 
 | Metric                  | Value                     | How measured                                                          |
 | :---------------------- | :------------------------ | :-------------------------------------------------------------------- |
 | Throughput              | 0.0969 st/s (10.6 s/step) | 94.7M, seq 2048, batch 8, instantaneous                               |
-| Throughput              | 1588 tok/s (1.71x)        | against 903 tok/s on the old kernels                                  |
+| Throughput              | 1588 tok/s (1.76x)        | against 903 tok/s on the old kernels                                  |
 | GPU busy                | **~42%** / 52.5%          | `gpu_busy_percent`; 42% during the run, 52.5% re-measured uncontended |
 | Host CPU                | ~400% of 32 cores         | `top` on the trainer process                                          |
 | Host RSS                | 1.06 GB steady            | sampled every 10s over 150 steps; flat from 300s on                   |
@@ -55,10 +57,11 @@ places that are called out inline. Lever 1 is the current ledger.
 Three things the plan got wrong, all of which the first measurement caught, which is why building
 the benchmark first was the right call:
 
-1. **The target.** The accounting below is for `srcAttnFwd`. Profiled per kernel, `srcAttnBwdDkv` was
-   ~70% of the attention slice and `srcAttnFwd` ~15%: the whole discussion aimed at the wrong kernel.
-2. **The SFU argument.** "Issue slots are the first-order constraint, exp-count is second-order" is
-   refuted below. `exp` -> `exp2` alone gave 1.16-1.36x per kernel, including in `srcAttnBwdDkv`,
+1. **The target.** The instruction accounting under "Why the attention kernel sat 17-35x below the
+   GEMM kernel" is for `srcAttnFwd`. Profiled per kernel, `srcAttnBwdDkv` was ~70% of the attention
+   slice and `srcAttnFwd` ~15%: the whole discussion aimed at the wrong kernel.
+2. **The SFU argument.** That same section concludes "issue slots are the first-order constraint,
+   exp-count is second-order". Refuted: `exp` -> `exp2` alone gave 1.16-1.36x per kernel, including in `srcAttnBwdDkv`,
    which has no conditional rescale at all, so `exp` does not lower to one multiply plus one
    hardware instruction.
 3. **Cross-entropy.** Scoped as saving one pass out of four. The actual defect was a kernel running
@@ -70,7 +73,9 @@ revisit if the vocab grows), `srcRmsNormBwdW`'s ~16x overfetch (~1% of the step)
 precompute, and sliding-window warmup (~2-3% of the run at T=2048, worse at T>=4096). Chunked online
 cross-entropy over the vocab axis, which would avoid materializing the `[T,V]` logits and buy
 headroom for bigger batches at 8K, is deferred rather than executed: see lever 3 for the 1 GiB
-logits tensor it targets.
+logits tensor it targets. Two more stay open: 2D workgroup tiling for attention (a staged-forward
+variant measured 17% SLOWER, `docs/notes/journal.md`), and cutting Newton-Schulz from five
+iterations to four, which needs an orthogonality-residual check to gate it.
 
 ### FLOP accounting
 
@@ -314,7 +319,8 @@ this.grad = new Float32Array(data.length);
 Every tensor gets TWO full-size host `Float32Array`s, including every intermediate activation under
 the GPU backend, where both live on the device and are never read. Measured: **one forward allocates
 4.34 GB of host array across 244 tensors.** Eight micro-batches are retained for the accumulation
-step, so a step churns ~35 GB, which is exactly the 34.9 GB resident above.
+step, so a step churns ~35 GB, which matched the 34.9 GB `smaps_rollup` reading taken during the
+live run. (That reading did not reproduce later; see the negative result below.)
 
 Honest accounting: warm-page allocation of 4.34 GB costs 2-4 ms, cold costs 126 ms, and an isolated
 forward's op overhead is ~400 ms. That explains ~500 ms of the ~1500 ms per micro-batch. The
@@ -541,8 +547,8 @@ order, on CPU.
 
 **The "Minueza-3" naming now has data behind it, on HellaSwag.** We clear Minueza-2-96M by 1.43
 points (28.46 vs 27.03; combined uncertainty ~0.63, so ~2.3σ) and Minueza-32M-Base by 2.7. On
-ARC-Challenge all seven models sit at chance (25% ±2.4; even SmolLM2 only reaches 31), so no
-ranking there is meaningful, ours included. Two consistency checks: HellaSwag scored 28.4704 and
+ARC-Challenge five of the seven sit at chance (25% ±2.4); only SmolLM2 (31.44) and Supra2 (27.42)
+clear it, so no ranking among the rest is meaningful, ours included. Two consistency checks: HellaSwag scored 28.4704 and
 28.4605 on two independent runs of our model (task order is deterministic), and Supra2's 35.31 here
 is close to the 0.36 acc_norm its card reports under the EleutherAI LM-Eval Harness, which suggests
 the two rulers agree at this scale even though they normalize differently. Do NOT mix our
@@ -585,12 +591,20 @@ continued-pretrain (`rp-full`, 94.7M):
 | ARC (mean)    |      - |   31.32% |     25 |       8.43 |
 | HellaSwag     | 10,042 |   28.16% |     25 |       4.21 |
 
-**Intelligence Index 9.67**, which ranks 48th of 130 on that board with 64% of entries scoring
-lower. ArithMark-3 is not implemented, so the index assumes it at chance; omitting the term instead
-gives 11.76, making the honest range 9.7-11.8.
+The board's formula normalizes each task against its chance floor, `N = 100 x (score - chance) /
+(100 - chance)`, averages ARC-Easy and ARC-Challenge into ONE ARC term before normalizing, and
+weights ArithMark-3 at 0.65:
+
+    Index = (HellaSwag + ARC + PIQA + 0.65 x ArithMark) / 3.65
+          = (4.21 + 8.43 + 22.64 + 0) / 3.65 = 9.67
+
+**Intelligence Index 9.67.** ArithMark-3 is not implemented here, so it is assumed at chance;
+omitting the term entirely gives 35.28 / 3 = 11.76, making the honest range 9.7-11.8. Against the
+board, 9.67 places 48th of 130 counting ours: it ranks 131 models, of which 129 carry the complete
+task data the index needs.
 
 Three things to carry forward. ARC-Challenge at 22.61% is below its 25% chance floor, but lever 9's
-head-to-head shows six of seven models between 21.74 and 23.41 under length-normalized scoring, so
+head-to-head shows five of seven models between 21.74 and 23.41 under length-normalized scoring, so
 this is a property of the ruler at this scale, not a defect of ours. PIQA carries the whole index
 (22.64 against HellaSwag's 4.21) partly because two-option normalization divides by 50 rather than
 75, which inflates any edge over chance. And against lever 9's 32.20 on a 2000-item HellaSwag
@@ -649,7 +663,7 @@ SmolLM2; the board says the same thing with models that are not outliers:
 | BananaMind-2-Pro   |   139M |         100B |          719 |     24.96 |
 | Supra2-100M-Base   |   101M |          30B |          298 |     19.41 |
 | ours, phaseA-final |  94.7M |        1.44B |       **15** |  unscored |
-| ours, rp-full      |  94.7M | 1.44B + 123M |       **15** |      9.67 |
+| ours, rp-full      |  94.7M | 1.95B + 123M |     **21.9** |      9.67 |
 
 **Depth over width, and a 3x FFN rather than 4x.** Both top non-HuggingFace models spend parameters
 on layers instead of on a wide FFN:
@@ -725,9 +739,8 @@ gate is tolerance-based, so rounding-order changes are admissible.
 
 ## References
 
-- Repo measurements: `docs/notes/journal.md` (kernel rewrites, reverted attempts),
-  `docs/notes/journal.md` (kernel rewrites, reverted attempts, remaining roadmap),
-  `docs/design.md` (precision and backend bring-up).
+- Repo measurements: `docs/notes/journal.md` (kernel rewrites, reverted attempts, remaining
+  roadmap), `docs/design.md` (precision and backend bring-up).
 - RDNA3.5 (gfx1151) speed-of-light rates, VOPD: [rocm.docs.amd.com](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/develop/conceptual/rdna/system-speed-of-light.html)
 - RDNA SFU/TFU, `v_exp_f32`, LDS bandwidth, Wave32: [rocm.docs.amd.com](https://rocm.docs.amd.com/projects/HIP/en/latest/understand/hardware_implementation.html)
 - SFU quarter-rate (RDNA2, applied by class): [nelcit.github.io](https://nelcit.github.io/shader-clippy/blog/pow-const-squared)
