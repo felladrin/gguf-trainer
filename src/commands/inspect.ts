@@ -29,6 +29,7 @@ async function run(v: Values) {
   // match the frozen embedding matrix), and they read it from a sibling
   // .tokenizer.json. A downloaded checkpoint carries its vocab in GGUF metadata
   // instead, so without this there is no way to get from one to the other.
+  let dumped: Record<string, unknown> | undefined;
   if (v.has("dump-tokenizer")) {
     const out = v.str("dump-tokenizer");
     const t = tokenizerFromGGUF(g);
@@ -36,7 +37,15 @@ async function run(v: Values) {
     // chat-corpus refuses a vocab that cannot encode these three atomically, so
     // say now rather than after a dataset download. Same constant it checks.
     const atomic = CHATML_SPECIALS.filter((x) => t.specials?.includes(x));
-    if (!v.has("json")) {
+    dumped = {
+      path: out,
+      tokens: t.tokens.length,
+      merges: t.merges.length,
+      specials: t.specials?.length ?? 0,
+      eosId: t.eosId,
+      chatml: atomic.length === CHATML_SPECIALS.length,
+    };
+    if (!v.bool("json")) {
       console.log(
         `wrote ${out}: ${t.tokens.length} tokens, ${t.merges.length} merges, ` +
           `${t.specials?.length ?? 0} specials, eos ${t.eosId}`,
@@ -75,6 +84,7 @@ async function run(v: Values) {
         tensors: v.bool("tensors")
           ? g.tensors.map((t) => ({ name: t.name, dims: t.dims, type: t.type }))
           : undefined,
+        dumpTokenizer: dumped,
       },
       null,
       2,

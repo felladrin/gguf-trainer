@@ -83,6 +83,7 @@ extra step versus continuing a model trained here:
 ```sh
 # 1. Convert the HF checkpoint to GGUF (llama.cpp's convert_hf_to_gguf.py)
 # 2. Read its shape, and write its vocab where the corpus commands can find it
+mkdir -p data
 deno run -A cli.ts inspect --model base.gguf --dump-tokenizer data/base.tokenizer.json
 # 3. Build the SFT corpus against THAT vocab
 deno run -A cli.ts chat-corpus --data chats.jsonl --tokenizer data/base.tokenizer.json --out data/sft
@@ -90,10 +91,13 @@ deno run -A cli.ts chat-corpus --data chats.jsonl --tokenizer data/base.tokenize
 #    optional: without them the config is built from defaults and the resume aborts.
 deno run -A cli.ts finetune --data data/sft.tokens --mask data/sft.mask \
   --template data/sft.template.txt --resume base.gguf --out out/tuned.gguf --steps 400 \
-  --arch llama --hidden 576 --layers 30 --head-dim 64 --heads 9 --kv-heads 3 --ffn-dim 1536
+  --arch llama --hidden 576 --layers 30 --head-dim 64 --heads 9 --kv-heads 3 \
+  --ffn-dim 1536 --max-seq 8192
 ```
 
-The flags above are SmolLM2-135M's; use whatever step 2 prints for your base.
+The flags above are SmolLM2-135M's; paste whatever step 2 prints for your base, ALL of
+it. `--max-seq` is compared too, so dropping it resumes against a default of 8192 and a
+base with a longer context (Qwen3 is 40960) aborts on the mismatch.
 
 The base must already carry ChatML (`<|im_start|>`, `<|im_end|>`, `<|endoftext|>`) as
 atomic specials; `--dump-tokenizer` says whether it does. Its other special tokens do
