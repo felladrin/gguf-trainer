@@ -460,10 +460,12 @@ Throughput is 1588 tok/s sustained after the 2026-08-18 kernel rewrite (Strix, s
 the plateau rate of the roleplay run), i.e. **137M tokens/day**, up from the 70M this section
 used to assume. The arithmetic is still discouraging:
 
+The "still to train" column is against the published model's 1.95B, not phaseA-final's 1.44B.
+
 | target                         | total tokens | still to train | days at 137M/day |
 | :----------------------------- | -----------: | -------------: | ---------------: |
-| 100 tokens/param               |         9.5B |           8.0B |               58 |
-| Minueza-2's 1,927 tokens/param |         185B |           184B |    1,340 (3.7 y) |
+| 100 tokens/param               |         9.5B |           7.5B |               55 |
+| Minueza-2's 1,927 tokens/param |         185B |           183B |    1,335 (3.7 y) |
 | SmolLM2's ~14,800 tokens/param |         1.4T |           1.4T |        ~28 years |
 
 So closing the gap to Minueza-2 is not "a compute-time decision" as this section previously called

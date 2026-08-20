@@ -22,17 +22,17 @@ deno run -A cli.ts <command> --help  # one command's flags, with defaults and ex
 
 ## Which document answers what
 
-This file is the operating manual: read it end to end before running anything. The rest of the docs
-are consulted, not read, and this is when each one earns opening.
+The rest of the docs are consulted, not read. This is when each one earns opening.
 
-| You are about to                              | Read                                                                                                               |
-| :-------------------------------------------- | :----------------------------------------------------------------------------------------------------------------- |
-| run any command                               | this file: the contract, the invariants, then the recipe                                                           |
-| add a model shape                             | [docs/adding-an-architecture.md](docs/adding-an-architecture.md)                                                   |
-| change a kernel or chase throughput           | [docs/optimization.md](docs/optimization.md), lever 1d FIRST: it lists what has already been measured and rejected |
-| understand why the engine is shaped this way  | [docs/design.md](docs/design.md)                                                                                   |
-| pick a corpus, a token budget or a model size | [docs/optimization.md](docs/optimization.md) levers 4 and 11                                                       |
-| reproduce or question a published number      | [docs/notes/](docs/notes/), point-in-time evidence, not maintained                                                 |
+| You are about to                             | Read                                                                                                                                                                      |
+| :------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| run any command                              | this file: the contract, the invariants, then the recipe                                                                                                                  |
+| add a model shape                            | [docs/adding-an-architecture.md](docs/adding-an-architecture.md)                                                                                                          |
+| change a kernel or chase throughput          | [docs/optimization.md](docs/optimization.md), lever 1d FIRST: it lists what has already been measured and rejected                                                        |
+| understand why the engine is shaped this way | [docs/design.md](docs/design.md)                                                                                                                                          |
+| pick a corpus or a token budget              | [docs/optimization.md](docs/optimization.md) levers 4 and 11; for model size, Hardware reality below                                                                      |
+| reproduce or question a published number     | [docs/optimization.md](docs/optimization.md) levers 1, 9 and 9b for the number; [docs/notes/](docs/notes/) for the run that produced it, point-in-time and not maintained |
+| judge whether this project fits your goal    | [readme.md](readme.md): the results and the honest limits                                                                                                                 |
 
 ## Contract
 
@@ -75,16 +75,6 @@ Violating any of these wastes a run. They are checked where possible; a few cann
 7. **`--seq-len` must fit `--max-seq`,** and context is capped by a WebGPU buffer limit before
    compute: attention binds one `[heads, T, T]` buffer per layer. 8192 works on adapters that grant
    their full buffer size; 2500-3000 on those that fall back to the 128 MiB default.
-
-## Already measured and rejected
-
-Before optimizing a kernel, read the ruled-out table in `docs/optimization.md` (lever 1d). It
-records what was tried, measured and abandoned, with the numbers: f16 compute (0.98x), f16 storage
-for Q/K/V (1.02-1.06x), split-K attention (0.4-0.7x), QT query-register tiling (0.48-0.94x), a
-larger GEMM tile (0.93x on an idle GPU), lazy host tensor storage (removes 98.9% of host allocation,
-moves throughput <1%), and why WMMA, subgroup matrices and bf16 are not reachable from WGSL here.
-Each of those cost hours to establish. Re-deriving one is the most common way to waste a day in this
-repo.
 
 ## Recipes
 
@@ -234,7 +224,7 @@ Measured on one AMD Strix Halo APU (128 GB unified memory), f32:
 | Model | Shape              | Throughput                              | Peak GPU |
 | ----- | ------------------ | --------------------------------------- | -------- |
 | 94.7M | batch 8 x seq 2048 | 1588 tokens/s                           | 39.3 GB  |
-| 94.7M | batch 8 x seq 2048 | ~900 tokens/s (pre-2026-08-18 kernels)  | 39.3 GB  |
+| 94.7M | batch 8 x seq 2048 | 903 tokens/s (pre-2026-08-18 kernels)   | 39.3 GB  |
 | 94.7M | batch 8 x seq 1024 | ~1050 tokens/s (pre-2026-08-18 kernels) | 28.9 GB  |
 
 The 2026-08-18 kernel rewrite vectorized attention, GEMM and cross-entropy: 903 -> 1588 tok/s on
@@ -270,6 +260,16 @@ docs/               how to add an architecture, design rationale, optimization n
 docs/notes/         point-in-time records of the Minueza-3 run, kept as evidence
 scripts/            the eval batteries and corpus builders, plus the historical Minueza-3 run scripts
 ```
+
+## Already measured and rejected
+
+Before optimizing a kernel, read the ruled-out table in `docs/optimization.md` (lever 1d). It
+records what was tried, measured and abandoned, with the numbers: f16 compute (0.98x), f16 storage
+for Q/K/V (1.02-1.06x), split-K attention (0.4-0.7x), QT query-register tiling (0.80-0.94x at QT=2, 0.48-0.68x at QT=3), a
+larger GEMM tile (0.93x on an idle GPU), lazy host tensor storage (removes 98.9% of host allocation,
+moves throughput <1%), and why WMMA, subgroup matrices and bf16 are not reachable from WGSL here.
+Each of those cost hours to establish. Re-deriving one is the most common way to waste a day in this
+repo.
 
 ## Rules for changing this code
 
