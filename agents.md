@@ -177,8 +177,9 @@ Violating any of these wastes a run. They are checked where possible; a few cann
 3. **The optimizer sidecar is `<model>.gguf.optstate`.** Same directory, exact name. Missing means a
    cold optimizer, which re-warms momentum over the first few hundred steps rather than failing.
 4. **Compute is f32.** f16 operands overflow to NaN at these sizes (it reproduced at exactly the
-   same step under two different learning rates), and they buy no wall-clock because attention, not
-   the GEMM, dominates. `--checkpoint-precision f16` only affects stored checkpoints.
+   same step under two different learning rates), and they buy no wall-clock: measured, f16 compute
+   is 0.98x on attention itself, so it is not a matter of which kernel dominates.
+   `--checkpoint-precision f16` only affects stored checkpoints.
 5. **Tokens seen = steps x batch x seq-len.** One epoch means `corpus_tokens / (batch * seq-len)`
    steps. The trainer prints the epoch count at startup; check it before walking away.
 6. **The LR schedule is derived from `--steps`.** Warmup is 10% and cooldown 20% of the total, so
@@ -187,6 +188,16 @@ Violating any of these wastes a run. They are checked where possible; a few cann
 7. **`--seq-len` must fit `--max-seq`,** and context is capped by a WebGPU buffer limit before
    compute: attention binds one `[heads, T, T]` buffer per layer. 8192 works on adapters that grant
    their full buffer size; 2500-3000 on those that fall back to the 128 MiB default.
+
+### Already measured and rejected
+
+Before optimizing a kernel, read the ruled-out table in `docs/optimization.md` (under lever 1c). It
+records what was tried, measured and abandoned, with the numbers: f16 compute (0.98x), f16 storage
+for Q/K/V (1.02-1.06x), split-K attention (0.4-0.7x), QT query-register tiling (0.48-0.94x), a
+larger GEMM tile (0.93x on an idle GPU), lazy host tensor storage (removes 98.9% of host allocation,
+moves throughput <1%), and why WMMA, subgroup matrices and bf16 are not reachable from WGSL here.
+Each of those cost hours to establish. Re-deriving one is the most common way to waste a day in this
+repo.
 
 ## When something fails
 
