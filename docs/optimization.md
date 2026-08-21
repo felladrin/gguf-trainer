@@ -439,6 +439,35 @@ grow with batch. Phase B can budget batch 4.
 The cost of long context is throughput, not memory: 8192 runs ~28% fewer tok/s than 2048 at equal
 tokens/step (SWA covers 5 of 6 layers; the global layers still pay O(T²)).
 
+### 3b. `--reclaim`: 82% of the memory for 23% of the throughput (2026-08-20)
+
+Lever 3 measured the wall; this measures the way through it. `--reclaim` frees each micro-batch's
+activations at the micro-batch boundary instead of holding all of them for the grad-accumulation
+step, so peak memory tracks one micro-batch rather than `batch`.
+
+A/B at identical shape and seed, 20 steps, seq 2048 x batch 8, resumed from the same checkpoint:
+
+| `--reclaim` | throughput | peak GPU (pool + state) | loss (first 10 -> last 10) |
+| ----------- | ---------- | ----------------------- | -------------------------- |
+| off         | 1341 tok/s | 39.3 GB (37.7 + 1.6)    | 2.708 -> 2.631             |
+| on          | 1031 tok/s | 7.0 GB (5.4 + 1.6)      | 2.708 -> 2.631             |
+
+The loss matches to four digits, which is the runtime confirmation of the `reclaimTransients`
+parity test in `tests/gpu-parity.ts`: reclaiming changes the allocator, not the math.
+
+The 23% is the cost of the drain. `reclaimStepTransients` ends the pass, submits, and awaits
+`onSubmittedWorkDone` at every micro-batch boundary, so a step that used to hand the GPU one queue
+submission now hands it `batch` of them, and lever 1c already established the step is host-bound.
+
+**The flag stays off by default.** On a machine with memory to spare the trade is bad: throughput is
+the scarce resource, and 23% turns an 18-day phase A into 23 days. On a machine without it the trade
+is not a trade, because the alternative is an OOM. Reach for it when a run does not fit, and
+remember that at `--batch 1` it is a no-op (there is no boundary to reclaim at).
+
+Not yet measured: whether reclaim-on at a larger batch beats reclaim-off inside the same memory
+budget. A larger batch amortizes the per-step host overhead, so it might; until someone runs it,
+the table above is the only claim this file makes.
+
 ### 4. More unique data: the binding constraint on quality (revised 2026-08-19)
 
 The corpus is 722M unique tokens; the run does 2 epochs (~1.44B). `corpus` can emit more parts for
