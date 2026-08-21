@@ -11,16 +11,18 @@
 //
 // Writes <out>.tokens, <out>.mask, <out>.tokenizer.json, <out>.template.txt.
 //
-// This NEVER trains a vocab: the embedding matrix
-// froze at pretraining, so a new vocab would be incompatible with the
-// checkpoint. The base tokenizer already reserves every curriculum special
-// (CURRICULUM_SPECIALS), which is checked below before anything is encoded.
+// This NEVER trains a vocab: the embedding matrix froze at pretraining, so a new
+// vocab would be incompatible with the checkpoint. What the render needs is the
+// three CHATML_SPECIALS, checked below before anything is encoded. A base trained
+// here reserves all of CURRICULUM_SPECIALS up front; a resumed foreign checkpoint
+// reserves its own set instead, and the difference is reported, not fatal.
 
 import { Template } from "@huggingface/jinja";
 import { fetchParquetUrls } from "../data/hf.ts";
 import { parseDataFile } from "../data/parse.ts";
 import {
   assistantLossMask,
+  CHATML_SPECIALS,
   CURRICULUM_SPECIALS,
   DEFAULT_CHAT_TEMPLATE,
   detectMapping,
@@ -28,7 +30,13 @@ import {
 } from "../data/chat.ts";
 import { BPETokenizer } from "../tokenizer/bpe.ts";
 import type { TokenizerData } from "../tokenizer/bpe.ts";
-import { diskTokenSource, tokenBytes, writeTokenFile } from "../data/tokens.ts";
+import {
+  diskTokenSource,
+  type IdArray,
+  idArrayFor,
+  tokenBytes,
+  writeTokenFile,
+} from "../data/tokens.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -52,15 +60,25 @@ async function run(v: Values) {
     die(`cannot read ${tokenizerPath} (${e}): the SFT corpus must reuse the base vocab`);
   }
   const tok = BPETokenizer.fromData(tokData);
-  const missing = CURRICULUM_SPECIALS.filter((s) => tok.idOf(s) === undefined);
+  // Only these three are load-bearing: two frame every turn, one separates
+  // conversations. The rest of CURRICULUM_SPECIALS are reserved for later stages,
+  // and a foreign base's vocab reserves its own set instead: SmolLM2 and Qwen3
+  // both carry ChatML but neither carries our <tools>/</tools>. Demanding the full
+  // set there would block `finetune --resume` against any published checkpoint,
+  // which is a workflow this trainer advertises.
+  const missing = CHATML_SPECIALS.filter((s) => tok.encode(s).length !== 1);
   if (missing.length) {
     die(
-      `${tokenizerPath} lacks curriculum specials [${missing.join(", ")}]: it was not built with ` +
-        `the "curriculum" specials set, so no later stage can use them`,
+      `${tokenizerPath} does not encode [${missing.join(", ")}] atomically, which the ChatML ` +
+        `render needs. A base trained here gets them from \`tokenize --curriculum-specials\`; a ` +
+        `foreign checkpoint must already carry ChatML in its specials list, not just its vocab.`,
     );
   }
-  if (tokenBytes(tok.vocabSize) !== 2) {
-    die(`vocab ${tok.vocabSize} needs u32 tokens; widen this path`);
+  const absent = CURRICULUM_SPECIALS.filter((s) => tok.idOf(s) === undefined);
+  if (absent.length) {
+    console.log(
+      `note: vocab has no [${absent.join(", ")}]; those stages stay unavailable, SFT is unaffected`,
+    );
   }
   const imStart = tok.idOf("<|im_start|>")!;
   const imEnd = tok.idOf("<|im_end|>")!;
@@ -69,8 +87,8 @@ async function run(v: Values) {
   // merges are untouched, so this only changes the exported EOS metadata.
   tok.eosId = imEnd;
   console.log(
-    `vocab: reused ${tokenizerPath} (${tok.vocabSize} tokens, all ${CURRICULUM_SPECIALS.length} ` +
-      `curriculum specials present), eos=${tok.eosId} (<|im_end|>)`,
+    `vocab: reused ${tokenizerPath} (${tok.vocabSize} tokens, ` +
+      `${tokenBytes(tok.vocabSize)} B/token), eos=${tok.eosId} (<|im_end|>)`,
   );
 
   // --- 2. Rows -> ChatML strings ----------------------------------------------
@@ -133,7 +151,8 @@ async function run(v: Values) {
   // ~10^8 tokens, and a single joined string would exceed the ~512MB string cap.
   console.log("encoding corpus (per conversation, with assistant-only mask) …");
   const t0 = performance.now();
-  let ids = new Uint16Array(1 << 24);
+  const IdBuffer = idArrayFor(tok.vocabSize);
+  let ids: IdArray = new IdBuffer(1 << 24);
   let sup = new Uint8Array(1 << 24);
   let len = 0;
   const decode = (x: number[]) => tok.decode(x);
@@ -142,7 +161,7 @@ async function run(v: Values) {
     const m = assistantLossMask(e, imStart, imEnd, decode);
     if (len + e.length + 1 > ids.length) {
       const cap = Math.max(ids.length * 2, len + e.length + 1);
-      const grownIds = new Uint16Array(cap);
+      const grownIds = new IdBuffer(cap);
       grownIds.set(ids.subarray(0, len));
       ids = grownIds;
       const grownSup = new Uint8Array(cap);

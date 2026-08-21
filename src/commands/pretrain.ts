@@ -38,7 +38,8 @@ import type { TokenizerData } from "../tokenizer/bpe.ts";
 import { CURRICULUM_SPECIALS } from "../data/chat.ts";
 import { llamaRunScript } from "../export/export-gguf.ts";
 import { wsdSchedule } from "../train/schedule.ts";
-import { diskTokenSource, tokenBytes, writeTokenFile } from "../data/tokens.ts";
+import { diskTokenSource, idArrayFor, tokenBytes, writeTokenFile } from "../data/tokens.ts";
+import type { IdArray } from "../data/tokens.ts";
 import type { TokenSource } from "../data/tokens.ts";
 import { parseQuantList } from "../gguf/quantize.ts";
 import type { QuantName } from "../gguf/quantize.ts";
@@ -126,7 +127,8 @@ async function sharedTokenizer(path: string, corpus: string): Promise<BPETokeniz
   const sample = corpus.slice(0, TRAIN_SAMPLE_MB * 1024 * 1024).split(DOC_SEP).join("\n");
   const tok = new BPETokenizer();
   tok.train(sample, VOCAB, CURRICULUM_SPECIALS);
-  if (tokenBytes(tok.vocabSize) !== 2) die(`vocab ${tok.vocabSize} exceeds u16; widen the loader`);
+  // We train this vocab ourselves, so this can only trip on a bad VOCAB constant.
+  if (tokenBytes(tok.vocabSize) !== 2) die(`vocab ${tok.vocabSize} exceeds u16; lower VOCAB`);
   await writeFileBytes(path, new TextEncoder().encode(JSON.stringify(tok.export())));
   console.log(
     `Tokenizer: trained to ${tok.vocabSize} tokens on ${(sample.length / 1e6).toFixed(1)}M-char ` +
@@ -147,16 +149,21 @@ async function siblingTokenizer(tokensPath: string): Promise<BPETokenizer> {
   return tok;
 }
 
-/** Pretokenize the whole corpus into a growable Uint16Array (a number[] would
- * hit V8's max-array-length near 10^8), doc-by-doc with eos between docs. */
-function encodeCorpus(tok: BPETokenizer, corpus: string): Uint16Array {
+/** Pretokenize the whole corpus into a growable typed array (a number[] would
+ * hit V8's max-array-length near 10^8), doc-by-doc with eos between docs.
+ *
+ * The width follows the vocab: u16 for a vocab trained here, u32 for a resumed
+ * foreign one. Qwen3 is 151,936 tokens and Llama-3 128,256, so a fixed u16 buffer
+ * would wrap their ids silently rather than fail. */
+export function encodeCorpus(tok: BPETokenizer, corpus: string): IdArray {
   const docs = corpus.split(DOC_SEP).map((d) => d.trim()).filter((d) => d.length > 0);
+  const IdBuffer = idArrayFor(tok.vocabSize);
   let cap = 1 << 20, n = 0;
-  let ids = new Uint16Array(cap);
+  let ids: IdArray = new IdBuffer(cap);
   const push = (id: number) => {
     if (n >= cap) {
       cap *= 2;
-      const grown = new Uint16Array(cap);
+      const grown = new IdBuffer(cap);
       grown.set(ids);
       ids = grown;
     }

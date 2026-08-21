@@ -117,6 +117,36 @@ deno run -A cli.ts pretrain --data data/more.tokens --out out/continued.gguf \
 Step 4 is the one that goes wrong. `tokenize` reuses a tokenizer that already sits at the output
 prefix and trains a fresh, incompatible one if it does not. Copy the file first, every time.
 
+### Fine-tune a downloaded checkpoint
+
+The corpus commands reuse the base model's vocab verbatim, and a downloaded model
+carries its vocab in GGUF metadata rather than in a `.tokenizer.json`. So there is one
+extra step versus continuing a model trained here:
+
+```sh
+# 1. Convert the HF checkpoint to GGUF (llama.cpp's convert_hf_to_gguf.py)
+# 2. Read its shape, and write its vocab where the corpus commands can find it
+mkdir -p data
+deno run -A cli.ts inspect --model base.gguf --dump-tokenizer data/base.tokenizer.json
+# 3. Build the SFT corpus against THAT vocab
+deno run -A cli.ts chat-corpus --data chats.jsonl --tokenizer data/base.tokenizer.json --out data/sft
+# 4. Fine-tune, repeating the architecture flags step 2 printed. They are not
+#    optional: without them the config is built from defaults and the resume aborts.
+deno run -A cli.ts finetune --data data/sft.tokens --mask data/sft.mask \
+  --template data/sft.template.txt --resume base.gguf --out out/tuned.gguf --steps 400 \
+  --arch llama --hidden 576 --layers 30 --head-dim 64 --heads 9 --kv-heads 3 \
+  --ffn-dim 1536 --max-seq 8192
+```
+
+The flags above are SmolLM2-135M's; paste whatever step 2 prints for your base, ALL of
+it. `--max-seq` is compared too, so dropping it resumes against the default
+`max(8192, seq-len)` and a base with a longer context (Qwen3 is 40960) aborts on the
+mismatch.
+
+The base must already carry ChatML (`<|im_start|>`, `<|im_end|>`, `<|endoftext|>`) as
+atomic specials; `--dump-tokenizer` says whether it does. Its other special tokens do
+not have to match ours.
+
 ### Train a new base model from scratch
 
 ```
@@ -205,17 +235,17 @@ the round-trip test automatically: docs/adding-an-architecture.md.
 
 ## When something fails
 
-| Message                                                          | Meaning                                                      | Fix                                                                         |
-| ---------------------------------------------------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| `--resume config mismatch (hidden: built 512 vs checkpoint 640)` | your architecture flags differ from the checkpoint           | run `inspect` and copy the flags it prints                                  |
-| `no sibling tokenizer <prefix>.tokenizer.json`                   | `pretrain` got a `.tokens` file with no tokenizer next to it | keep the pair together, or re-run `tokenize`                                |
-| `lacks curriculum specials [...]`                                | fine-tuning a base whose vocab has no ChatML tokens          | that base cannot be chat-tuned; pretrain again with `--curriculum-specials` |
-| `mask <path> has N tokens, corpus has M`                         | `.mask` and `.tokens` are from different `chat-corpus` runs  | rebuild both together                                                       |
-| `mask supervises nothing`                                        | the template rendered no assistant turns                     | check the dataset actually has `assistant` roles                            |
-| `no WebGPU: training needs Deno`                                 | running under Node or Bun                                    | training needs Deno; Node and Bun have no GPU backend here                  |
-| `GPU/CPU parity probe failed`                                    | the backend disagrees with the reference at init             | a real bug; stop and report it, do not train through it                     |
-| NaN loss partway into a run                                      | f16 overflow, or a learning rate above 0.01                  | keep compute f32; `--lr 0.01` is the proven ceiling, 0.02 diverged          |
-| OOM at long context                                              | the per-layer attention buffer                               | lower `--seq-len`, or add `--reclaim` to free activations per micro-batch   |
+| Message                                                          | Meaning                                                      | Fix                                                                                                                         |
+| ---------------------------------------------------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `--resume config mismatch (hidden: built 512 vs checkpoint 640)` | your architecture flags differ from the checkpoint           | run `inspect` and copy the flags it prints                                                                                  |
+| `no sibling tokenizer <prefix>.tokenizer.json`                   | `pretrain` got a `.tokens` file with no tokenizer next to it | keep the pair together, or re-run `tokenize`                                                                                |
+| `does not encode [...] atomically`                               | fine-tuning a base whose vocab has no ChatML tokens          | a base trained here needs `tokenize --curriculum-specials`; a downloaded one must already carry ChatML in its specials list |
+| `mask <path> has N tokens, corpus has M`                         | `.mask` and `.tokens` are from different `chat-corpus` runs  | rebuild both together                                                                                                       |
+| `mask supervises nothing`                                        | the template rendered no assistant turns                     | check the dataset actually has `assistant` roles                                                                            |
+| `no WebGPU: training needs Deno`                                 | running under Node or Bun                                    | training needs Deno; Node and Bun have no GPU backend here                                                                  |
+| `GPU/CPU parity probe failed`                                    | the backend disagrees with the reference at init             | a real bug; stop and report it, do not train through it                                                                     |
+| NaN loss partway into a run                                      | f16 overflow, or a learning rate above 0.01                  | keep compute f32; `--lr 0.01` is the proven ceiling, 0.02 diverged                                                          |
+| OOM at long context                                              | the per-layer attention buffer                               | lower `--seq-len`, or add `--reclaim` to free activations per micro-batch                                                   |
 
 ## Hardware reality
 
