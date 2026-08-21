@@ -111,7 +111,7 @@ ok(
   w.meta_arr_str("tokenizer.ggml.merges", ["w0 w1"]);
   // llama.cpp marks turn tokens CONTROL (3); tokenizerFromGGUF recovers specials
   // from that, and falls back to the <|...|> shape only when no types are present.
-  w.meta_arr_i32("tokenizer.ggml.token_type", tokens.map((t, i) => (i < 3 ? 3 : 1)));
+  w.meta_arr_i32("tokenizer.ggml.token_type", tokens.map((_t, i) => (i < 3 ? 3 : 1)));
   w.meta_u32("tokenizer.ggml.bos_token_id", 0);
   w.meta_u32("tokenizer.ggml.eos_token_id", 2);
   const t = tokenizerFromGGUF(readGGUF(w.build()));
