@@ -15,8 +15,10 @@
 //
 // The vocab and embedding matrix freeze the moment pretraining starts, so every
 // special token a later stage needs is reserved up front (CURRICULUM_SPECIALS:
-// ChatML turns, <think>, the tool tags). Pretraining never emits them; their
-// rows sit at init until a fine-tune first uses them.
+// ChatML turns, <think>, the tool tags). Pretraining never emits them, but with
+// embeddings tied (the default on every arch here) their rows are also the output
+// projection, so pretraining spends every step pushing them down as never-correct
+// softmax competitors. A fine-tune inherits suppressed rows, not fresh ones.
 
 import { readGGUF } from "../gguf/gguf.ts";
 import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";

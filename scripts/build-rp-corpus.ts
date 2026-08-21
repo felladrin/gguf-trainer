@@ -84,9 +84,11 @@ function macroName(inner: string, botName: string): string | null {
  * embedded one would forge a false document boundary downstream).
  *
  * Resolving only the documented {{char}} and {{user}} is not enough. PIPPA's
- * cards carry 60 other spellings, and the render left 4,719 macros standing
- * across 5.6% of documents; a 94.7M model trained on that emitted "{{u01}}:" as
- * a speaker name, which breaks the "Name:" turn structure a horde client parses.
+ * cards carry 60 other spellings, and the render left 4,782 macros standing
+ * across 4.0% of documents (count them on corpus/rp-pippa.prev.txt, the
+ * pre-cleanup render; this rule takes it to 441 across 0.5%). A 94.7M model
+ * trained on that emitted "{{u01}}:" as a speaker name, which breaks the
+ * "Name:" turn structure a horde client parses.
  * So the rule for a double-delimiter macro is: resolve the aliases we can name,
  * unwrap everything else (another character's name, or a stage direction someone
  * put in braces), and let no brace through. Single braces get the narrower

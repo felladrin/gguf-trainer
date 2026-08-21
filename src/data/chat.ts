@@ -91,8 +91,9 @@ export const CHATML_SPECIALS = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"];
  * embedding matrix freeze the moment pretraining starts, so every special any
  * later stage needs must exist from step 1: a stage cannot grow the vocab
  * without discarding trained embeddings. Pretraining never emits these (it sees
- * raw text); their rows sit at init until their stage's data first uses them,
- * which costs only a handful of dormant embedding rows. On export, the `<|...|>`
+ * raw text), and with embeddings tied their rows double as the output projection,
+ * so pretraining actively suppresses them: a fine-tune starts from rows pushed
+ * down as never-correct softmax competitors, not from init. On export, the `<|...|>`
  * turn tokens are CONTROL (stop/handled) while the `<...>` reasoning and tool
  * tags are USER_DEFINED so they stay visible in the model's output text for
  * llama.cpp's `--jinja` tool parser and any reasoning parser (see

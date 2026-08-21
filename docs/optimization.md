@@ -855,6 +855,45 @@ turn upward, a behavioral probe to confirm the one it picks. Neither the loss cu
 four-task benchmark separated these two by more than noise, and the loss curve pointed the wrong
 way; six turns of transcript settled it in minutes.
 
+### 13. Tightening the sampler makes a 95M model worse, not better (2026-08-20)
+
+Prior going in: a tiny model has a garbage tail, so truncate it hard. The measurement says the
+opposite, and the two settings on the RP model card come out of this table rather than out of
+folklore.
+
+14 presets, 2 scenarios (Iris the librarian, Thorn the cat), 2 seeds, all through
+`llama-server --jinja` with the full history resent each turn, scored on `rp-chat3`. Metrics:
+distinct-trigram ratio, longest repeated n-gram inside a reply, mean reply length, and whether the
+model still knows the user's name at turn 6.
+
+| preset                                    | distinct-3 | worst loop | mean len | name recall |
+| :---------------------------------------- | ---------: | ---------: | -------: | ----------: |
+| mirostat2 (t5, n0.1)                      |      0.992 |          0 |     33.6 |        0.75 |
+| st-2026 (t1.0, min-p .05, DRY .8, XTC)    |      0.985 |          2 |     46.3 |        0.50 |
+| dry-strong (t0.85, min-p .08, DRY 1.0)    |      0.973 |          1 |     34.2 |        0.50 |
+| nsigma-dry (t1.0, ns1.0, DRY .8)          |      0.971 |          0 |     29.4 |        0.00 |
+| topk-classic (t0.7, k40, p0.9, rep 1.1)   |      0.966 |          0 |     36.0 |        0.50 |
+| card-current (t0.8, p0.9, min-p .05, 1.1) |      0.912 |        2.5 |     52.5 |        0.25 |
+| minp-tight (t0.8, min-p .10)              |      0.589 |        6.5 |     52.9 |        0.75 |
+| low-temp (t0.6, min-p .05, rep 1.05)      |      0.560 |        5.5 |     44.7 |        0.50 |
+| minp-tighter (t0.7, min-p .15)            |      0.412 |        6.0 |     30.4 |        0.25 |
+
+`min-p 0.15` at temp 0.7 produced 8-gram loops and a distinct-3 of 0.41: squeeze the distribution of
+a 95M model and there is nothing left but its favourite phrase. **Every preset that avoided loops did
+it with DRY, XTC, mirostat or top-n-sigma, not with truncation.** Zero presets leaked a user turn, so
+that failure mode is gone from the chat stages.
+
+**The metric leaderboard is a trap, and that is the more useful half of this.** Mirostat tops every
+column and reads worst by eye ("Junius me!", "I love working here, and it gets me **working**!").
+Highest-diversity and least-coherent are the same thing at this size, because distinct-3 rewards
+exactly the invented-token garble a small model produces under pressure. A garble metric (the
+tokenizer's own pieces-per-word, ~2.0 on ordinary English and ~4.0 on invented names like
+"Sagittariroh") catches what distinct-3 pays for, and any future sweep needs it in the table.
+
+By eye the two survivors are `dry-strong` and `topk-classic`, which is what the model card ships as
+its recommended and alternative presets. A round-2 grid of 11 presets around those was written but
+never run; it is not what the card's numbers rest on.
+
 ## Explicitly not worth doing
 
 - **Guarded/clamped f16 compute**: 0.98x measured on attention at seq 4096-8192, plus
