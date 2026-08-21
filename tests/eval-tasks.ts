@@ -2,7 +2,14 @@
 // the label join that PIQA's split label file needs, and the dataset coordinates
 // each task is registered under (nothing downloaded).
 // Run:  deno run tests/eval-tasks.ts
-import { attachPiqaLabels, piqaItem, TASKS } from "../src/commands/eval-choice.ts";
+import {
+  argminPerChar,
+  attachPiqaLabels,
+  hellaswagItem,
+  hellaswagPreprocess,
+  piqaItem,
+  TASKS,
+} from "../src/commands/eval-choice.ts";
 
 function ok(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -87,5 +94,63 @@ ok(
   `piqa renders like ARC, got ${JSON.stringify(TASKS["piqa"].render("G", "S"))}`,
 );
 ok(TASKS["hellaswag"].render("C", "E") === "C E", "hellaswag renders as a plain continuation");
+
+// HellaSwag: the query is not the bare `ctx` field. lm-eval-harness scores
+// preprocess(activity_label + ": " + ctx_a + " " + ctx_b.capitalize()), and every
+// published HellaSwag number is measured on that string, so a shortcut here makes
+// the result incomparable while still looking like a plausible score.
+const hs = (over: Record<string, unknown> = {}) => ({
+  activity_label: "Roof shingle removal",
+  ctx_a: "A man is sitting on a roof.",
+  ctx_b: "he",
+  ctx: "A man is sitting on a roof. he",
+  endings: ["is using wrap to wrap a pair of skis.", "is ripping level tiles off.", "c", "d"],
+  label: 1,
+  ...over,
+});
+
+const h = hellaswagItem(hs())!;
+ok(h !== null, "a well-formed HellaSwag row parses");
+ok(
+  h.context === "Roof shingle removal: A man is sitting on a roof. He",
+  `activity label prefixes the query and ctx_b is capitalized, got ${JSON.stringify(h.context)}`,
+);
+ok(!h.context.includes(" he"), "the lowercase ctx_b must not survive uncapitalized");
+ok(h.gold === 1, "label selects the gold ending");
+ok(hellaswagItem(hs({ label: "1" }))!.gold === 1, "a stringified label still parses");
+ok(hellaswagItem(hs({ activity_label: undefined })) === null, "no activity label drops the row");
+ok(hellaswagItem(hs({ label: 9 })) === null, "an out-of-range label drops the row");
+
+// Python's str.capitalize() lowercases the tail; copying only the uppercase half
+// of it silently changes the query on every row whose ctx_b has inner capitals.
+ok(
+  hellaswagItem(hs({ ctx_b: "the MAN then" }))!.context.endsWith("The man then"),
+  "ctx_b's tail is lowercased, the way str.capitalize() does it",
+);
+
+// The same cleanup runs over the endings, not just the query.
+ok(
+  hellaswagItem(hs({ endings: ["a [header] b", "x", "y", "z"] }))!.choices[0] === "a b",
+  "endings are preprocessed too",
+);
+
+ok(hellaswagPreprocess("  padded  ") === "padded", "outer whitespace goes");
+ok(
+  hellaswagPreprocess("Do it [title] Then rest") === "Do it. Then rest",
+  "[title] becomes a break",
+);
+ok(
+  hellaswagPreprocess("keep [substeps] this") === "keep this",
+  "other bracketed spans are dropped",
+);
+ok(hellaswagPreprocess("a  b") === "a b", "the double space a drop leaves is collapsed");
+
+// acc_norm normalizes by the choice's character length, not by its token count.
+// The two disagree exactly when a longer choice is cheaper per token, which is
+// the case the metric exists to handle.
+ok(argminPerChar([10, 12], ["ab", "abcd"]) === 1, "the longer choice wins on cost per character");
+ok(argminPerChar([10, 12], ["ab", "ab"]) === 0, "equal lengths fall back to the raw sum");
+ok(argminPerChar([5], ["only"]) === 0, "a single choice is the prediction");
+ok(argminPerChar([1, 1], ["", "abcd"]) === 1, "an empty choice does not divide by zero");
 
 console.log("eval-tasks: all checks passed");

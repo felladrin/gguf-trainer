@@ -3,13 +3,16 @@
 // external eval framework, so it stays as portable as the rest of the project.
 //
 // Scoring is the standard length-normalized log-likelihood: for each candidate
-// completion we forward [context + completion] once and read the mean negative
+// completion we forward [context + completion] once and read the negative
 // log-likelihood over ONLY the completion tokens (context targets masked to -1,
-// which crossEntropy ignores). The lowest mean-NLL choice is the prediction:
-//   - acc_norm  ranks by mean NLL   (length-normalized; the headline metric)
+// which crossEntropy ignores). The lowest-NLL choice is the prediction:
+//   - acc_norm  ranks by summed NLL divided by the choice's CHARACTER length
 //   - acc       ranks by summed NLL (raw log-likelihood)
-// This matches the lm-eval-harness definition, so numbers compare to the Open
-// LLM Leaderboard figures on the Minueza model cards.
+// Character length, not token count, is what lm-eval-harness normalizes by
+// (`completion_len = np.array([float(len(i)) for i in choices])`), and it is the
+// tokenizer-independent choice: per-token normalization makes the metric depend
+// on how a given vocab happens to split the ending. Matching it is what lets
+// these numbers sit next to the Open LLM Leaderboard figures.
 //
 // --shots defaults to 0; the Open LLM Leaderboard uses 25 for ARC and 10 for
 // HellaSwag, so compare like with like before reading anything into a gap.
@@ -67,15 +70,41 @@ function arcItem(row: Row): MCItem | null {
   return { context: q, choices: texts, gold };
 }
 
-function hellaswagItem(row: Row): MCItem | null {
-  const ctx = (row["ctx"] ?? row["ctx_a"]) as string;
+/**
+ * HellaSwag ships raw WikiHow/ActivityNet markup, and every published number
+ * for it is measured after lm-eval-harness's cleanup, not before: " [title]"
+ * becomes a sentence break, any other bracketed span is dropped, and the double
+ * spaces that leaves collapse.
+ */
+export function hellaswagPreprocess(text: string): string {
+  return text.trim()
+    .replaceAll(" [title]", ". ")
+    .replace(/\[.*?\]/g, "")
+    .replaceAll("  ", " ");
+}
+
+/**
+ * The query is the activity label plus the two context halves, not the bare
+ * `ctx` field: without the label the model loses the topic the ending has to be
+ * plausible for, and the score is no longer the one the leaderboards report.
+ */
+export function hellaswagItem(row: Row): MCItem | null {
+  const label = row["activity_label"];
+  const ctxA = row["ctx_a"] ?? row["ctx"];
+  const ctxB = row["ctx_b"] ?? "";
   // deno-lint-ignore no-explicit-any
   const endings = row["endings"] as any;
-  const label = row["label"];
-  if (typeof ctx !== "string" || !Array.isArray(endings)) return null;
-  const gold = typeof label === "number" ? label : parseInt(String(label), 10);
+  const gold = typeof row["label"] === "number" ? row["label"] : parseInt(String(row["label"]), 10);
+  if (typeof label !== "string" || typeof ctxA !== "string" || typeof ctxB !== "string") {
+    return null;
+  }
+  if (!Array.isArray(endings)) return null;
   if (!Number.isInteger(gold) || gold < 0 || gold >= endings.length) return null;
-  return { context: ctx, choices: endings.map(String), gold };
+  // Python's str.capitalize() also lowercases the tail, and the reference
+  // implementation's output is what the published numbers were measured on.
+  const capB = ctxB.charAt(0).toUpperCase() + ctxB.slice(1).toLowerCase();
+  const query = hellaswagPreprocess(`${label}: ${ctxA} ${capB}`);
+  return { context: query, choices: endings.map((e) => hellaswagPreprocess(String(e))), gold };
 }
 
 /** PIQA: a goal and two candidate solutions, gold given by a 0/1 label. */
@@ -176,15 +205,15 @@ async function loadRows(task: Task, limit: number): Promise<Row[]> {
   return rows;
 }
 
-/** Mean + summed negative log-likelihood of `choiceText` given `ctxText`,
- * scored over ONLY the choice tokens. Runs on GPU if `gpu` is installed. */
+/** Summed negative log-likelihood of `choiceText` given `ctxText`, scored over
+ * ONLY the choice tokens. Runs on GPU if `gpu` is installed. */
 async function choiceNLL(
   model: LanguageModel,
   tok: BPETokenizer,
   gpu: WebGPUBackend | null,
   ctxText: string,
   choiceText: string,
-): Promise<{ mean: number; sum: number }> {
+): Promise<number> {
   const ctxIds = tok.encode(ctxText);
   const chIds = tok.encode(choiceText);
   const full = [...ctxIds, ...chIds].slice(-model.cfg.maxSeq);
@@ -198,8 +227,20 @@ async function choiceNLL(
   const nChoice = targets.length - firstChoiceTgt;
   const loss = crossEntropy(model.forward(inputs), targets);
   if (gpu) await gpu.sync([loss]);
-  const mean = loss.data[0];
-  return { mean, sum: mean * Math.max(1, nChoice) };
+  return loss.data[0] * Math.max(1, nChoice);
+}
+
+/**
+ * acc_norm's prediction: the choice with the lowest NLL per character of its own
+ * text, measured before the render adds its delimiter. Normalizing per token
+ * instead would make the metric depend on how the vocab splits each ending, so a
+ * retokenized model would score differently on identical predictions.
+ */
+export function argminPerChar(sums: number[], choices: string[]): number {
+  let best = 0;
+  const per = (i: number) => sums[i] / Math.max(1, choices[i].length);
+  for (let i = 1; i < sums.length; i++) if (per(i) < per(best)) best = i;
+  return best;
 }
 
 async function run(v: Values) {
@@ -245,19 +286,17 @@ async function run(v: Values) {
     const t0 = Date.now();
     for (const it of evalItems) {
       const ctx = preamble ? `${preamble}\n\n${it.context}` : it.context;
-      const scored = [];
+      const sums: number[] = [];
       for (const ch of it.choices) {
         const full = task.render(ctx, ch);
         // Score only the choice span: render context without the answer to find
         // the boundary, then score the full render's choice tokens.
         const ctxOnly = task.render(ctx, "").replace(/\s+$/, "");
-        scored.push(await choiceNLL(model, tok, gpu, ctxOnly, full.slice(ctxOnly.length)));
+        sums.push(await choiceNLL(model, tok, gpu, ctxOnly, full.slice(ctxOnly.length)));
       }
-      let bestNorm = 0, bestRaw = 0;
-      for (let i = 1; i < scored.length; i++) {
-        if (scored[i].mean < scored[bestNorm].mean) bestNorm = i;
-        if (scored[i].sum < scored[bestRaw].sum) bestRaw = i;
-      }
+      const bestNorm = argminPerChar(sums, it.choices);
+      let bestRaw = 0;
+      for (let i = 1; i < sums.length; i++) if (sums[i] < sums[bestRaw]) bestRaw = i;
       if (bestNorm === it.gold) correctNorm++;
       if (bestRaw === it.gold) correctRaw++;
       done++;

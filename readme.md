@@ -84,11 +84,11 @@ Each architecture is a single file in `src/arch/` plus one line in the registry,
 
 ## Results
 
-Scored with `eval-choice` on the Open SLM Leaderboard's four tasks, full sets, 0-shot: PIQA 61.32, ARC-Easy 40.03, ARC-Challenge 22.61, HellaSwag 28.16 (acc_norm). Combined the way that board combines them, those give an **Intelligence Index of 9.67**, against 25-27 at the top of the board; the formula and the arithmetic are in [docs/optimization.md](docs/optimization.md) lever 9b.
+Scored with `eval-choice` on the Open SLM Leaderboard's four tasks, full sets, 0-shot, acc_norm. [Minueza-3-95M-Base](https://huggingface.co/Felladrin/Minueza-3-95M-Base), the published 94.7M model trained with this repo, gets PIQA 61.26, ARC-Easy 40.53, ARC-Challenge 23.81, HellaSwag 30.14. Combined the way that board combines them, that is an **Intelligence Index of 10.67**, against 25-27 at the top of the board. The formula and the arithmetic are in [docs/optimization.md](docs/optimization.md) lever 9c.
 
-Two qualifiers that matter. This is a self-computed index, not a submitted entry, and the board's fifth task (ArithMark-3) is not implemented here, so it is assumed at chance; omitting the term instead gives 11.76. And it was measured on a roleplay continuation of the published base, not on the published [Minueza-3-95M-Base](https://huggingface.co/Felladrin/Minueza-3-95M-Base) file itself, which has not been scored on all four tasks yet.
+Two qualifiers that matter. This is a self-computed index, not a submitted entry: the scoring matches lm-eval-harness on the query construction and on normalizing acc_norm by character length, which is what makes the numbers comparable at all, but nobody else ran them. And the board's fifth task (ArithMark-3) is not implemented here, so it is assumed at chance; omitting the term instead gives 12.98, making the honest range 10.7-13.0.
 
-For placement, 9.67 would sit above 82 of the 129 entries on that board with complete task data, at 94.7M parameters trained on one consumer APU. The cohort above it is trained on 14 to 700 times more tokens per parameter; `docs/optimization.md` lever 11 covers what they do differently, and lever 4 covers why tokens-per-parameter, not anything in this codebase, is the ceiling on quality.
+At 94.7M parameters on one consumer APU, the cohort above it on that board is trained on 14 to 700 times more tokens per parameter. `docs/optimization.md` lever 11 covers what they do differently, and lever 4 covers why tokens-per-parameter, not anything in this codebase, is the ceiling on quality.
 
 ## Honest limits
 
