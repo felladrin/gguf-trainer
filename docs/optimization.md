@@ -573,9 +573,10 @@ instruct curriculum stage.
 
 ### 9. Eval harness (medium, validates the whole effort): DONE, first full run recorded
 
-`eval-choice` scores a GGUF on ARC-Challenge / HellaSwag via length- normalized log-likelihood
-(matches lm-eval-harness, comparable to the Minueza leaderboard numbers), plus acc/acc_norm;
-datasets via the HF parquet tooling.
+`eval-choice` scores a GGUF on ARC-Challenge / HellaSwag via length-normalized log-likelihood,
+plus acc/acc_norm; datasets via the HF parquet tooling. Everything in this lever predates the
+parity fix in 9c, so its acc_norm figures were computed with a different normalizer than the ones
+below and do not compare to them.
 
 **Phase A base, `phaseA-final-88000.gguf` (step 88000, 1.44B tokens), run 2026-08-04:**
 
@@ -676,6 +677,62 @@ this is a property of the ruler at this scale, not a defect of ours. PIQA carrie
 not reconciled by this run: 28.16 here is a different checkpoint and lever 9's 28.46 is a different
 harness, so no pair isolates the subset. The clean test, `eval-choice` on phaseA-final over the full
 10,042, has not been run.
+
+### 9c. Two divergences from lm-eval-harness, and what fixing them moved (2026-08-21)
+
+Lever 9 claimed `eval-choice` matched lm-eval-harness. It did not, in two places, both found by
+reading our scoring against the reference implementation rather than by any test failing:
+
+1. **The HellaSwag query.** lm-eval scores
+   `preprocess(activity_label + ": " + ctx_a + " " + ctx_b.capitalize())`. We used the bare `ctx`
+   field: no activity label, and none of the reference preprocessing (`" [title]"` to `". "`,
+   bracketed spans dropped, the resulting double spaces collapsed). The endings get that same
+   preprocessing and did not. Note `str.capitalize()` lowercases the tail, which the obvious
+   JavaScript one-liner does not.
+2. **The `acc_norm` normalizer.** lm-eval divides the summed log-likelihood by the CHARACTER length
+   of the choice (`completion_len = np.array([float(len(i)) for i in choices])`). We divided by
+   token count. This one touches every task, not just HellaSwag, and per-token normalization is
+   tokenizer-dependent, which is the thing character length exists to avoid.
+
+Full sets, 0-shot, before and after, on the roleplay SFT (`rp-chat3`, the published
+Minueza-3-95M-RP):
+
+| Task          | acc_norm before | acc_norm after | acc before | acc after |
+| :------------ | --------------: | -------------: | ---------: | --------: |
+| PIQA          |           61.04 |          60.88 |      60.17 |     60.17 |
+| ARC-Easy      |           39.90 |          41.04 |      45.03 |     45.03 |
+| ARC-Challenge |           23.89 |          25.51 |      20.39 |     20.39 |
+| HellaSwag     |           28.40 |          29.90 |      28.05 |     28.14 |
+| **Index**     |        **9.81** |      **10.77** |          - |         - |
+
+**The raw `acc` column is the check that the change did only what it should.** It is identical on
+all three ARC/PIQA rows: sum-NLL ranking cannot be touched by swapping a normalizer, and those
+items never changed. Only HellaSwag's `acc` moves (28.05 to 28.14), which is the query rebuild.
+
+Scored against the published base with the fixed harness, which lever 9b could not do because the
+base had never been run on all four tasks:
+
+| Model                         |  PIQA | ARC-Easy | ARC-C | HellaSwag |     Index |
+| :---------------------------- | ----: | -------: | ----: | --------: | --------: |
+| Minueza-3-95M-Base            | 61.26 |    40.53 | 23.81 |     30.14 |     10.67 |
+| Minueza-3-95M-RP (`rp-chat3`) | 60.88 |    41.04 | 25.51 |     29.90 | **10.77** |
+
+Two roleplay training stages moved the index by 0.10, which is the flat result the model card
+claims. Omitting the ArithMark-3 term rather than assuming it at chance gives 12.98 and 13.11.
+
+**The original plan for this lever did not work, and the reason is worth keeping.** It was to score
+`Felladrin/Minueza-32M-UltraChat` and compare against its real Open LLM Leaderboard v1 entry
+(ARC-C 25-shot acc_norm 21.08 ±1.19, HellaSwag 10-shot 26.95 ±0.44, run 2024-03-01). All four rows
+failed with `GGUF missing tokenizer.ggml.tokens/merges`: that GGUF carries a SentencePiece unigram
+vocab, and `eval-choice` reads BPE only. An external validation still needs a model that is both on
+a leaderboard we can read and shipped with a BPE GGUF in an architecture this loader supports.
+
+**A process note that cost a wasted battery.** `eval-choice` runs out of the working tree, and a
+`git checkout` during a multi-hour run swaps the code under the next task in the loop: a re-measure
+of the stage 2 checkpoint reproduced the old numbers exactly, because the fix had been committed and
+the branch switched away six seconds later. Long benchmarks run from a `git worktree` pinned to the
+branch being measured, with absolute model paths, and the script greps the source for the change it
+is supposed to be measuring before it starts.
 
 ### 10. Phase B KL anchor against the base checkpoint (medium): OP DONE
 
