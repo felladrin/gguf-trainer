@@ -712,13 +712,24 @@ items never changed. Only HellaSwag's `acc` moves (28.05 to 28.14), which is the
 Scored against the published base with the fixed harness, which lever 9b could not do because the
 base had never been run on all four tasks:
 
-| Model                         |  PIQA | ARC-Easy | ARC-C | HellaSwag |     Index |
-| :---------------------------- | ----: | -------: | ----: | --------: | --------: |
-| Minueza-3-95M-Base            | 61.26 |    40.53 | 23.81 |     30.14 |     10.67 |
-| Minueza-3-95M-RP (`rp-chat3`) | 60.88 |    41.04 | 25.51 |     29.90 | **10.77** |
+| Model                          |  PIQA | ARC-Easy | ARC-C | HellaSwag |     Index |
+| :----------------------------- | ----: | -------: | ----: | --------: | --------: |
+| Minueza-3-95M-Base             | 61.26 |    40.53 | 23.81 |     30.14 |     10.67 |
+| stage 2, style SFT (`rp-full`) | 60.34 |    41.12 | 24.49 |     30.16 |     10.40 |
+| Minueza-3-95M-RP (`rp-chat3`)  | 60.88 |    41.04 | 25.51 |     29.90 | **10.77** |
 
 Two roleplay training stages moved the index by 0.10, which is the flat result the model card
-claims. Omitting the ArithMark-3 term rather than assuming it at chance gives 12.98 and 13.11.
+claims. Omitting the ArithMark-3 term rather than assuming it at chance gives 12.98, 12.66 and
+13.11.
+
+**Do not read the dip.** The middle row is 0.27 below the base and 0.37 below the finished model,
+and the battery does not resolve that. A 1-sigma binomial error on a single Index value is 0.71 on
+this basis (PIQA +-1.14 pp on 1,838 items, ARC-E +-1.01 on 2,376, ARC-C +-1.26 on 1,172, HellaSwag
++-0.46 on 10,042), so the whole three-row spread fits inside one standard error of any one row. The
+three checkpoints are scored on identical items, which makes this a paired comparison and the true
+resolution better than 0.71, but recovering how much better needs per-item results the logs do not
+keep. **The defensible claim is the one the card makes: the curriculum did not move general
+capability. Ordering these three by index is not supported.**
 
 **The original plan for this lever did not work, and the reason is worth keeping.** It was to score
 `Felladrin/Minueza-32M-UltraChat` and compare against its real Open LLM Leaderboard v1 entry
@@ -732,7 +743,9 @@ a leaderboard we can read and shipped with a BPE GGUF in an architecture this lo
 of the stage 2 checkpoint reproduced the old numbers exactly, because the fix had been committed and
 the branch switched away six seconds later. Long benchmarks run from a `git worktree` pinned to the
 branch being measured, with absolute model paths, and the script greps the source for the change it
-is supposed to be measuring before it starts.
+is supposed to be measuring before it starts. The stage 2 row above is that re-measure, run from a
+pinned worktree with the grep guard; its raw `acc` matches the discarded battery on PIQA, ARC-Easy
+and ARC-Challenge and differs only on HellaSwag, which is the signature the fix should leave.
 
 ### 10. Phase B KL anchor against the base checkpoint (medium): OP DONE
 
