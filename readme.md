@@ -53,7 +53,7 @@ deno run -A cli.ts pretrain --data your.tokens --out out/continued.gguf \
 | `pretrain`                    | train a base model, or continue one with `--resume`                                                              |
 | `finetune`                    | fine-tune on chat data, supervising only the assistant turns                                                     |
 | `eval-loss`                   | held-out validation loss on fixed windows                                                                        |
-| `eval-choice`                 | ARC / HellaSwag / perplexity                                                                                     |
+| `eval-choice`                 | ARC-Challenge / ARC-Easy / HellaSwag / PIQA / perplexity                                                         |
 | `generate`                    | greedy completion without llama.cpp                                                                              |
 | `inspect`                     | a GGUF's metadata, shape, and the flags needed to resume it                                                      |
 | `export`                      | re-export under a release name, with quants                                                                      |
@@ -80,9 +80,18 @@ Each architecture is a single file in `src/arch/` plus one line in the registry,
 - Checkpoint resume through GGUF plus an optimizer-state sidecar, so a long run survives an interruption.
 - `deno task test` type-checks the tree, then runs finite-difference gradient checks on every op (with a negative control, so we know it can catch a wrong backward) and GPU-vs-CPU parity on every kernel.
 
+## Results
+
+Scored with `eval-choice` on the Open SLM Leaderboard's four tasks, full sets, 0-shot: PIQA 61.32, ARC-Easy 40.03, ARC-Challenge 22.61, HellaSwag 28.16 (acc_norm). Combined the way that board combines them, those give an **Intelligence Index of 9.67**, against 25-27 at the top of the board; the formula and the arithmetic are in [docs/optimization.md](docs/optimization.md) lever 9b.
+
+Two qualifiers that matter. This is a self-computed index, not a submitted entry, and the board's fifth task (ArithMark-3) is not implemented here, so it is assumed at chance; omitting the term instead gives 11.76. And it was measured on a roleplay continuation of the published base, not on the published [Minueza-3-95M-Base](https://huggingface.co/Felladrin/Minueza-3-95M-Base) file itself, which has not been scored on all four tasks yet.
+
+For placement, 9.67 would sit above 82 of the 129 entries on that board with complete task data, at 94.7M parameters trained on one consumer APU. The cohort above it is trained on 14 to 700 times more tokens per parameter; `docs/optimization.md` lever 11 covers what they do differently, and lever 4 covers why tokens-per-parameter, not anything in this codebase, is the ceiling on quality.
+
 ## Honest limits
 
-- Single-digit to low-hundreds of millions of parameters. At 94.7M on one APU it did ~900 tokens/s on the kernels the published model was trained with, so 2B tokens took about 25 days; the kernels have since been vectorized (2.4x on an M1 Max) but nobody has re-run the APU number. Either way, JS and WebGPU won't match a CUDA cluster, and no flag changes that.
+- **A model this size is a demonstration, not a product.** At 94.7M and ~21 tokens per parameter it produces locally fluent text and cannot hold a conversation: it does not carry facts across turns, and it will confabulate an answer to anything factual. The index above measures the trainer working, not a model you would deploy.
+- Single-digit to low-hundreds of millions of parameters. At 94.7M on one APU it does 1588 tokens/s, up from the ~900 the published model was trained at, so the published model's 1.95B tokens is about 14 days rather than 25. JS and WebGPU still won't match a CUDA cluster, and no flag changes that.
 - Training keeps float master weights and quantizes at export, so you can't really train in Q4_0.
 - Context length is capped by a WebGPU buffer limit, before compute becomes the problem: 8192 on adapters that grant their full buffer size, 2500-3000 on the ones that don't.
 - The GGUF output is structurally verified here, but please check it against `llama-cli` before trusting a specific build.

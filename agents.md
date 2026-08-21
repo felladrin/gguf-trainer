@@ -20,6 +20,20 @@ deno run -A cli.ts help --json       # the same, machine-readable: parse this, d
 deno run -A cli.ts <command> --help  # one command's flags, with defaults and examples
 ```
 
+## Which document answers what
+
+The rest of the docs are consulted, not read. This is when each one earns opening.
+
+| You are about to                             | Read                                                                                                                                                                      |
+| :------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| run any command                              | this file: the contract, the invariants, then the recipe                                                                                                                  |
+| add a model shape                            | [docs/adding-an-architecture.md](docs/adding-an-architecture.md)                                                                                                          |
+| change a kernel or chase throughput          | [docs/optimization.md](docs/optimization.md), lever 1d FIRST: it lists what has already been measured and rejected                                                        |
+| understand why the engine is shaped this way | [docs/design.md](docs/design.md)                                                                                                                                          |
+| pick a corpus or a token budget              | [docs/optimization.md](docs/optimization.md) levers 4 and 11; for model size, Hardware reality below                                                                      |
+| reproduce or question a published number     | [docs/optimization.md](docs/optimization.md) levers 1, 9 and 9b for the number; [docs/notes/](docs/notes/) for the run that produced it, point-in-time and not maintained |
+| judge whether this project fits your goal    | [readme.md](readme.md): the results and the honest limits                                                                                                                 |
+
 ## Contract
 
 - **Flags only.** No positional arguments anywhere. `--flag value` and `--flag=value` both work,
@@ -32,6 +46,35 @@ deno run -A cli.ts <command> --help  # one command's flags, with defaults and ex
   `[ckpt @ N]` when it writes. Parse those lines to follow a run; do not poll the file.
 - **Checkpoints are atomic.** Written to a temp file and renamed, so an interrupted run always
   leaves a loadable GGUF plus its `.optstate` sidecar.
+
+## Invariants
+
+Violating any of these wastes a run. They are checked where possible; a few cannot be.
+
+0. **An architecture is a file, not a fork.** If a model shape is missing, add `src/arch/<name>.ts`
+   rather than special-casing the trainer. Everything outside `src/arch/` is architecture-agnostic
+   on purpose, and a conditional there is a bug.
+1. **The tokenizer freezes at step one.** Vocab and embeddings are fixed for the model's whole life.
+   Every fine-tune must reuse the base's `tokenizer.json` byte for byte. `chat-corpus` aborts if the
+   tokenizer lacks the ChatML specials; `tokenize` silently trains a new vocab if you point it at a
+   prefix with no tokenizer beside it.
+2. **`--resume` requires an exact architecture match.** `--hidden`, `--layers`, `--head-dim`,
+   `--window`, `--max-seq` and the vocab must equal the checkpoint's. A mismatch aborts before any
+   compute and names the field. `inspect` prints the correct flags.
+3. **The optimizer sidecar is `<model>.gguf.optstate`.** Same directory, exact name. Missing means a
+   cold optimizer, which re-warms momentum over the first few hundred steps rather than failing.
+4. **Compute is f32.** f16 operands overflow to NaN at these sizes (it reproduced at exactly the
+   same step under two different learning rates), and they buy no wall-clock: measured, f16 compute
+   is 0.98x on attention itself, so it is not a matter of which kernel dominates.
+   `--checkpoint-precision f16` only affects stored checkpoints.
+5. **Tokens seen = steps x batch x seq-len.** One epoch means `corpus_tokens / (batch * seq-len)`
+   steps. The trainer prints the epoch count at startup; check it before walking away.
+6. **The LR schedule is derived from `--steps`.** Warmup is 10% and cooldown 20% of the total, so
+   resuming with a different `--steps` silently reshapes the schedule mid-run. Keep it constant
+   across resumes and move `--start-step` instead.
+7. **`--seq-len` must fit `--max-seq`,** and context is capped by a WebGPU buffer limit before
+   compute: attention binds one `[heads, T, T]` buffer per layer. 8192 works on adapters that grant
+   their full buffer size; 2500-3000 on those that fall back to the 128 MiB default.
 
 ## Recipes
 
@@ -160,34 +203,6 @@ deno run -A cli.ts pretrain --arch qwen3 --data data/corpus.tokens --out out/q3.
 Adding an architecture is one file plus one registry line, and it inherits the gradient checks and
 the round-trip test automatically: docs/adding-an-architecture.md.
 
-## Invariants
-
-Violating any of these wastes a run. They are checked where possible; a few cannot be.
-
-0. **An architecture is a file, not a fork.** If a model shape is missing, add `src/arch/<name>.ts`
-   rather than special-casing the trainer. Everything outside `src/arch/` is architecture-agnostic
-   on purpose, and a conditional there is a bug.
-1. **The tokenizer freezes at step one.** Vocab and embeddings are fixed for the model's whole life.
-   Every fine-tune must reuse the base's `tokenizer.json` byte for byte. `chat-corpus` aborts if the
-   tokenizer lacks the ChatML specials; `tokenize` silently trains a new vocab if you point it at a
-   prefix with no tokenizer beside it.
-2. **`--resume` requires an exact architecture match.** `--hidden`, `--layers`, `--head-dim`,
-   `--window`, `--max-seq` and the vocab must equal the checkpoint's. A mismatch aborts before any
-   compute and names the field. `inspect` prints the correct flags.
-3. **The optimizer sidecar is `<model>.gguf.optstate`.** Same directory, exact name. Missing means a
-   cold optimizer, which re-warms momentum over the first few hundred steps rather than failing.
-4. **Compute is f32.** f16 operands overflow to NaN at these sizes (it reproduced at exactly the
-   same step under two different learning rates), and they buy no wall-clock because attention, not
-   the GEMM, dominates. `--checkpoint-precision f16` only affects stored checkpoints.
-5. **Tokens seen = steps x batch x seq-len.** One epoch means `corpus_tokens / (batch * seq-len)`
-   steps. The trainer prints the epoch count at startup; check it before walking away.
-6. **The LR schedule is derived from `--steps`.** Warmup is 10% and cooldown 20% of the total, so
-   resuming with a different `--steps` silently reshapes the schedule mid-run. Keep it constant
-   across resumes and move `--start-step` instead.
-7. **`--seq-len` must fit `--max-seq`,** and context is capped by a WebGPU buffer limit before
-   compute: attention binds one `[heads, T, T]` buffer per layer. 8192 works on adapters that grant
-   their full buffer size; 2500-3000 on those that fall back to the 128 MiB default.
-
 ## When something fails
 
 | Message                                                          | Meaning                                                      | Fix                                                                         |
@@ -206,17 +221,20 @@ Violating any of these wastes a run. They are checked where possible; a few cann
 
 Measured on one AMD Strix Halo APU (128 GB unified memory), f32:
 
-| Model | Shape              | Throughput     | Peak GPU |
-| ----- | ------------------ | -------------- | -------- |
-| 94.7M | batch 8 x seq 2048 | ~900 tokens/s  | 39.3 GB  |
-| 94.7M | batch 8 x seq 1024 | ~1050 tokens/s | 28.9 GB  |
+| Model | Shape              | Throughput                              | Peak GPU |
+| ----- | ------------------ | --------------------------------------- | -------- |
+| 94.7M | batch 8 x seq 2048 | 1588 tokens/s                           | 39.3 GB  |
+| 94.7M | batch 8 x seq 2048 | 903 tokens/s (pre-2026-08-18 kernels)   | 39.3 GB  |
+| 94.7M | batch 8 x seq 1024 | ~1050 tokens/s (pre-2026-08-18 kernels) | 28.9 GB  |
 
-**Those two rows predate the 2026-08-18 kernel rewrite and are the floor, not the current number.**
-The attention, GEMM and cross-entropy kernels were vectorized after they were taken; the same run on
-an M1 Max went 204 -> 490 tokens/s. Nobody has re-run it on Strix yet. Run `bench` on the machine in
-front of you before planning around a throughput figure, and see `docs/optimization.md` lever 1.
+The 2026-08-18 kernel rewrite vectorized attention, GEMM and cross-entropy: 903 -> 1588 tok/s on
+Strix (1.76x) and 2.40x on an M1 Max. 1588 is the SUSTAINED rate inside a real run; the same shape
+measured 2651 tok/s over 150 steps on an idle GPU, and that 1.7x gap is not yet attributed (see
+`docs/optimization.md` lever 1c). Run `bench` on the machine in front of you before planning around
+any of these.
 
-That is 1.9 billion tokens in about 25 days of wall clock, which is what the published model cost.
+The published model was trained on the pre-rewrite kernels, so its 1.95B tokens cost about 25 days
+of wall clock; at 1588 tok/s the same run is about 14.
 Plan in those units: a "quick experiment" is 100M tokens and a day. This is not a CUDA cluster and
 no flag makes it one. Sub-100M models are the honest target.
 
@@ -242,6 +260,16 @@ docs/               how to add an architecture, design rationale, optimization n
 docs/notes/         point-in-time records of the Minueza-3 run, kept as evidence
 scripts/            the eval batteries and corpus builders, plus the historical Minueza-3 run scripts
 ```
+
+## Already measured and rejected
+
+Before optimizing a kernel, read the ruled-out table in `docs/optimization.md` (lever 1d). It
+records what was tried, measured and abandoned, with the numbers: f16 compute (0.98x), f16 storage
+for Q/K/V (1.02-1.06x), split-K attention (0.4-0.7x), QT query-register tiling (0.80-0.94x at QT=2, 0.48-0.68x at QT=3), a
+larger GEMM tile (0.93x on an idle GPU), lazy host tensor storage (removes 98.9% of host allocation,
+moves throughput <1%), and why WMMA, subgroup matrices and bf16 are not reachable from WGSL here.
+Each of those cost hours to establish. Re-deriving one is the most common way to waste a day in this
+repo.
 
 ## Rules for changing this code
 
