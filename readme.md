@@ -22,6 +22,8 @@ Deno 2.x, which ships WebGPU natively (CI tests on it). That's it: no build step
 
 Node 22.6+ and Bun run the CPU reference path too, which is enough for the test suite (`deno task test:node`), though the CLI itself is Deno-only.
 
+Memory scales with `seq-len x batch`, and on this trainer that means tens of GB at the shapes a real run uses. `--reclaim` frees each micro-batch's activations as it goes, which cut peak GPU memory 5.6x in the measured A/B (39.3 GB to 7.0 GB) for 23% less throughput: it is off by default, and it is what makes a long-context run fit on a small GPU. Measured both ways in [docs/optimization.md](docs/optimization.md) lever 3b.
+
 The continue-training recipe below also uses [`hf`](https://huggingface.co/docs/huggingface_hub/guides/cli), Hugging Face's CLI, to fetch a published model. Nothing else needs it.
 
 ## Quickstart

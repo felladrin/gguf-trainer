@@ -245,7 +245,7 @@ the round-trip test automatically: docs/adding-an-architecture.md.
 | `no WebGPU: training needs Deno`                                 | running under Node or Bun                                    | training needs Deno; Node and Bun have no GPU backend here                                                                  |
 | `GPU/CPU parity probe failed`                                    | the backend disagrees with the reference at init             | a real bug; stop and report it, do not train through it                                                                     |
 | NaN loss partway into a run                                      | f16 overflow, or a learning rate above 0.01                  | keep compute f32; `--lr 0.01` is the proven ceiling, 0.02 diverged                                                          |
-| OOM at long context                                              | the per-layer attention buffer                               | lower `--seq-len`, or add `--reclaim` to free activations per micro-batch                                                   |
+| OOM at long context                                              | the per-layer attention buffer                               | add `--reclaim` (5.6x less peak memory, 23% slower, lever 3b), or lower `--seq-len`                                        |
 
 ## Hardware reality
 
