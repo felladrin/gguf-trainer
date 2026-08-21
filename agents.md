@@ -141,7 +141,10 @@ deno run -A cli.ts finetune --data data/sft.tokens --mask data/sft.mask \
 The flags above are SmolLM2-135M's; paste whatever step 2 prints for your base, ALL of
 it. `--max-seq` is compared too, so dropping it resumes against the default
 `max(8192, seq-len)` and a base with a longer context (Qwen3 is 40960) aborts on the
-mismatch.
+mismatch. `--heads` is load-bearing on qwen3 for the same reason and one more: published
+Qwen3 checkpoints size the attention block independently of the model width (LittleLamb-0.3B
+is 16 heads of 128 over a width of 544), and without the flag there is nothing to derive the
+head count from but `hidden / head-dim`, which does not divide.
 
 The base must already carry ChatML (`<|im_start|>`, `<|im_end|>`, `<|endoftext|>`) as
 atomic specials; `--dump-tokenizer` says whether it does. Its other special tokens do

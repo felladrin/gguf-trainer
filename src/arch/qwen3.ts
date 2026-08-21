@@ -184,11 +184,18 @@ export function qwen3Config(
   nLayers: number,
   maxSeq = 8192,
   headDim = 64,
+  heads?: number,
 ): Qwen3Config {
-  if (hiddenSize % headDim !== 0) {
-    throw new Error(`hiddenSize ${hiddenSize} must be a multiple of headDim (${headDim})`);
+  // Only the DERIVED head count needs the width to divide: published Qwen3
+  // checkpoints routinely set nHeads * headDim wider than hiddenSize (LittleLamb
+  // is 16 x 128 over a width of 544), and the model builds those fine.
+  if (heads === undefined && hiddenSize % headDim !== 0) {
+    throw new Error(
+      `hiddenSize ${hiddenSize} must be a multiple of headDim (${headDim}), ` +
+        `or pass --heads to set the query-head count directly`,
+    );
   }
-  const nHeads = hiddenSize / headDim;
+  const nHeads = heads ?? hiddenSize / headDim;
   return {
     arch: "qwen3",
     vocabSize,
@@ -257,12 +264,11 @@ export const qwen3: Architecture<Qwen3Config> = {
       shape.nLayers,
       shape.maxSeq,
       shape.headDim,
+      v.has("heads") ? v.num("heads") : undefined,
     );
-    const nHeads = v.has("heads") ? v.num("heads") : base.nHeads;
     return {
       ...base,
-      nHeads,
-      nKVHeads: v.has("kv-heads") ? v.num("kv-heads") : Math.max(1, Math.round(nHeads / 2)),
+      nKVHeads: v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads,
       ffnDim: v.has("ffn-dim") ? v.num("ffn-dim") : base.ffnDim,
       ropeBase: v.has("rope-base") ? v.num("rope-base") : base.ropeBase,
       rmsEps: v.has("rms-eps") ? v.num("rms-eps") : base.rmsEps,
