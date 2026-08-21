@@ -1,0 +1,16 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "local>felladrin/.github:renovate-config"
+  ],
+  "automergeStrategy": "squash",
+  "packageRules": [
+    {
+      "description": "Nothing in the test suite imports hyparquet or @huggingface/jinja, so CI only type-checks them. Review these by hand until a test exercises them.",
+      "matchManagers": [
+        "deno"
+      ],
+      "automerge": false
+    }
+  ]
+}
