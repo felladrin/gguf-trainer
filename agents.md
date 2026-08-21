@@ -185,6 +185,14 @@ deno run -A cli.ts generate --model out/base.gguf --prompt "Once upon a time"
 checkpoints. `eval-choice` at these sizes hovers near chance (25.0), so read the trend, not the
 number.
 
+Split a held-out set off the corpus BEFORE tokenizing it, or you cannot compare two checkpoints
+that trained for different numbers of epochs: whatever you hold out from the shorter run is
+training data for the longer one. `eval-loss --holdout 1` wants a separate `.tokens` file;
+its default 1% tail is corpus the run has already seen.
+
+Never pick between checkpoints on the training loss. A longer SFT run reached a lower training loss
+and was the worse model on every other axis, benchmarks included (`docs/optimization.md` lever 12).
+
 For a qualitative read, `bash scripts/eval-completions.sh out/base.gguf` runs a fixed prompt battery
 through llama.cpp with a repetition penalty. A base model loops under `generate`'s pure greedy
 decoding and reads worse than it is; keep the battery and the preset fixed so checkpoints stay

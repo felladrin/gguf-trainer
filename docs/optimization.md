@@ -812,6 +812,49 @@ them from us. GPT-X2.5 uses WSD with the decay confined to the last 10%, against
 Not transferable, despite ranking 7th at 90M: `palmer-006` discloses no token count, no datasets and
 no optimizer, and describes a merge plus a light finetune of an unnamed base.
 
+### 12. Picking between checkpoints: the training loss selects the wrong one (2026-08-21)
+
+The roleplay SFT ran as two halves of one WSD schedule over the same 18.3M-token corpus: `rp-chat3`
+stopped at step 550 (0.5 epochs), `rp-chat4` continued the same schedule to step 1100 (1.0 epoch),
+same seed, same shapes. The training loss says the longer run is the better model. Everything else
+says the opposite.
+
+| signal                                | v3 (550 steps) | v4 (1100 steps)           |
+| :------------------------------------ | :------------- | :------------------------ |
+| training loss, mean of the last 10    | 2.726          | **2.681**                 |
+| name given at turn 2, recalled turn 6 | yes            | no                        |
+| persona held across 6 turns           | yes            | collapses to one template |
+| greedy decode                         | no loop        | loops on 2 of 4 prompts   |
+
+The four-task Intelligence Index is deliberately not in that table. Both checkpoints were scored on
+it before the lm-eval parity fix and came out a fifth of a point apart, which is inside what a
+benchmark this size resolves; re-scoring v4 on the current harness would cost hours of GPU to decide
+nothing. The behavioral rows come from `--jinja` through the OpenAI chat endpoint with the full
+history resent each turn, which is the only honest way to probe this (agents.md, the ChatML gotcha).
+
+**The rule: at this scale a checkpoint is chosen by a behavioral probe, and the training loss is a
+divergence alarm, not a selector.** The extra half epoch bought 0.045 nats on the training
+distribution and paid for it in the behavior the model exists for. Nothing about that is surprising
+in hindsight, which is the point: the loss curve gave no hint, and reading two transcripts settled
+it in five minutes.
+
+**What we could not do, and why.** The obvious instrument is held-out loss, and `eval-loss` already
+supports it (`--holdout 1` against a separate `.tokens` file; the default 1% tail is corpus the run
+has seen, which its help says outright). It cannot be applied retroactively here: v4 consumed the
+whole corpus, so every token held out from v3 is training data for v4, and any split of `rpchat3`
+is rigged toward v4. **A held-out slice has to be carved before training starts, or it does not
+exist.**
+
+For the next run that is a jsonl split, not a code change: hold back the last few hundred
+conversations before `chat-corpus`, tokenize them as a second corpus with the same `--tokenizer`,
+and score every checkpoint with fixed `--windows` and `--seed`. `chat-corpus` has no split flag
+(only `--max-rows`), so the split happens upstream of it.
+
+Adopt the pairing, not either half alone: held-out loss to rank checkpoints cheaply and catch the
+turn upward, a behavioral probe to confirm the one it picks. Neither the loss curve nor the
+four-task benchmark separated these two by more than noise, and the loss curve pointed the wrong
+way; six turns of transcript settled it in minutes.
+
 ## Explicitly not worth doing
 
 - **Guarded/clamped f16 compute**: 0.98x measured on attention at seq 4096-8192, plus
@@ -835,6 +878,11 @@ no optimizer, and describes a merge plus a light finetune of an unnamed base.
 
 ## References
 
+- Held-out eval per epoch, early stopping on it, and "loss != correctness" as standard SFT practice
+  (a QLoRA/PEFT pipeline, so only the evaluation discipline transfers to this project):
+  [towardsdatascience.com](https://towardsdatascience.com/how-to-fine-tune-an-llm-an-end-to-end-guide/)
+- lm-evaluation-harness, the reference for the query construction and the acc_norm normalizer
+  `eval-choice` matches: [github.com](https://github.com/EleutherAI/lm-evaluation-harness)
 - Repo measurements: `docs/notes/journal.md` (kernel rewrites, reverted attempts, remaining
   roadmap), `docs/design.md` (precision and backend bring-up).
 - RDNA3.5 (gfx1151) speed-of-light rates, VOPD: [rocm.docs.amd.com](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/develop/conceptual/rdna/system-speed-of-light.html)
