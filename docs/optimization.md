@@ -918,6 +918,44 @@ By eye the two survivors are `dry-strong` and `topk-classic`, which is what the 
 its recommended and alternative presets. A round-2 grid of 11 presets around those was written but
 never run; it is not what the card's numbers rest on.
 
+### 14. Four scenarios the RP battery was missing, and whether `-ngl` changes its answers (2026-08-22)
+
+`eval-rp-completions.sh` has existed since the roleplay corpus tools landed, with five prompts shaped
+like a real horde request and `-r "You:"` as the stop, so a model that writes the human's turn shows up
+as truncation. What it did not have was a scenario per failure mode, which is what a checkpoint
+comparison needs: without one, three LittleLamb checkpoints all "look fine" and nothing names what
+differs.
+
+Four added, each isolating one thing: holding a stated refusal, recalling a fact given three turns up,
+a card dense with proper nouns, and two characters in one scene. Their personas are invented rather
+than lifted from PIPPA, so a model that memorized a popular card cannot score on recall instead of
+adherence. On step 881 the two new hard ones fail visibly and differently: the gate sergeant emits
+three consecutive `Sergeant Idris Vale:` labels instead of one turn, and the barge scene switches from
+`Captain Rook:` to `Rook:` and then writes Pell's line. Neither is visible in the original five.
+
+**Whether `-ngl` changes the answer: measured, and on this hardware it does not.** The concern was that
+GPU offload produces different completions from CPU at temp 0. On Strix Halo (gfx1151, Vulkan backend,
+llama.cpp b7682), across 26 deterministic completions (the 10-prompt base battery on checkpoints 481
+and 881, plus a 6-scenario RP set run at the temp-0 override):
+
+| Comparison                                          | Result                                |
+| --------------------------------------------------- | ------------------------------------- |
+| `-ngl 0` vs `-ngl 1` vs `-ngl 10`                   | byte-identical                        |
+| `-ngl 0` vs `-ngl 99`, base battery, 20 completions | byte-identical                        |
+| `-ngl 0` vs `-ngl 99`, RP set, 6 completions        | 1 token differs ("That's" vs "Good.") |
+| `-ngl 99` run twice                                 | byte-identical                        |
+
+Device memory scales with the flag (472 / 731 / 1295 MiB), so the partial offloads are real and not
+silently falling back to CPU. Each setting is deterministic; the single divergence is a float-order
+argmax flip on a near-tie, not degradation, and neither completion is worse than the other. So the
+backend is not a correctness problem here, but a checkpoint comparison decided by eye can turn on one
+token: record which backend and which build a result came from. `NGL` is now a tunable and the script
+prints it in the header for that reason.
+
+Untested, and the reason the flag is exposed rather than pinned: the original report of incoherent
+offloaded output was on an M1 Max, which is the Metal backend, not Vulkan. Nothing above transfers to
+it.
+
 ## Explicitly not worth doing
 
 - **Guarded/clamped f16 compute**: 0.98x measured on attention at seq 4096-8192, plus
