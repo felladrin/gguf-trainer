@@ -858,10 +858,21 @@ whole corpus, so every token held out from v3 is training data for v4, and any s
 is rigged toward v4. **A held-out slice has to be carved before training starts, or it does not
 exist.**
 
-For the next run that is a jsonl split, not a code change: hold back the last few hundred
+For the next run the split is a jsonl step, not a code change: hold back the last few hundred
 conversations before `chat-corpus`, tokenize them as a second corpus with the same `--tokenizer`,
 and score every checkpoint with fixed `--windows` and `--seed`. `chat-corpus` has no split flag
 (only `--max-rows`), so the split happens upstream of it.
+
+**Two things this lever assumed and should not have.** First, that "every checkpoint" exists:
+`finetune` overwrites its `--out` path on every write, so a finished run leaves exactly one file and
+nothing to rank. `--keep-checkpoints` now also writes each one as `<out>-step<N>.gguf`, reusing the
+bytes the export already produced. Without that flag this lever's whole prescription has no input.
+Second, that carving the split before training is sufficient to make it held-out. It is not, if the
+source corpus contains duplicates: the LittleLamb split was carved cleanly at document boundaries
+and one of its 500 documents still appeared in the training half, because that conversation was in
+the source twice and the boundary cannot see that. **Dedup against the training side after
+splitting, not just split carefully** — one hash set over both sides is the whole check, and it
+found a 2,720-token document worth 0.49% of that holdout.
 
 Adopt the pairing, not either half alone: held-out loss to rank checkpoints cheaply and catch the
 turn upward, a behavioral probe to confirm the one it picks. Neither the loss curve nor the

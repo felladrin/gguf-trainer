@@ -9,6 +9,7 @@ import { parseQuantList } from "../src/gguf/quantize.ts";
 import { llamaRunScript } from "../src/export/export-gguf.ts";
 import { guardBufferSize } from "../src/backend/webgpu.ts";
 import { gemma3Config } from "../src/arch/gemma3.ts";
+import { stepCheckpointPath } from "../src/commands/pretrain.ts";
 
 function eq(got: string, want: string, msg: string): void {
   if (got !== want) throw new Error(`${msg}: got ${got}, want ${want}`);
@@ -57,5 +58,20 @@ throws(
   "maxStorageBufferBindingSize",
   "over-limit error names the limit",
 );
+
+// --keep-checkpoints names each write by its step, so a run leaves a series to pick
+// between rather than one overwritten file. The `.gguf` suffix is optional in the
+// pattern, so a path written without one has to gain it instead of producing a name
+// nothing will load.
+for (
+  const [inp, step, want] of [
+    ["out/lamb-rp.gguf", 200, "out/lamb-rp-step200.gguf"],
+    ["out/lamb-rp", 200, "out/lamb-rp-step200.gguf"],
+    ["out/v1.5/model.gguf", 0, "out/v1.5/model-step0.gguf"],
+    ["model.gguf.bak", 40, "model.gguf.bak-step40.gguf"],
+  ] as [string, number, string][]
+) {
+  eq(stepCheckpointPath(inp, step), want, `stepCheckpointPath(${inp}, ${step})`);
+}
 
 console.log("export_extras: all assertions passed");

@@ -179,6 +179,13 @@ export function encodeCorpus(tok: BPETokenizer, corpus: string): IdArray {
   return ids.subarray(0, n);
 }
 
+/** `out/m.gguf` at step 200 becomes `out/m-step200.gguf`. The `.gguf` suffix is
+ * optional in the pattern, so a path written without one still gains it and the
+ * result is loadable by name. */
+export function stepCheckpointPath(outPath: string, step: number): string {
+  return outPath.replace(/(\.gguf)?$/, `-step${step}.gguf`);
+}
+
 async function run(v: Values, mode: "pretrain" | "finetune") {
   const inputPath = v.str("data");
   const resumeFlag = v.opt("resume");
@@ -463,6 +470,12 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       const b = await exportGGUF();
       const optBytes = await writeOptState();
       const step = startStep + localStep;
+      // The canonical --out path is overwritten every time, so a finished run
+      // leaves one checkpoint and nothing to choose between. Reuse the bytes the
+      // export just produced rather than serializing the model twice.
+      if (v.bool("keep-checkpoints")) {
+        await writeFileBytes(stepCheckpointPath(outPath, step), b);
+      }
       const el = (Date.now() - t0) / 1000;
       const rate = localStep / Math.max(1, el);
       console.log(
@@ -626,6 +639,11 @@ const SHARED_FLAGS: Flag[] = [
     type: "number",
     placeholder: "MIN",
     describe: "also write it whenever this many minutes have passed since the last one",
+  },
+  {
+    name: "keep-checkpoints",
+    type: "boolean",
+    describe: "also keep each checkpoint under its own step number, for picking between them later",
   },
   {
     name: "checkpoint-precision",
