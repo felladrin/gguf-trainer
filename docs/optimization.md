@@ -991,6 +991,61 @@ Unprompted adult drift from these SFW prompts was rare, 0 to 3 hits per 80 depen
 at that sample size does not separate the presets. It is not zero: one sample turned "That sword you
 made is beautiful" into "just a tool for your pleasure".
 
+### 16. The cooldown made the model worse, and a slope through a staircase predicted neither (2026-08-23)
+
+The LittleLamb RP fine-tune is the first run with the instrument lever 12 asked for: a held-out
+slice carved before training, `--keep-checkpoints` writing a snapshot series, and every snapshot
+scored on the same 64 windows of 1024 tokens at a fixed seed. Twenty-one points, base to step 2200.
+Three things came out of it, and only the first was expected.
+
+**The WSD cooldown raised held-out loss.** The schedule puts warmup at 220, stable to 1760 and
+cooldown over the last 440 steps.
+
+| Phase                           | Held-out loss     |
+| ------------------------------- | ----------------- |
+| plateau, steps 762-1400 (n=11)  | 2.8888, sd 0.0062 |
+| plateau, steps 1600-1767 (n=3)  | 2.8596, sd 0.0003 |
+| cooldown, steps 1800-2200 (n=9) | 2.8744, sd 0.0059 |
+| final checkpoint, step 2200     | 2.8683            |
+
+The release is step 1680 at 2.8594. Shipping the last checkpoint would have cost 0.0089 nats, and
+"train to the end" and "take the best model" are simply different decisions here. Adjacent
+checkpoints jitter by about 0.009, so the cooldown's 0.015 is above the noise floor and the
+final-versus-best gap sits right at it.
+
+**The curve is a staircase, and fitting a line through it predicted badly in both directions.**
+Mid-run, a tail fit over 762-1400 projected 2.8629 at step 2200 and the argument was that the
+remaining hours were buying almost nothing. Then the curve stepped down 0.029 nats across 1400-1600,
+a refit projected 2.8264, and the argument reversed to "let it run, the cooldown is still ahead".
+Both were wrong, because a plateau-step-plateau shape has no slope to extrapolate. **Scoring two
+more snapshots settled what neither fit could**: 1600, 1680 and 1767 came in at 2.8595, 2.8594 and
+2.8600, flat at full LR, which is the measurement that says the descent had already stopped.
+
+**The step itself is unexplained.** It is not the LR schedule: it happened about 300 steps inside
+the stable phase, and the cooldown had not started. It is not an epoch boundary: the corpus is 16.8M
+tokens at 4 bytes per id, 4096 tokens per step, so one epoch is 4101 steps and the whole 2200-step
+run covers 54% of one. It is not a data-mix change: the run passed no injection flags. Recorded here
+as an observation rather than a cause.
+
+**What the behavioural battery could and could not add.** The RP battery's label-hygiene counts, at
+12 seeds across 17 checkpoints (204 runs), regress on step at t=+1.45 for self-relabels and t=+2.46
+for other-speaker labels, r=0.10 and r=0.17. An earlier note in this project claimed the
+other-speaker count _declined_ at t=-3.02; that does not reproduce and is retracted. The rebuilt
+scorer gives +1.25 on exactly the same 180 runs. The lesson is not about the sign: it is that a
+scorer which lives only in a scratchpad cannot be re-run when its number is challenged, and
+`scripts/score-rp-battery.py` and `scripts/dump-rp-prompts.sh` are now in the repo, the latter
+re-emitting the battery's prompt array so the scorer strips prompts exactly rather than guessing
+where each completion starts.
+
+The chosen checkpoint does score best on the battery (self 1.33 +/- 0.36, other 1.92 +/- 0.40,
+against 2.00-2.25 and 3.17-3.33 for the 1151-1281 band), but at roughly 2.4 sigma on the better of
+the two counts, that is a confirmation the held-out curve was not contradicted, not an independent
+selector.
+
+**The pairing lever 12 prescribed held up; the ranking half did the work.** Training loss would have
+picked differently again: its per-batch trace over the last 40 steps swings 1.52 to 3.22 with no visible
+relationship to the held-out curve.
+
 ## Explicitly not worth doing
 
 - **Guarded/clamped f16 compute**: 0.98x measured on attention at seq 4096-8192, plus
