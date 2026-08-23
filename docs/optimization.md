@@ -956,6 +956,41 @@ Untested, and the reason the flag is exposed rather than pinned: the original re
 offloaded output was on an M1 Max, which is the Metal backend, not Vulkan. Nothing above transfers to
 it.
 
+### 15. The card's own sampler preset was the worst of four (2026-08-22)
+
+Two questions, one measurement. First, whether `llama-server` mishandles the model: it does not.
+With `-ngl 999` on the Q8_0 file, `llama-completion` from the same build at the same seed and
+parameters returns byte-identical text. The suspicion was reasonable and it is ruled out.
+
+Second, whether the preset the card recommended was the right one. It was not. Four presets, four
+personas by twenty seeds each, through `/completion` with `You:` as the stop:
+
+| Preset                                                    | Mean tokens | Replies under 15 tokens |
+| --------------------------------------------------------- | ----------- | ----------------------- |
+| card-dry: `temp 0.85 min-p 0.08 top-k 0` + DRY 1.0/1.75/2 | 35.2        | 28% +/- 5%              |
+| card-topk: `temp 0.7 top-k 40 top-p 0.9 rep 1.1/128`      | 58.5        | 16% +/- 4%              |
+| warm-minp: `temp 1.0 min-p 0.10 rep 1.05/64`              | 50.7        | 12% +/- 4%              |
+| cool-topk: `temp 0.6 top-k 30 top-p 0.9 rep 1.1/128`      | 61.5        | **8% +/- 3%**           |
+
+The card led with card-dry, which collapses most often: a reply that runs eleven tokens and hands the
+turn straight back is a real roleplay failure, not a metric artifact. Every DRY variant tried landed
+at 28-34%; every non-DRY one at 8-16%. The gap from worst to best is 20 points against a combined
+error of about 6. The card now leads with cool-topk.
+
+**This does not overturn lever 13, it measures a different axis.** That sweep asked which presets
+avoid loops and garble, and DRY genuinely does. This one asks how often a preset produces a collapsed
+reply on transcript-shaped prompts with a stop sequence, which the earlier sweep never posed.
+
+**What no preset fixed.** Reading the text rather than the counts: a persona written as a male cat
+comes back as "her" under every setting, and a persona written as reticent and uncomfortable with
+praise gushes under every setting. One preset had the model address the user as "my dear apprentice"
+when the card makes the character the apprentice. Persona adherence at 95M is a capacity limit and
+the sampler does not reach it; the card's Limitations say so now.
+
+Unprompted adult drift from these SFW prompts was rare, 0 to 3 hits per 80 depending on preset, which
+at that sample size does not separate the presets. It is not zero: one sample turned "That sword you
+made is beautiful" into "just a tool for your pleasure".
+
 ## Explicitly not worth doing
 
 - **Guarded/clamped f16 compute**: 0.98x measured on attention at seq 4096-8192, plus
