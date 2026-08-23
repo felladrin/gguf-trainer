@@ -1,0 +1,68 @@
+########## out/littlelamb-base.f32.gguf
+val loss 3.4023  ppl 30.03  (64 x 1024 tok, held-out file, seed 1234)  littlelamb-base.f32.gguf
+########## out/lamb-ckpt-200.gguf
+val loss 2.9666  ppl 19.43  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-200.gguf
+########## out/lamb-ckpt-279.gguf
+val loss 2.9406  ppl 18.93  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-279.gguf
+########## out/lamb-ckpt-360.gguf
+val loss 2.9167  ppl 18.48  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-360.gguf
+########## out/lamb-ckpt-400.gguf
+val loss 2.9227  ppl 18.59  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-400.gguf
+########## out/lamb-ckpt-481.gguf
+val loss 2.9226  ppl 18.59  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-481.gguf
+########## out/lamb-ckpt-562.gguf
+val loss 2.9065  ppl 18.29  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-562.gguf
+########## out/lamb-ckpt-600.gguf
+val loss 2.9090  ppl 18.34  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-600.gguf
+########## out/lamb-ckpt-681.gguf
+val loss 2.9000  ppl 18.17  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-681.gguf
+########## out/lamb-ckpt-762.gguf
+val loss 2.8912  ppl 18.01  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-762.gguf
+########## out/lamb-ckpt-800.gguf
+val loss 2.8910  ppl 18.01  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-800.gguf
+########## out/lamb-ckpt-881.gguf
+val loss 2.9006  ppl 18.18  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-881.gguf
+########## out/lamb-ckpt-962.gguf
+val loss 2.8927  ppl 18.04  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-962.gguf
+########## out/lamb-ckpt-1000.gguf
+val loss 2.8927  ppl 18.04  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1000.gguf
+########## out/lamb-ckpt-1081.gguf
+val loss 2.8932  ppl 18.05  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1081.gguf
+########## out/lamb-ckpt-1151.gguf
+val loss 2.8835  ppl 17.88  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1151.gguf
+########## out/lamb-ckpt-1200.gguf
+val loss 2.8857  ppl 17.92  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1200.gguf
+########## out/lamb-ckpt-1281.gguf
+val loss 2.8798  ppl 17.81  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1281.gguf
+########## out/lamb-ckpt-1362.gguf
+val loss 2.8823  ppl 17.86  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1362.gguf
+########## out/lamb-ckpt-1400.gguf
+val loss 2.8842  ppl 17.89  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1400.gguf
+########## out/lamb-ckpt-1474.gguf
+val loss 2.8685  ppl 17.61  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1474.gguf
+########## out/lamb-ckpt-1549.gguf
+val loss 2.8604  ppl 17.47  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1549.gguf
+########## out/lamb-ckpt-1600.gguf
+val loss 2.8595  ppl 17.45  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1600.gguf
+########## out/lamb-ckpt-1680.gguf
+val loss 2.8594  ppl 17.45  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1680.gguf
+########## out/lamb-ckpt-1767.gguf
+val loss 2.8600  ppl 17.46  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1767.gguf
+########## out/lamb-ckpt-1800.gguf
+val loss 2.8678  ppl 17.60  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1800.gguf
+########## out/lamb-ckpt-1868.gguf
+val loss 2.8744  ppl 17.72  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1868.gguf
+########## out/lamb-ckpt-1913.gguf
+val loss 2.8861  ppl 17.92  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1913.gguf
+########## out/lamb-ckpt-1965.gguf
+val loss 2.8771  ppl 17.76  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-1965.gguf
+########## out/lamb-ckpt-2000.gguf
+val loss 2.8754  ppl 17.73  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-2000.gguf
+########## out/lamb-ckpt-2042.gguf
+val loss 2.8770  ppl 17.76  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-2042.gguf
+########## out/lamb-ckpt-2090.gguf
+val loss 2.8759  ppl 17.74  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-2090.gguf
+########## out/lamb-ckpt-2135.gguf
+val loss 2.8679  ppl 17.60  (64 x 1024 tok, held-out file, seed 1234)  lamb-ckpt-2135.gguf
+########## out/lamb-rp.gguf
+val loss 2.8683  ppl 17.61  (64 x 1024 tok, held-out file, seed 1234)  lamb-rp.gguf

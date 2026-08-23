@@ -5,37 +5,52 @@
 //   deno run -A scripts/score-rp-battery.ts --seeds         # the multi-seed sweep, mean +/- SEM
 //   deno run -A scripts/score-rp-battery.ts --dir out/rp-battery
 //
-// Three counts per completion, because "wrote a name" is not one failure:
-//   self      the model re-labels its own turn, "Iris:" again inside Iris's reply
-//   in-scene  a speaker the PROMPT already established, which is correct behaviour
-//   invented  a speaker that appears nowhere in the prompt
+// Four counts per completion. Two earlier versions of this scorer had two and
+// three, and both lumped a defect together with correct behaviour in a way that
+// reversed the conclusion drawn from them, so the buckets are spelled out:
 //
-// The in-scene split is what makes the two-character prompt scoreable. Captain
-// Rook's scene names the deckhand Pell and asks for both voices, so a `Pell:`
-// line is the scenario working; counting it as a defect would score a checkpoint
-// higher for ignoring the character it was asked to write. Only `invented` is
-// unambiguously wrong.
+//   handback  `You:`, the model writing the human's turn. `-r "You:"` stops
+//             generation there, so this is the truncation the battery is built
+//             to expose, not a neutral event.
+//   self      the character re-labelling its own turn with no other speaker in
+//             between. An alternation like `Pell:` then `Captain Rook:` is a
+//             scene taking turns, so only a consecutive repeat counts.
+//   costar    a speaker the PROMPT staged, `Pell:` in the two-character scene.
+//             That scenario asks for both voices, so this is the scenario
+//             working; counting it as a defect scores a checkpoint higher for
+//             ignoring the character it was told to write.
+//   invented  a speaker that appears nowhere in the prompt. The only bucket
+//             that is unambiguously wrong.
 //
-// The prose control has no `[Character:]` header and no speaker labels at all,
-// so every label it produces is invented. That is deliberate: a narrative
-// continuation that starts assigning dialogue has left the format.
+// The prose control has no `[Character:]` header, so any label at all is either
+// handback or invented: a narrative continuation writing dialogue attributions
+// has left the format.
 //
-// Both counts are noise-dominated at one seed. Read the --seeds aggregate.
+// All four are noise-dominated at one seed. Read the --seeds aggregate, and
+// note that between-checkpoint spread is about the size of within-checkpoint
+// spread, so treat a trend across checkpoints with suspicion.
 
 const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const join = (...parts: string[]) => parts.join("/");
 
 export interface Counts {
+  handback: number;
   self: number;
-  inScene: number;
+  costar: number;
   invented: number;
 }
 
 const LABEL = /^([A-Z][^\n:]{0,40}):/gm;
 
-/** Speakers the prompt already put on stage, including the human's `You`. */
+/**
+ * Speakers the prompt staged in the transcript itself. Anchored after `<START>`
+ * so the persona block's own `Iris's Persona:` line does not become a name the
+ * model can regurgitate for free.
+ */
 export function promptSpeakers(prompt: string): Set<string> {
-  return new Set([...prompt.matchAll(LABEL)].map((m) => m[1]));
+  const at = prompt.indexOf("<START>");
+  const scene = at < 0 ? prompt : prompt.slice(at);
+  return new Set([...scene.matchAll(LABEL)].map((m) => m[1]));
 }
 
 export function characterOf(prompt: string): string | null {
@@ -47,12 +62,17 @@ export function characterOf(prompt: string): string | null {
 export function scoreCompletion(prompt: string, completion: string): Counts {
   const char = characterOf(prompt);
   const known = promptSpeakers(prompt);
-  const c: Counts = { self: 0, inScene: 0, invented: 0 };
+  const c: Counts = { handback: 0, self: 0, costar: 0, invented: 0 };
+  let previous: string | null = char;
   for (const m of completion.matchAll(LABEL)) {
     const name = m[1];
-    if (char !== null && name === char) c.self++;
-    else if (name === "You" || known.has(name)) c.inScene++;
+    if (name === "You") c.handback++;
+    else if (char !== null && name === char) {
+      if (previous === char) c.self++;
+      else c.costar++; // taking the turn back after someone else spoke
+    } else if (known.has(name)) c.costar++;
     else c.invented++;
+    previous = name;
   }
   return c;
 }
@@ -74,18 +94,24 @@ export function scoreRun(text: string, prompts: string[]): Counts {
       `${blocks.length} blocks, expected ${prompts.length}: the battery's prompt set moved`,
     );
   }
-  const total: Counts = { self: 0, inScene: 0, invented: 0 };
+  const total: Counts = { handback: 0, self: 0, costar: 0, invented: 0 };
   for (let i = 0; i < blocks.length; i++) {
     const nl = blocks[i].indexOf("\n");
     const body = nl < 0 ? "" : blocks[i].slice(nl + 1);
     const at = body.indexOf(prompts[i]);
     if (at < 0) throw new Error(`block ${i + 1} does not echo its prompt`);
     const c = scoreCompletion(prompts[i], body.slice(at + prompts[i].length));
+    total.handback += c.handback;
     total.self += c.self;
-    total.inScene += c.inScene;
+    total.costar += c.costar;
     total.invented += c.invented;
   }
   return total;
+}
+
+function die(msg: string): never {
+  console.error(msg);
+  Deno.exit(2);
 }
 
 function step(name: string): number {
@@ -104,7 +130,9 @@ function stats(xs: number[]): { mean: number; sem: number } {
 if (import.meta.main) {
   const args = new Set(Deno.args);
   const dirArg = Deno.args.indexOf("--dir");
-  const battery = dirArg >= 0 ? Deno.args[dirArg + 1] : join(ROOT, "out", "rp-battery");
+  const battery = dirArg >= 0
+    ? (Deno.args[dirArg + 1] ?? die("--dir needs a path"))
+    : join(ROOT, "out", "rp-battery");
   const prompts = await loadPrompts();
 
   if (args.has("--seeds")) {
@@ -115,10 +143,10 @@ if (import.meta.main) {
       const s = step(e.name);
       runs.set(s, [...(runs.get(s) ?? []), c]);
     }
-    console.log("  step   n           self       in-scene       invented");
+    console.log("  step   n       handback           self         costar       invented");
     for (const s of [...runs.keys()].sort((a, b) => a - b)) {
       const rows = runs.get(s)!;
-      const cells = (["self", "inScene", "invented"] as const).map((k) => {
+      const cells = (["handback", "self", "costar", "invented"] as const).map((k) => {
         const { mean, sem } = stats(rows.map((r) => r[k]));
         return `${mean.toFixed(2).padStart(5)} +- ${sem.toFixed(2)}`;
       });
@@ -131,13 +159,13 @@ if (import.meta.main) {
     for await (const e of Deno.readDir(battery)) {
       if (/^ckpt-\d+\.txt$/.test(e.name)) files.push(e.name);
     }
-    console.log("  step   self  in-scene  invented");
+    console.log("  step  handback   self  costar  invented");
     for (const f of files.sort((a, b) => step(a) - step(b))) {
       const c = scoreRun(await Deno.readTextFile(join(battery, f)), prompts);
       console.log(
-        `${String(step(f)).padStart(6)}  ${String(c.self).padStart(5)}  ${
-          String(c.inScene).padStart(8)
-        }  ${String(c.invented).padStart(8)}`,
+        `${String(step(f)).padStart(6)}  ${String(c.handback).padStart(8)}  ${
+          String(c.self).padStart(5)
+        }  ${String(c.costar).padStart(6)}  ${String(c.invented).padStart(8)}`,
       );
     }
   }

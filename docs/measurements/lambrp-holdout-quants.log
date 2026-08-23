@@ -1,0 +1,4 @@
+########## Q8_0
+val loss 2.8614  ppl 17.49  (64 x 1024 tok, held-out file, seed 1234)  LittleLamb-293M-RP.Q8_0.gguf
+########## Q4_0
+val loss 2.9755  ppl 19.60  (64 x 1024 tok, held-out file, seed 1234)  LittleLamb-293M-RP.Q4_0.gguf

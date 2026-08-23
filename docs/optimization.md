@@ -1018,13 +1018,21 @@ plateau above it.
 support the stronger claim.** Phase is perfectly confounded with time and there is no constant-LR
 continuation to compare against. Worse, this same curve takes an unexplained 0.025 excursion
 elsewhere (below), so the honest noise scale for a phase-sized claim is the size of the excursions
-the series makes for no reason anyone can name, not the 0.0066 mean gap between adjacent
-checkpoints. By that standard the cooldown's 0.0135 is _smaller_ than something already conceded as
+the series makes for no reason anyone can name, not the 0.0066 mean gap between the 32
+checkpoints' 31 adjacent pairs. By that standard the cooldown's 0.0135 is _smaller_ than something already conceded as
 unexplained. There is even a reading in which the cooldown helped: driving the LR toward its floor
 freezes the trajectory, and what looks like degradation is the walk being stopped somewhere
-mediocre instead of wandering back. **The run is seeded (`mulberry32(7 + startStep)`,
-`pretrain.ts`), so the counterfactual is one cheap experiment: resume from 1767 with the LR held
-flat for 440 steps.** Until that runs, this is an association.
+mediocre instead of wandering back. **The counterfactual is one cheap experiment, with one trap in it.** The seed is
+`mulberry32(7 + startStep)`, so a resume draws a different data stream than the original tail did:
+comparing a fresh flat-LR resume against the original cooldown would confound the schedule with the
+batch order. Run _both_ arms as resumes from the same step so both get the same stream and only the
+schedule differs. There is also no flat-LR flag, since warmup and cooldown are hardcoded at 10% and
+20% of `--steps`, so the flat arm has to be built by choosing a `--steps` whose cooldown falls
+outside the segment. Until that runs, this is an association.
+
+One thing that is free and confound-independent, though, and worth stating because the paragraph
+above understates the evidence: all ten cooldown snapshots score worse than both pre-cooldown flat
+points. Ten for ten is not nothing, even if it cannot separate the schedule from time.
 
 **The curve is a staircase, and two extrapolations through it were both wrong.** Mid-run, an OLS
 tail fit projected roughly 2.86 at step 2200 and the argument was that the remaining hours bought
@@ -1036,53 +1044,60 @@ could**: 1600, 1680 and 1767 came in at 2.8595, 2.8594 and 2.8600, three flat po
 cooldown boundary, which says the descent had already stopped.
 
 **The step is unexplained, and the most likely cause is that there is no cause.** The move across
-1400-1600 is 0.0247 endpoint to endpoint, 0.0292 between the two plateau means. It is not the LR
+1400-1600 is 0.0247 endpoint to endpoint, 0.0294 between the two plateau means. It is not the LR
 schedule: it happened ~300 steps inside the stable phase. It is not a data-mix change: the run
-passed no injection flags, and `injectFromStep` is the only mechanism that would alter the mix. It
+passed no injection flags, and `injectFromStep` in `train-gpu.ts` is the only mechanism that would
+alter the mix. The trainer's own banner says "0.5 epochs of 17M", which is the token ratio and not
+a claim that the sampler walks the corpus in order. It
 is **not an epoch boundary, and that ruling-out was originally argued the wrong way**: the trainer
 draws every window as `Math.floor(rng() * maxStart)`, i.i.d. with replacement per sequence
-(`trainer.ts`), so there are no epochs at any step count, and the arithmetic about 4101 steps per
+(`train-gpu.ts`, which is the path this run took, and identically in `trainer.ts`), so there are no
+epochs at any step count, and the arithmetic about 4101 steps per
 epoch was answering a question the sampler never poses. What that sampler does imply is the fourth
 candidate: with 2 sequences per step under assistant-only masking, the weights random-walk inside a
-low-loss basin, and plateau-step-plateau is what a random walk looks like sampled at 30 points.
+low-loss basin, and plateau-step-plateau is what a random walk looks like sampled at 32 points.
 
-**The behavioural battery does not corroborate any of this, and fixing its scorer reversed what it
-seemed to say.** Two things went wrong and both are worth recording.
+**The behavioural battery was scored by a broken metric twice, and both breaks flattered the
+conclusion in front of them.** This is the part of the run worth carrying forward, more than any
+number above it.
 
-The first is bookkeeping: an earlier draft cited "17 checkpoints, 204 runs" while
-`out/rp-battery/seeds/` holds 216 files across 18 checkpoints, because the released checkpoint's
-own seeds were added after the paragraph was written. A lever whose subject is reproducibility
-should not be unreproducible from its own artifacts.
+The scorer began with two buckets, the character and everyone else. The battery's two-character
+prompt names a deckhand called Pell in the persona and asks for both voices, so a `Pell:` line
+counted as a stray label. That scored a checkpoint higher for **ignoring the character it was told
+to write**, and the released step 1680 is exactly such a checkpoint, so the battery appeared to
+endorse it. Splitting staged speakers out of "everyone else" reversed that: 1680 became the worst
+of 18.
 
-The second is the metric. The scorer had two buckets, the character and everyone else, and the
-battery's two-character prompt names a deckhand called Pell in the persona and asks for both
-voices. A `Pell:` line is the scenario working; counting it as a defect scored a checkpoint higher
-for **ignoring the character it was told to write**. Splitting "everyone else" into speakers the
-prompt staged and speakers the model invented changes the answer, over the same 216 runs:
+The split was also wrong. It filed `You:` under staged-and-therefore-correct, when the model
+writing the human's turn is the truncation the whole battery exists to expose, and `You:` was 76%
+of that bucket, 825 of 1,092 labels across 216 runs. So the second reading reversed again. Each
+time, the bucket that merged a defect with correct behaviour was the one carrying the conclusion.
 
-| Count             | Trend across 18 checkpoints |
-| ----------------- | --------------------------- |
-| self-relabel      | t=+0.52, flat               |
-| in-scene speakers | t=-2.89                     |
-| invented speakers | t=+1.34                     |
+Four buckets survive scrutiny: `handback` (`You:`), `self` (a consecutive re-label, not an
+alternation), `costar` (a speaker the transcript staged), `invented`. Over 18 checkpoint means:
 
-Those t-values regress the 18 checkpoint means, not the 216 seed-runs; regressing the runs treats
-clustered residuals as independent and inflates every t (self +0.55, in-scene -4.26, invented
-+1.73). The only real trend is that later checkpoints bring the second character on stage _less_,
-and the released step 1680 has the lowest in-scene count of any checkpoint at 3.67 +/- 0.48 against
-a 5-6 typical. **So the battery does not confirm the released checkpoint; on the one axis that
-moves, it is at the bad end.** An earlier claim in this project that other-speaker labels declined
-at t=-3.02 is retracted, and the likely explanation for where that number came from is now visible:
-the in-scene decline is real and was buried inside the old combined bucket.
+| Count    | t (18) | t without step 1680 | within-ckpt SD | between-ckpt SD |
+| -------- | ------ | ------------------- | -------------- | --------------- |
+| handback | -2.87  | -2.30               | 1.20           | 0.69            |
+| self     | +1.46  | +1.43               | 0.97           | 0.30            |
+| costar   | -0.71  | **+0.89**           | 1.17           | 0.46            |
+| invented | +1.34  | +1.74               | 1.09           | 0.45            |
 
-The battery also has nothing at all past step 1680, so it could not speak to the cooldown even if
-its metric were sound.
+**Read the last two columns first.** Within-checkpoint spread exceeds between-checkpoint spread on
+every count, which is this instrument saying it cannot separate these checkpoints. `costar` also
+flips sign when one point is dropped: the battery has nothing between step 1281 and step 1680, so
+1680 carries 35% of the leverage in any regression across it. The one count that survives both
+checks is `handback`, and it declines, meaning later checkpoints stop before writing the human's
+turn. That is an improvement, and it is the opposite of what the first two scorers said.
 
-`scripts/score-rp-battery.ts` and `scripts/dump-rp-prompts.sh` are in the repo, the latter
-re-emitting the battery's prompt array so completions are split from prompts exactly rather than by
-guesswork, and `tests/rp-battery-score.ts` pins the three-way split so the Pell bug cannot come
-back silently. The original scorer lived in a session scratchpad that a reboot wiped, which is why
-its number could not be re-derived when it was challenged.
+**None of this ranks checkpoints here, and an earlier claim of t=-3.02 on a combined other-speaker
+count is retracted rather than re-derived.** That number cannot be checked against anything: it came
+from a scorer that lived in the session scratchpad and is gone. The battery also has nothing past
+step 1680, so it could not speak to the cooldown even if the metric were sound.
+
+`scripts/score-rp-battery.ts` and `scripts/dump-rp-prompts.sh` are in the repo now, with
+`tests/rp-battery-score.ts` pinning all four distinctions so neither merge can come back silently,
+and `docs/measurements/` carries the logs and per-run counts every number above is read from.
 
 **What survived all of this.** Training loss picked differently again: over the 101 logged steps
 the per-batch trace ranges 1.52 to 3.22, with its minimum at step 1782 and its maximum at 1914,

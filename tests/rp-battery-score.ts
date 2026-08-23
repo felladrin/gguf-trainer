@@ -1,12 +1,13 @@
 // The roleplay battery's label scorer: does it tell the three label kinds apart?
 // Run:  deno run -A tests/rp-battery-score.ts
 //
-// The distinction under test is the one that changed a published conclusion. An
-// earlier scorer had two buckets, "the character" and "everyone else", so a
-// `Pell:` line in the two-character scene counted as a defect. Pell is named in
-// Captain Rook's own persona and the scene asks for both voices, so that scored
-// a checkpoint HIGHER for ignoring the character it was told to write, and the
-// checkpoint that ignored Pell looked like the best one.
+// Two earlier scorers each merged a defect with correct behaviour and each
+// reversed a conclusion drawn from them. First, "everyone else" counted `Pell:`
+// as a stray label, though the two-character scene asks for both voices, which
+// scored a checkpoint HIGHER for ignoring the character it was told to write.
+// Then the fix filed `You:` under correct behaviour, when the model writing the
+// human's turn is the truncation the battery exists to expose, and `You:` was
+// 76% of that bucket. Every one of those four distinctions is pinned below.
 
 import {
   characterOf,
@@ -37,19 +38,41 @@ check(
 const known = promptSpeakers(rook);
 check("a second staged speaker is known", known.has("Pell"), [...known].join(","));
 
-const both = scoreCompletion(
+const alt = scoreCompletion(
   rook,
   ` Always.\nPell: Should I sound the horn?\nCaptain Rook: Not yet.`,
 );
-check("a staged speaker is in-scene, not invented", both.inScene === 1, `inScene=${both.inScene}`);
-check("the character's own re-label is a self-relabel", both.self === 1, `self=${both.self}`);
-check("nothing is invented here", both.invented === 0, `invented=${both.invented}`);
+check("a staged co-star is not a defect", alt.costar === 2, `costar=${alt.costar}`);
+check(
+  "taking the turn back after Pell is alternation, not a re-label",
+  alt.self === 0,
+  `self=${alt.self}`,
+);
+check("nothing is invented here", alt.invented === 0, `invented=${alt.invented}`);
+
+const repeat = scoreCompletion(rook, ` Always.\nCaptain Rook: And another thing.`);
+check("a consecutive repeat IS a self-relabel", repeat.self === 1, `self=${repeat.self}`);
+
+const handback = scoreCompletion(rook, ` Always.\nYou: Thanks.`);
+check(
+  "the human's turn is a handback, never correct behaviour",
+  handback.handback === 1,
+  `handback=${handback.handback}`,
+);
+check("and is not counted as a co-star", handback.costar === 0, `costar=${handback.costar}`);
 
 const stray = scoreCompletion(rook, ` Always.\nI: You're so nervous!?\nDeckhand Vek: Aye.`);
 check(
   "speakers absent from the prompt are invented",
   stray.invented === 2,
   `invented=${stray.invented}`,
+);
+
+// The persona block names the character too; only the transcript stages speakers.
+check(
+  "a persona-block label is not a staged speaker",
+  !known.has("Captain Rook's Persona"),
+  [...known].join(","),
 );
 
 // The prose control has no header and no labels, so any label it emits is invented.
@@ -62,6 +85,12 @@ check(
   `invented=${drift.invented}`,
 );
 check("and never a self-relabel", drift.self === 0, `self=${drift.self}`);
+const proseYou = scoreCompletion(prose, ` She climbed.\nYou: Who's there?`);
+check(
+  "even with no character, You: is a handback",
+  proseYou.handback === 1,
+  `handback=${proseYou.handback}`,
+);
 
 // A moved prompt set must fail loudly: every published number depends on the pairing.
 let threw = "";
