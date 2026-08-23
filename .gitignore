@@ -14,3 +14,4 @@ evaldata/
 
 # Agent scratch, not project source.
 memory/
+.consult/
