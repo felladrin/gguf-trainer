@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Re-emits the battery's PROMPTS array NUL-separated, so a scorer can strip the
 # prompt from each block instead of guessing where the completion starts.
 set -euo pipefail

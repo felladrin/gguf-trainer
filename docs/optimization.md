@@ -991,60 +991,104 @@ Unprompted adult drift from these SFW prompts was rare, 0 to 3 hits per 80 depen
 at that sample size does not separate the presets. It is not zero: one sample turned "That sword you
 made is beautiful" into "just a tool for your pleasure".
 
-### 16. The cooldown made the model worse, and a slope through a staircase predicted neither (2026-08-23)
+### 16. Held-out loss rose during the cooldown, and a slope through a random walk predicted nothing (2026-08-23)
 
 The LittleLamb RP fine-tune is the first run with the instrument lever 12 asked for: a held-out
-slice carved before training, `--keep-checkpoints` writing a snapshot series, and every snapshot
-scored on the same 64 windows of 1024 tokens at a fixed seed. Twenty-one points, base to step 2200.
-Three things came out of it, and only the first was expected.
+slice carved before training, `--keep-checkpoints` writing a snapshot series, and 34 rows in
+`out/holdout-200.log` (base, 32 checkpoints, the final file) all scored on the same 64 windows of
+1024 tokens at seed 1234. Every comparison below is therefore paired, which is what makes
+checkpoint-to-checkpoint jitter the right error scale rather than the standard error of a
+64-window estimate.
 
-**The WSD cooldown raised held-out loss.** The schedule puts warmup at 220, stable to 1760 and
-cooldown over the last 440 steps.
+**Held-out loss rose during the cooldown.** The schedule is 220 warmup, stable to 1760, cooldown
+over the last 440 steps.
 
-| Phase                           | Held-out loss     |
-| ------------------------------- | ----------------- |
-| plateau, steps 762-1400 (n=11)  | 2.8888, sd 0.0062 |
-| plateau, steps 1600-1767 (n=3)  | 2.8596, sd 0.0003 |
-| cooldown, steps 1800-2200 (n=9) | 2.8744, sd 0.0059 |
-| final checkpoint, step 2200     | 2.8683            |
+| Phase                            | Held-out loss     |
+| -------------------------------- | ----------------- |
+| plateau, steps 762-1400 (n=11)   | 2.8888, sd 0.0062 |
+| plateau, steps 1600-1680 (n=2)   | 2.8594, sd 0.0001 |
+| cooldown, steps 1767-2200 (n=10) | 2.8730, sd 0.0072 |
+| final checkpoint, step 2200      | 2.8683            |
 
-The release is step 1680 at 2.8594. Shipping the last checkpoint would have cost 0.0089 nats, and
-"train to the end" and "take the best model" are simply different decisions here. Adjacent
-checkpoints jitter by about 0.009, so the cooldown's 0.015 is above the noise floor and the
-final-versus-best gap sits right at it.
+The release is step 1680 at 2.8594. Note the phase boundary: step 1767 is 7 steps _inside_ the
+cooldown, so it belongs in the third row and not, as an earlier draft of this lever had it, in the
+plateau above it.
 
-**The curve is a staircase, and fitting a line through it predicted badly in both directions.**
-Mid-run, a tail fit over 762-1400 projected 2.8629 at step 2200 and the argument was that the
-remaining hours were buying almost nothing. Then the curve stepped down 0.029 nats across 1400-1600,
-a refit projected 2.8264, and the argument reversed to "let it run, the cooldown is still ahead".
-Both were wrong, because a plateau-step-plateau shape has no slope to extrapolate. **Scoring two
-more snapshots settled what neither fit could**: 1600, 1680 and 1767 came in at 2.8595, 2.8594 and
-2.8600, flat at full LR, which is the measurement that says the descent had already stopped.
+**That heading is deliberately weaker than "the cooldown made it worse", because the data does not
+support the stronger claim.** Phase is perfectly confounded with time and there is no constant-LR
+continuation to compare against. Worse, this same curve takes an unexplained 0.025 excursion
+elsewhere (below), so the honest noise scale for a phase-sized claim is the size of the excursions
+the series makes for no reason anyone can name, not the 0.0066 mean gap between adjacent
+checkpoints. By that standard the cooldown's 0.0135 is _smaller_ than something already conceded as
+unexplained. There is even a reading in which the cooldown helped: driving the LR toward its floor
+freezes the trajectory, and what looks like degradation is the walk being stopped somewhere
+mediocre instead of wandering back. **The run is seeded (`mulberry32(7 + startStep)`,
+`pretrain.ts`), so the counterfactual is one cheap experiment: resume from 1767 with the LR held
+flat for 440 steps.** Until that runs, this is an association.
 
-**The step itself is unexplained.** It is not the LR schedule: it happened about 300 steps inside
-the stable phase, and the cooldown had not started. It is not an epoch boundary: the corpus is 16.8M
-tokens at 4 bytes per id, 4096 tokens per step, so one epoch is 4101 steps and the whole 2200-step
-run covers 54% of one. It is not a data-mix change: the run passed no injection flags. Recorded here
-as an observation rather than a cause.
+**The curve is a staircase, and two extrapolations through it were both wrong.** Mid-run, an OLS
+tail fit projected roughly 2.86 at step 2200 and the argument was that the remaining hours bought
+almost nothing. Then the curve stepped down across 1400-1600, a refit projected roughly 2.83, and
+the argument reversed to "let it run". Both were wrong, and the projections are quoted to two
+figures here because neither reproduces exactly from the checked-in log: they were computed against
+partial series while the run was still going. **Scoring two more snapshots settled what no fit
+could**: 1600, 1680 and 1767 came in at 2.8595, 2.8594 and 2.8600, three flat points spanning the
+cooldown boundary, which says the descent had already stopped.
 
-**What the behavioural battery could and could not add.** The RP battery's label-hygiene counts, at
-12 seeds across 17 checkpoints (204 runs), regress on step at t=+1.45 for self-relabels and t=+2.46
-for other-speaker labels, r=0.10 and r=0.17. An earlier note in this project claimed the
-other-speaker count _declined_ at t=-3.02; that does not reproduce and is retracted. The rebuilt
-scorer gives +1.25 on exactly the same 180 runs. The lesson is not about the sign: it is that a
-scorer which lives only in a scratchpad cannot be re-run when its number is challenged, and
-`scripts/score-rp-battery.py` and `scripts/dump-rp-prompts.sh` are now in the repo, the latter
-re-emitting the battery's prompt array so the scorer strips prompts exactly rather than guessing
-where each completion starts.
+**The step is unexplained, and the most likely cause is that there is no cause.** The move across
+1400-1600 is 0.0247 endpoint to endpoint, 0.0292 between the two plateau means. It is not the LR
+schedule: it happened ~300 steps inside the stable phase. It is not a data-mix change: the run
+passed no injection flags, and `injectFromStep` is the only mechanism that would alter the mix. It
+is **not an epoch boundary, and that ruling-out was originally argued the wrong way**: the trainer
+draws every window as `Math.floor(rng() * maxStart)`, i.i.d. with replacement per sequence
+(`trainer.ts`), so there are no epochs at any step count, and the arithmetic about 4101 steps per
+epoch was answering a question the sampler never poses. What that sampler does imply is the fourth
+candidate: with 2 sequences per step under assistant-only masking, the weights random-walk inside a
+low-loss basin, and plateau-step-plateau is what a random walk looks like sampled at 30 points.
 
-The chosen checkpoint does score best on the battery (self 1.33 +/- 0.36, other 1.92 +/- 0.40,
-against 2.00-2.25 and 3.17-3.33 for the 1151-1281 band), but at roughly 2.4 sigma on the better of
-the two counts, that is a confirmation the held-out curve was not contradicted, not an independent
-selector.
+**The behavioural battery does not corroborate any of this, and fixing its scorer reversed what it
+seemed to say.** Two things went wrong and both are worth recording.
 
-**The pairing lever 12 prescribed held up; the ranking half did the work.** Training loss would have
-picked differently again: its per-batch trace over the last 40 steps swings 1.52 to 3.22 with no visible
-relationship to the held-out curve.
+The first is bookkeeping: an earlier draft cited "17 checkpoints, 204 runs" while
+`out/rp-battery/seeds/` holds 216 files across 18 checkpoints, because the released checkpoint's
+own seeds were added after the paragraph was written. A lever whose subject is reproducibility
+should not be unreproducible from its own artifacts.
+
+The second is the metric. The scorer had two buckets, the character and everyone else, and the
+battery's two-character prompt names a deckhand called Pell in the persona and asks for both
+voices. A `Pell:` line is the scenario working; counting it as a defect scored a checkpoint higher
+for **ignoring the character it was told to write**. Splitting "everyone else" into speakers the
+prompt staged and speakers the model invented changes the answer, over the same 216 runs:
+
+| Count             | Trend across 18 checkpoints |
+| ----------------- | --------------------------- |
+| self-relabel      | t=+0.52, flat               |
+| in-scene speakers | t=-2.89                     |
+| invented speakers | t=+1.34                     |
+
+Those t-values regress the 18 checkpoint means, not the 216 seed-runs; regressing the runs treats
+clustered residuals as independent and inflates every t (self +0.55, in-scene -4.26, invented
++1.73). The only real trend is that later checkpoints bring the second character on stage _less_,
+and the released step 1680 has the lowest in-scene count of any checkpoint at 3.67 +/- 0.48 against
+a 5-6 typical. **So the battery does not confirm the released checkpoint; on the one axis that
+moves, it is at the bad end.** An earlier claim in this project that other-speaker labels declined
+at t=-3.02 is retracted, and the likely explanation for where that number came from is now visible:
+the in-scene decline is real and was buried inside the old combined bucket.
+
+The battery also has nothing at all past step 1680, so it could not speak to the cooldown even if
+its metric were sound.
+
+`scripts/score-rp-battery.ts` and `scripts/dump-rp-prompts.sh` are in the repo, the latter
+re-emitting the battery's prompt array so completions are split from prompts exactly rather than by
+guesswork, and `tests/rp-battery-score.ts` pins the three-way split so the Pell bug cannot come
+back silently. The original scorer lived in a session scratchpad that a reboot wiped, which is why
+its number could not be re-derived when it was challenged.
+
+**What survived all of this.** Training loss picked differently again: over the 101 logged steps
+the per-batch trace ranges 1.52 to 3.22, with its minimum at step 1782 and its maximum at 1914,
+both inside the cooldown and neither related to the held-out curve. The ranking half of lever 12's
+prescription did the work; the behavioural half needed its instrument repaired before it was worth
+reading.
 
 ## Explicitly not worth doing
 
