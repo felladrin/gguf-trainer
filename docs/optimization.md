@@ -991,7 +991,7 @@ Unprompted adult drift from these SFW prompts was rare, 0 to 3 hits per 80 depen
 at that sample size does not separate the presets. It is not zero: one sample turned "That sword you
 made is beautiful" into "just a tool for your pleasure".
 
-### 16. Held-out loss rose during the cooldown, and a slope through a random walk predicted nothing (2026-08-23)
+### 16. Held-out loss rose during the cooldown, and a slope through a random walk predicted nothing (2026-08-23; the cause is settled in 16b)
 
 The LittleLamb RP fine-tune is the first run with the instrument lever 12 asked for: a held-out
 slice carved before training, `--keep-checkpoints` writing a snapshot series, and 34 rows in
@@ -1030,9 +1030,14 @@ schedule differs. There is also no flat-LR flag, since warmup and cooldown are h
 20% of `--steps`, so the flat arm has to be built by choosing a `--steps` whose cooldown falls
 outside the segment. Until that runs, this is an association.
 
+**It ran the next day, and the association was spurious: see 16b.** Both hedges above were the
+right ones to keep. The reading in which the cooldown helped is the reading that survived.
+
 One thing that is free and confound-independent, though, and worth stating because the paragraph
 above understates the evidence: all ten cooldown snapshots score worse than both pre-cooldown flat
-points. Ten for ten is not nothing, even if it cannot separate the schedule from time.
+points. Ten for ten is not nothing, even if it cannot separate the schedule from time. It turned
+out to be nothing: ten for ten against a baseline that does not exist yet is ten for ten against
+time, and 16b built the baseline.
 
 **The curve is a staircase, and two extrapolations through it were both wrong.** Mid-run, an OLS
 tail fit projected roughly 2.86 at step 2200 and the argument was that the remaining hours bought
@@ -1104,6 +1109,92 @@ the per-batch trace ranges 1.52 to 3.22, with its minimum at step 1782 and its m
 both inside the cooldown and neither related to the held-out curve. The ranking half of lever 12's
 prescription did the work; the behavioural half needed its instrument repaired before it was worth
 reading.
+
+### 16b. The counterfactual: the cooldown was not the cause, and the rise did not reproduce (2026-08-24)
+
+Lever 16 left the cooldown as an association and named the experiment that would settle it. The
+experiment is `scripts/counterfactual-cooldown.sh`, it cost about ten and a half GPU-hours, and it
+came back against the hypothesis twice over.
+
+**The design, and why the flat arm looks strange.** Both arms resume `out/lamb-ckpt-1767.gguf`. The
+window sampler is seeded `mulberry32(7 + startStep)`, so resuming both at the same step is what buys
+an identical data stream; only the schedule then differs. Warmup and cooldown are hardcoded at 10%
+and 20% of `--steps`, so there is no flat-LR flag and the flat arm has to be constructed:
+
+|                             | arm A, cooldown       | arm B, flat          |
+| :-------------------------- | :-------------------- | :------------------- |
+| `--steps`                   | 2200                  | 2760                 |
+| WSD cooldown per the header | 440 steps, from 1760  | 552 steps, from 2208 |
+| LR scale across 1767-2167   | 0.9836 down to 0.1000 | flat at 1.0          |
+| stopped at                  | 2200, ran out         | 2167, killed         |
+
+Arm B's cooldown is real but starts 41 steps past where the arm is killed, which is the whole trick.
+Both headers are in `docs/measurements/`, and both logged the same parity probe (CPU 3.3022 vs GPU
+3.3022), which is the check that they started from identical weights.
+
+**The trap that nearly cost a night.** `checkpointEvery` keys on the step local to the segment
+(`train-gpu.ts`), while the filename carries the global `startStep + localStep`. The obvious stop
+condition, waiting for `cf-flat-step2200.gguf`, waits on local step 433, which is prime and
+therefore never a multiple of any cadence. That file is never written and the loop never exits.
+The arms stop at 2167, local step 400, for this reason and no other.
+
+**Result: the cooldown arm is better at every matched step.**
+
+| Global step | arm A, cooldown | arm B, flat |   A - B |
+| ----------: | --------------: | ----------: | ------: |
+|        1817 |          2.8591 |      2.8595 | -0.0004 |
+|        1867 |          2.8527 |      2.8545 | -0.0018 |
+|        1917 |          2.8556 |      2.8595 | -0.0039 |
+|        1967 |          2.8531 |      2.8611 | -0.0080 |
+|        2017 |          2.8519 |      2.8552 | -0.0033 |
+|        2067 |          2.8629 |      2.8744 | -0.0115 |
+|        2117 |          2.8553 |      2.8581 | -0.0028 |
+|        2167 |          2.8566 |      2.8595 | -0.0029 |
+
+Eight of eight negative. Mean -0.0043, paired t = -3.37 on 7 df, and the sign test alone gives
+p = 0.0078 without assuming anything about the distribution. Lever 16 was right to refuse the
+stronger claim, and the direction it floated as a possibility ("driving the LR toward its floor
+freezes the trajectory") is the direction the data took.
+
+Read the magnitude with the same suspicion lever 16 applied to its own: -0.0043 is smaller than the
+0.0066 adjacent-checkpoint jitter. Only the pairing makes it visible, and nothing about checkpoint
+selection changes because of it.
+
+**The finding that actually settles lever 16: neither arm reproduced the rise.**
+
+| Series, steps 1817-2167      | Mean held-out loss |
+| :--------------------------- | -----------------: |
+| the original run             |             2.8752 |
+| arm A, the same schedule     |             2.8559 |
+| arm B, flat                  |             2.8602 |
+| the shared origin, step 1767 |             2.8600 |
+
+Arm A ran the identical schedule from identical weights and stayed flat across a stretch where the
+original climbed 0.015 nats. A cause that does not reproduce when you re-run it is not the cause. So
+the fourth candidate in lever 16 is the one left standing: the weights random-walk in a low-loss
+basin, and the excursion the original took during steps 1800-2200 is the same kind of event as the
+unexplained 0.025 excursion across 1400-1600, which also sits nowhere near a phase boundary.
+
+**What arm A does not share with the original tail**, and therefore what a follow-up would have to
+separate: no optimizer state was kept at step 1767, so both arms cold-start Muon where the original
+carried momentum through, and `mulberry32(7 + 1767)` draws different windows than the original run's
+`mulberry32(7 + 0)` reached by that point. Either is enough to move a random walk this far. The
+cold start is symmetric across the arms, so it does not touch the A-versus-B comparison; it only
+means arm A is not a byte reproduction of the original tail, which is exactly why it is evidence
+about schedules and not about that specific trajectory.
+
+**One observation, recorded rather than acted on.** Arm A's snapshots run 2.8519 to 2.8629 on the
+same holdout at the same knobs, and several of them beat the released step-1680 checkpoint at
+2.8594; the best is 0.0075 lower, about one jitter unit, from a lineage with a cold-started
+optimizer. That is not a reason to re-release anything. It is a reason to suspect that restarting
+the optimizer mid-run is worth its own experiment, which this one cannot answer because both arms
+did it.
+
+**What this changes about how to read a loss curve here.** Lever 12 established that training loss
+picks the wrong checkpoint. This adds the weaker-looking but more expensive lesson: a held-out curve
+that turns at a phase boundary is not evidence about the phase either. Anything on this setup that
+moves less than the excursions the series makes for no reason needs a shared-checkpoint
+counterfactual before it becomes a claim, and running one costs a night.
 
 ## Explicitly not worth doing
 

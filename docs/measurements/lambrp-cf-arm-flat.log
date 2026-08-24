@@ -1,0 +1,40 @@
+=== finetune: qwen3 -> GGUF ===
+
+Device:
+  adapter    : AMD Radeon Graphics (RADV GFX1151) (vendor 4098, arch ?)
+  limits     : maxBuffer 2048 MiB, maxStorageBinding 2048 MiB, workgroupStorage 16 KiB, invocations/wg 256
+  features   : timestamp-query yes, shader-f16 no
+  system mem : 91.3 GiB free / 124.4 GiB (unified pool)
+Tokenizer: loaded data/lambrp-train.tokenizer.json (vocab 151936, specials <|endoftext|>,<|im_start|>,<|im_end|>,<|object_ref_start|>,<|object_ref_end|>,<|box_start|>,<|box_end|>,<|quad_start|>,<|quad_end|>,<|vision_start|>,<|vision_end|>,<|vision_pad|>,<|image_pad|>,<|video_pad|>,<tool_call>,</tool_call>,<|fim_prefix|>,<|fim_middle|>,<|fim_suffix|>,<|fim_pad|>,<|repo_name|>,<|file_sep|>,<tool_response>,</tool_response>,<think>,</think>)
+Tokens: data/lambrp-train.tokens (16.8M, pretokenized)
+Mask: data/lambrp-train.mask (assistant-only loss over 16798386 tokens)
+Run: 2760 x 2 x 2048 = 11M tokens (0.7 epochs of 17M), eos=151645, resuming @ step 1767
+Model: qwen3, 28 layers, hidden=544, heads=16/8, headDim=128, ffn=2560, ctx=40960, rope=1000000, QK-norm, ~293.3M params
+Resumed weights from out/lamb-ckpt-1767.gguf (310 tensors)
+Parity probe: CPU 3.3022 vs GPU 3.3022 (|Δ|=4.3e-6)
+--coldOpt: ignoring any optimizer state (momentum from another objective)
+Schedule: muon lr 0.00005, aux lr 0.00002, WSD warmup 276 / cooldown 552 steps, quant f32
+Chat template: data/lambrp-train.template.txt (embedded in every export)
+  step    1767  loss 2.0606  (0.000 st/s, 0.7min, eta --:--:--:--)
+  step    1795  loss 1.8270  (0.022 st/s, 21.7min, eta 0:12:26:22)
+  [ckpt @ 1817] cf-flat.gguf 1179MB + optstate 1504MB, loss 1.827, 0.022 st/s, eta 0:12:03:33, mem 22548MB gpu (pool 18053 + state 4495)
+  step    1823  loss 2.0786  (0.022 st/s, 42.9min, eta 0:11:57:15)
+  step    1851  loss 2.2149  (0.022 st/s, 63.9min, eta 0:11:31:23)
+  [ckpt @ 1867] cf-flat.gguf 1179MB + optstate 1504MB, loss 2.215, 0.022 st/s, eta 0:11:24:04, mem 22548MB gpu (pool 18053 + state 4495)
+  step    1879  loss 2.6018  (0.022 st/s, 85.6min, eta 0:11:13:30)
+  step    1907  loss 2.9025  (0.022 st/s, 108.4min, eta 0:11:00:45)
+  [ckpt @ 1917] cf-flat.gguf 1179MB + optstate 1504MB, loss 2.902, 0.022 st/s, eta 0:10:53:09, mem 22548MB gpu (pool 18053 + state 4495)
+  step    1935  loss 2.2897  (0.022 st/s, 129.7min, eta 0:10:37:09)
+  step    1963  loss 2.0569  (0.022 st/s, 151.0min, eta 0:10:13:59)
+  [ckpt @ 1967] cf-flat.gguf 1179MB + optstate 1504MB, loss 2.057, 0.022 st/s, eta 0:10:11:33, mem 22548MB gpu (pool 18053 + state 4495)
+  step    1991  loss 2.2124  (0.022 st/s, 172.2min, eta 0:09:51:17)
+  [ckpt @ 2017] cf-flat.gguf 1179MB + optstate 1504MB, loss 2.212, 0.022 st/s, eta 0:09:30:32, mem 22548MB gpu (pool 18053 + state 4495)
+  step    2019  loss 2.9714  (0.022 st/s, 193.5min, eta 0:09:28:52)
+  step    2047  loss 2.1988  (0.022 st/s, 214.4min, eta 0:09:05:59)
+  [ckpt @ 2067] cf-flat.gguf 1179MB + optstate 1504MB, loss 2.199, 0.022 st/s, eta 0:08:50:26, mem 22548MB gpu (pool 18053 + state 4495)
+  step    2075  loss 2.2470  (0.022 st/s, 235.6min, eta 0:08:44:03)
+  step    2103  loss 2.3375  (0.022 st/s, 256.6min, eta 0:08:21:45)
+  [ckpt @ 2117] cf-flat.gguf 1179MB + optstate 1504MB, loss 2.338, 0.022 st/s, eta 0:08:11:09, mem 22548MB gpu (pool 18053 + state 4495)
+  step    2131  loss 2.3610  (0.022 st/s, 277.8min, eta 0:08:00:04)
+  step    2159  loss 2.1029  (0.022 st/s, 298.7min, eta 0:07:38:01)
+  [ckpt @ 2167] cf-flat.gguf 1179MB + optstate 1504MB, loss 2.103, 0.022 st/s, eta 0:07:32:09, mem 22548MB gpu (pool 18053 + state 4495)
