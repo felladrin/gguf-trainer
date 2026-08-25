@@ -25,7 +25,7 @@ import {
   rope,
   silu,
 } from "../model/autograd.ts";
-import type { Tensor } from "../model/autograd.ts";
+import { Tensor } from "../model/autograd.ts";
 import { muPEmbedStd, type MuPOpts } from "../model/mup.ts";
 import type {
   Architecture,
@@ -68,6 +68,54 @@ interface Layer {
   gate: Tensor;
   up: Tensor;
   down: Tensor;
+}
+
+/**
+ * llama.cpp rotates a `llama` checkpoint with LLAMA_ROPE_TYPE_NORM, which pairs
+ * dimensions (2j, 2j+1); this engine's rope() pairs (j, j+headDim/2), the NeoX
+ * convention every other architecture here uses. Same rotation, different row
+ * order, so the Q and K projections are reordered on the way in and back on the
+ * way out. Nothing else in the model is affected: the rotation is the only place
+ * a head's dimension order carries meaning.
+ *
+ * Getting this wrong is quiet rather than loud. Greedy generation still reads
+ * fine because the argmax survives, and the CPU and GPU backends agree with each
+ * other because they share the bug. What breaks is anything that needs an exact
+ * match to earlier context: the base checkpoint scored ppl 5.73 on "The cat sat
+ * on the mat." repeated 400 times, where llama.cpp scored 1.006 on the same file.
+ * That gap is what this function closes.
+ *
+ * The other half of the same conversion lives in llama.cpp's converter, which does
+ * the equivalent reorder when importing from Hugging Face, whose LlamaAttention uses
+ * the half-split convention too: `permute()` in `conversion/llama.py` on builds that
+ * split the converter up, `LlamaModel.modify_tensors` in `convert_hf_to_gguf.py`
+ * before that.
+ */
+function reorderQK(t: Tensor, heads: number, headDim: number, toGGUF: boolean): Tensor {
+  const inDim = t.shape[1];
+  const half = headDim / 2;
+  // The loop below writes only rows [0, heads*headDim). Anything else would be
+  // left as zeros, which is a silent wrong answer rather than a failure, and
+  // headDim can be derived from metadata rather than stated (configFromGGUF falls
+  // back to hidden/nHeads when a checkpoint omits attention.key_length).
+  if (heads * headDim !== t.shape[0] || headDim % 2 !== 0) {
+    throw new Error(
+      `reorderQK: ${heads} heads x ${headDim} dims does not tile ${t.shape[0]} rows evenly`,
+    );
+  }
+  const out = Tensor.zeros(t.shape);
+  for (let h = 0; h < heads; h++) {
+    for (let j = 0; j < half; j++) {
+      const lo = (h * headDim + j) * inDim; // our row j
+      const hi = (h * headDim + j + half) * inDim; // our row j + half
+      const even = (h * headDim + 2 * j) * inDim; // llama.cpp's row 2j
+      const odd = (h * headDim + 2 * j + 1) * inDim; // llama.cpp's row 2j+1
+      const [from0, to0, from1, to1] = toGGUF ? [lo, even, hi, odd] : [even, lo, odd, hi];
+      out.data.set(t.data.subarray(from0, from0 + inDim), to0);
+      out.data.set(t.data.subarray(from1, from1 + inDim), to1);
+    }
+  }
+  return out;
 }
 
 export class LlamaModel implements LanguageModel {
@@ -331,8 +379,9 @@ export const llama: Architecture<LlamaConfig> = {
     m.layers.forEach((L, i) => {
       const p = `blk.${i}`;
       addVector(w, `${p}.attn_norm.weight`, L.attnNorm);
-      addMatrix(w, `${p}.attn_q.weight`, L.qProj, q);
-      addMatrix(w, `${p}.attn_k.weight`, L.kProj, q);
+      // Copies, not the live tensors: checkpoints are written mid-run.
+      addMatrix(w, `${p}.attn_q.weight`, reorderQK(L.qProj, c.nHeads, c.headDim, true), q);
+      addMatrix(w, `${p}.attn_k.weight`, reorderQK(L.kProj, c.nKVHeads, c.headDim, true), q);
       addMatrix(w, `${p}.attn_v.weight`, L.vProj, q);
       addMatrix(w, `${p}.attn_output.weight`, L.oProj, q);
       addVector(w, `${p}.ffn_norm.weight`, L.ffnNorm);
@@ -345,6 +394,7 @@ export const llama: Architecture<LlamaConfig> = {
 
   loadWeights(model: LanguageModel, g: GGUFFile) {
     const m = model as LlamaModel;
+    const c = m.cfg;
     const load = tensorLoader(g);
     load("token_embd.weight", m.tokenEmbd);
     load("output_norm.weight", m.outputNorm);
@@ -354,6 +404,11 @@ export const llama: Architecture<LlamaConfig> = {
       load(`${p}.attn_norm.weight`, L.attnNorm);
       load(`${p}.attn_q.weight`, L.qProj);
       load(`${p}.attn_k.weight`, L.kProj);
+      // NOT idempotent, and it has to run after these two loads and before nothing:
+      // applying it twice returns a third row order, silently. Both callers build
+      // the model on the line above, so it runs exactly once per model.
+      L.qProj.data.set(reorderQK(L.qProj, c.nHeads, c.headDim, false).data);
+      L.kProj.data.set(reorderQK(L.kProj, c.nKVHeads, c.headDim, false).data);
       load(`${p}.attn_v.weight`, L.vProj);
       load(`${p}.attn_output.weight`, L.oProj);
       load(`${p}.ffn_norm.weight`, L.ffnNorm);

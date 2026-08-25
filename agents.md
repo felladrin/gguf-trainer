@@ -196,6 +196,13 @@ its default 1% tail is corpus the run has already seen.
 Never pick between checkpoints on the training loss. A longer SFT run reached a lower training loss
 and was the worse model on every other axis, benchmarks included (`docs/optimization.md` lever 12).
 
+Before trusting any absolute loss from a DOWNLOADED checkpoint, score one file with llama.cpp too.
+Every suite here is a self-consistency check (GPU against CPU, analytic gradients against finite
+differences, export against re-import), so a forward pass that disagrees with llama.cpp passes all
+of them. That is how the `llama` RoPE row order stayed wrong until a fine-tune opened at loss 6.4
+(lever 17). Repeated text is the sharpest probe: a correct model scores near zero perplexity on a
+sentence repeated 400 times, and a model that cannot read its own context does not.
+
 For a qualitative read, `bash scripts/eval-completions.sh out/base.gguf` runs a fixed prompt battery
 through llama.cpp with a repetition penalty. A base model loops under `generate`'s pure greedy
 decoding and reads worse than it is; keep the battery and the preset fixed so checkpoints stay
@@ -246,17 +253,18 @@ the round-trip test automatically: docs/adding-an-architecture.md.
 
 ## When something fails
 
-| Message                                                          | Meaning                                                      | Fix                                                                                                                         |
-| ---------------------------------------------------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `--resume config mismatch (hidden: built 512 vs checkpoint 640)` | your architecture flags differ from the checkpoint           | run `inspect` and copy the flags it prints                                                                                  |
-| `no sibling tokenizer <prefix>.tokenizer.json`                   | `pretrain` got a `.tokens` file with no tokenizer next to it | keep the pair together, or re-run `tokenize`                                                                                |
-| `does not encode [...] atomically`                               | fine-tuning a base whose vocab has no ChatML tokens          | a base trained here needs `tokenize --curriculum-specials`; a downloaded one must already carry ChatML in its specials list |
-| `mask <path> has N tokens, corpus has M`                         | `.mask` and `.tokens` are from different `chat-corpus` runs  | rebuild both together                                                                                                       |
-| `mask supervises nothing`                                        | the template rendered no assistant turns                     | check the dataset actually has `assistant` roles                                                                            |
-| `no WebGPU: training needs Deno`                                 | running under Node or Bun                                    | training needs Deno; Node and Bun have no GPU backend here                                                                  |
-| `GPU/CPU parity probe failed`                                    | the backend disagrees with the reference at init             | a real bug; stop and report it, do not train through it                                                                     |
-| NaN loss partway into a run                                      | f16 overflow, or a learning rate above 0.01                  | keep compute f32; `--lr 0.01` is the proven ceiling, 0.02 diverged                                                          |
-| OOM at long context                                              | the per-layer attention buffer                               | add `--reclaim` (5.6x less peak memory, 23% slower, lever 3b), or lower `--seq-len`                                         |
+| Message                                                                                      | Meaning                                                      | Fix                                                                                                                         |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `--resume config mismatch (hidden: built 512 vs checkpoint 640)`                             | your architecture flags differ from the checkpoint           | run `inspect` and copy the flags it prints                                                                                  |
+| `no sibling tokenizer <prefix>.tokenizer.json`                                               | `pretrain` got a `.tokens` file with no tokenizer next to it | keep the pair together, or re-run `tokenize`                                                                                |
+| `does not encode [...] atomically`                                                           | fine-tuning a base whose vocab has no ChatML tokens          | a base trained here needs `tokenize --curriculum-specials`; a downloaded one must already carry ChatML in its specials list |
+| `mask <path> has N tokens, corpus has M`                                                     | `.mask` and `.tokens` are from different `chat-corpus` runs  | rebuild both together                                                                                                       |
+| `mask supervises nothing`                                                                    | the template rendered no assistant turns                     | check the dataset actually has `assistant` roles                                                                            |
+| `no WebGPU: training needs Deno`                                                             | running under Node or Bun                                    | training needs Deno; Node and Bun have no GPU backend here                                                                  |
+| `GPU/CPU parity probe failed`                                                                | the backend disagrees with the reference at init             | a real bug; stop and report it, do not train through it                                                                     |
+| NaN loss partway into a run                                                                  | f16 overflow, or a learning rate above 0.01                  | keep compute f32; `--lr 0.01` is the proven ceiling, 0.02 diverged                                                          |
+| a loss far worse than the checkpoint deserves, on a model that still generates readable text | this engine and llama.cpp disagree about the forward pass    | score one file with both before blaming the corpus: `docs/optimization.md` lever 17                                         |
+| OOM at long context                                                                          | the per-layer attention buffer                               | add `--reclaim` (5.6x less peak memory, 23% slower, lever 3b), or lower `--seq-len`                                         |
 
 ## Hardware reality
 

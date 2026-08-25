@@ -4,6 +4,8 @@
 out/
 data/
 demo-out/
+# Downloaded base checkpoints, converted on the way in.
+base/
 
 # Raw and pretokenized corpora: downloaded or derived, never source.
 corpus/
