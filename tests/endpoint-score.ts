@@ -6,7 +6,7 @@
 // (docs/optimization.md, lever 16).
 //
 // Run:  deno run tests/endpoint-score.ts
-import { scoreChat, scoreRaw } from "../scripts/eval-endpoints.ts";
+import { scoreChat, scoreRaw, stoppedOnEos } from "../scripts/eval-endpoints.ts";
 
 function ok(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -85,5 +85,24 @@ ok(
 ok(scoreChat("", "Iris", "You").empty, "an empty reply is empty");
 ok(scoreChat("  \n ", "Iris", "You").empty, "whitespace is empty");
 ok(!scoreChat("No.", "Iris", "You").empty, "a short refusal is a real reply");
+
+// --- The stop reason ---------------------------------------------------------
+
+// The count that matters most on the raw endpoint, and the easiest to read wrong:
+// a model that stops correctly and a scorer looking at the wrong field both report
+// the same number until you check which.
+ok(stoppedOnEos({ stop_type: "eos" }), "stop_type eos is a stop on EOS");
+ok(!stoppedOnEos({ stop_type: "limit" }), "stop_type limit is the token cap");
+ok(!stoppedOnEos({ stop_type: "word" }), "stop_type word is a stop string");
+ok(stoppedOnEos({ stopped_eos: true }), "older builds report a boolean instead");
+ok(!stoppedOnEos({ stopped_eos: false }), "and the false case is still false");
+
+let raised = false;
+try {
+  stoppedOnEos({ content: "hi", index: 0 });
+} catch {
+  raised = true;
+}
+ok(raised, "a response with no stop field must throw: absent is not the same as never");
 
 console.log("=== endpoint score checks passed ===");

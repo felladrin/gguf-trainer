@@ -146,6 +146,25 @@ Iris:`,
   },
 ];
 
+/**
+ * Did generation end on EOS rather than on the token cap? llama.cpp reports this
+ * as `stop_type: "eos"`; older builds used a boolean `stopped_eos`.
+ *
+ * Absent means throw, never false. Reading a field that does not exist yields
+ * undefined, which is falsy, which reports "never stopped on EOS" for every model
+ * including the ones that always do. The first version of this script did exactly
+ * that, and the count read 0/6 on a model that was stopping correctly on all six.
+ */
+export function stoppedOnEos(res: Record<string, unknown>): boolean {
+  if (typeof res.stop_type === "string") return res.stop_type === "eos";
+  if (typeof res.stopped_eos === "boolean") return res.stopped_eos;
+  throw new Error(
+    `completion response carries neither stop_type nor stopped_eos (keys: ${
+      Object.keys(res).join(", ")
+    }); this llama.cpp build reports the stop reason some other way`,
+  );
+}
+
 /** Labels for the human side. `userName` is the one this prompt actually used;
  * the other two are what a model that memorized one string falls back to. */
 function handbackLabels(userName: string): string[] {
@@ -264,7 +283,7 @@ async function main(): Promise<void> {
   for (const s of RAW_SCENARIOS) {
     const res = await post(`${url}/completions`, { prompt: s.prompt, ...SAMPLING });
     const text = String(res.content ?? "");
-    const stopped = res.stopped_eos === true;
+    const stopped = stoppedOnEos(res);
     const v = scoreRaw(text, s.character, s.userName);
     tally.raw.n++;
     if (v.handback) tally.raw.handback++;
