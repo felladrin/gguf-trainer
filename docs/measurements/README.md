@@ -17,7 +17,7 @@ a reader can recompute the lever's arithmetic rather than trust the lever's arit
 | `lambrp-cooldown-counterfactual.log` | `scripts/score-counterfactual.sh`, the same eval-loss knobs over both counterfactual arms at their eight matched steps                 |
 | `lambrp-cf-arm-cooldown.log`         | arm A of `scripts/counterfactual-cooldown.sh`, whose header carries the schedule the arm actually ran                                  |
 | `lambrp-cf-arm-flat.log`             | arm B of the same script, kept because its header is the proof its cooldown starts past the stop                                       |
-| `smolrp-cross-engine.log`            | `scripts/cross-engine-check.sh`, the same repeated-sentence file scored by this trainer and by llama.cpp, AFTER the lever-17 fix       |
+| `smolrp-cross-engine.log`            | `scripts/cross-engine-check.sh` plus the held-out line and both greedy continuations, all AFTER the lever-17 fix                       |
 
 The battery's raw completions are not here: 216 files of model output is too much to carry in a
 repo, and the two tables above are what the lever reads. Regenerate them with

@@ -108,18 +108,39 @@ ok(k2.every((x, i) => x === before.k[i]), "export then load must return the orig
 // Pinned explicitly, because a reorder that is merely self-consistent round-trips
 // perfectly and still disagrees with llama.cpp.
 const half = HEAD_DIM / 2;
-const exported = asF32(qOut);
-for (let h = 0; h < cfg.nHeads; h++) {
-  for (let j = 0; j < half; j++) {
-    ok(
-      rowKey(exported, h * HEAD_DIM + 2 * j) === rowKey(before.q, h * HEAD_DIM + j),
-      `head ${h}: our row ${j} must export as llama.cpp's row ${2 * j}`,
-    );
-    ok(
-      rowKey(exported, h * HEAD_DIM + 2 * j + 1) === rowKey(before.q, h * HEAD_DIM + j + half),
-      `head ${h}: our row ${j + half} must export as llama.cpp's row ${2 * j + 1}`,
-    );
+const kOut = g.tensors.find((t) => t.name === "blk.0.attn_k.weight")!;
+
+// K gets the same treatment as Q and over a different head count, so checking it
+// only through the round trip above would leave exactly the self-consistent-but-
+// wrong case this test exists to catch.
+for (
+  const [what, exported, original, heads] of [
+    ["Q", asF32(qOut), before.q, cfg.nHeads],
+    ["K", asF32(kOut), before.k, cfg.nKVHeads],
+  ] as [string, Float32Array, Float32Array, number][]
+) {
+  for (let h = 0; h < heads; h++) {
+    for (let j = 0; j < half; j++) {
+      ok(
+        rowKey(exported, h * HEAD_DIM + 2 * j) === rowKey(original, h * HEAD_DIM + j),
+        `${what} head ${h}: our row ${j} must export as llama.cpp's row ${2 * j}`,
+      );
+      ok(
+        rowKey(exported, h * HEAD_DIM + 2 * j + 1) === rowKey(original, h * HEAD_DIM + j + half),
+        `${what} head ${h}: our row ${j + half} must export as llama.cpp's row ${2 * j + 1}`,
+      );
+    }
   }
 }
+
+// The guard that turns a shape mismatch into an error instead of a zero-filled
+// tensor: 3 heads do not tile 4 heads' worth of rows.
+let threw = false;
+try {
+  llama.exportGGUF(model, tok, { ...cfg, nHeads: 3 }, { quant: "f32" });
+} catch {
+  threw = true;
+}
+ok(threw, "a head count that does not tile the rows must throw, not zero-fill");
 
 console.log("=== llama rope layout checks passed ===");

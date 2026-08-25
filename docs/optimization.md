@@ -1220,8 +1220,15 @@ pairs (2j, 2j+1). `rope()` here rotates (j, j+headDim/2), the NeoX convention. B
 rotation over a different row order, and `conversion/llama.py` in llama.cpp does exactly this
 reorder when it imports from Hugging Face, whose `LlamaAttention` uses the half-split form. So a
 converted checkpoint arrives in the interleaved order and this engine rotated it as though it were
-half-split. `src/arch/llama.ts` now reorders Q and K on load and back on export; `tests/llama-rope-layout.ts`
-pins the convention.
+half-split. `src/arch/llama.ts` now reorders Q and K on load and back on export;
+`tests/llama-rope-layout.ts` pins the convention. The reorder lives in llama.cpp's converter too, as
+`permute()` in `conversion/llama.py`, or as `LlamaModel.modify_tensors` in `convert_hf_to_gguf.py`
+on builds from before that file was split up.
+
+**Any `llama` checkpoint written here before the fix is now misread.** It is stored in the old row
+order and the loader applies the inverse permutation to it, so a resume runs and the loss jumps
+rather than failing. To carry one over, load it with the pre-fix code and export it again with this
+one. Nothing published is affected: `--arch llama` never carried a released checkpoint.
 
 Confirmation, same holdout and same knobs, before and after:
 

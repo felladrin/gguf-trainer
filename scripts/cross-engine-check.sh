@@ -43,5 +43,8 @@ echo
 echo "-- llama.cpp --"
 "$BIN" -m "$MODEL" -f "$work/repeat.txt" -c 512 -ngl 99 2>&1 | grep "Final estimate"
 echo
-echo "Both should be near perplexity 1. A gap is a forward-pass disagreement,"
-echo "not a corpus problem: see docs/optimization.md lever 17."
+echo "Both should be near perplexity 1, and close to each other rather than equal:"
+echo "eval-loss scores every position in its window, llama-perplexity scores only the"
+echo "second half of each context, and the two tokenize the file differently. A ratio"
+echo "under about 1.5 is that. A ratio of 5 is a forward-pass disagreement, not a"
+echo "corpus problem: see docs/optimization.md lever 17."

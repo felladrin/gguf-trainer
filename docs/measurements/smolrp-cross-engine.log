@@ -4,7 +4,25 @@ model: out/smollm2-heretic.f32.gguf
 val loss 0.0893  ppl 1.09  (4 x 512 tok, held-out file, seed 1)  smollm2-heretic.f32.gguf
 
 -- llama.cpp --
-0.00.916.985 I Final estimate: PPL = 1.0063 +/- 0.00029
+0.00.863.138 I Final estimate: PPL = 1.0063 +/- 0.00029
 
-Both should be near perplexity 1. A gap is a forward-pass disagreement,
-not a corpus problem: see docs/optimization.md lever 17.
+Both should be near perplexity 1, and close to each other rather than equal:
+eval-loss scores every position in its window, llama-perplexity scores only the
+second half of each context, and the two tokenize the file differently. A ratio
+under about 1.5 is that. A ratio of 5 is a forward-pass disagreement, not a
+corpus problem: see docs/optimization.md lever 17.
+
+===== held-out loss, base checkpoint, after the fix =====
+$ deno run -A cli.ts eval-loss --model out/smollm2-heretic.f32.gguf --data data/rpx-hold.tokens --holdout 1 --windows 48 --seq-len 1024 --seed 1234
+val loss 2.7276  ppl 15.30  (48 x 1024 tok, held-out file, seed 1234)  smollm2-heretic.f32.gguf
+(the same command before the fix returned: val loss 6.1761  ppl 481.09)
+
+===== greedy continuation, after the fix =====
+prompt: The cat sat on the mat. The cat sat on the mat. The cat sat on the
+
+-- this trainer --
+The cat sat on the mat. The cat sat on the mat. The cat sat on the mat. The cat sat on the mat. The cat sat
+-- llama.cpp --
+The cat sat on the mat. The cat sat on the mat. The cat sat on the mat. The cat sat on the mat. The cat sat
+
+(before the fix this trainer continued: ... on the floor. The cat was sitting on the floor. The cat)

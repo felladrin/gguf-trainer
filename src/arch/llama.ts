@@ -85,13 +85,24 @@ interface Layer {
  * on the mat." repeated 400 times, where llama.cpp scored 1.006 on the same file.
  * That gap is what this function closes.
  *
- * `conversion/llama.py` in llama.cpp is the other half of the same conversion; it
- * does the equivalent reorder when importing from Hugging Face, whose LlamaAttention
- * uses the half-split convention too.
+ * The other half of the same conversion lives in llama.cpp's converter, which does
+ * the equivalent reorder when importing from Hugging Face, whose LlamaAttention uses
+ * the half-split convention too: `permute()` in `conversion/llama.py` on builds that
+ * split the converter up, `LlamaModel.modify_tensors` in `convert_hf_to_gguf.py`
+ * before that.
  */
 function reorderQK(t: Tensor, heads: number, headDim: number, toGGUF: boolean): Tensor {
   const inDim = t.shape[1];
   const half = headDim / 2;
+  // The loop below writes only rows [0, heads*headDim). Anything else would be
+  // left as zeros, which is a silent wrong answer rather than a failure, and
+  // headDim can be derived from metadata rather than stated (configFromGGUF falls
+  // back to hidden/nHeads when a checkpoint omits attention.key_length).
+  if (heads * headDim !== t.shape[0] || headDim % 2 !== 0) {
+    throw new Error(
+      `reorderQK: ${heads} heads x ${headDim} dims does not tile ${t.shape[0]} rows evenly`,
+    );
+  }
   const out = Tensor.zeros(t.shape);
   for (let h = 0; h < heads; h++) {
     for (let j = 0; j < half; j++) {
@@ -393,6 +404,9 @@ export const llama: Architecture<LlamaConfig> = {
       load(`${p}.attn_norm.weight`, L.attnNorm);
       load(`${p}.attn_q.weight`, L.qProj);
       load(`${p}.attn_k.weight`, L.kProj);
+      // NOT idempotent, and it has to run after these two loads and before nothing:
+      // applying it twice returns a third row order, silently. Both callers build
+      // the model on the line above, so it runs exactly once per model.
       L.qProj.data.set(reorderQK(L.qProj, c.nHeads, c.headDim, false).data);
       L.kProj.data.set(reorderQK(L.kProj, c.nKVHeads, c.headDim, false).data);
       load(`${p}.attn_v.weight`, L.vProj);
