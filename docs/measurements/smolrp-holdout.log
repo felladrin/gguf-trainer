@@ -1,0 +1,29 @@
+########## out/smollm2-heretic.f32.gguf
+val loss 2.7647  ppl 15.87  (64 x 1024 tok, held-out file, seed 1234)  smollm2-heretic.f32.gguf
+########## out/smolrp-step100.gguf
+val loss 2.7115  ppl 15.05  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step100.gguf
+########## out/smolrp-step200.gguf
+val loss 2.6819  ppl 14.61  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step200.gguf
+########## out/smolrp-step300.gguf
+val loss 2.6728  ppl 14.48  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step300.gguf
+########## out/smolrp-step400.gguf
+val loss 2.6678  ppl 14.41  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step400.gguf
+########## out/smolrp-step500.gguf
+val loss 2.6618  ppl 14.32  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step500.gguf
+########## out/smolrp-step600.gguf
+val loss 2.6589  ppl 14.28  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step600.gguf
+########## out/smolrp-step700.gguf
+val loss 2.6554  ppl 14.23  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step700.gguf
+########## out/smolrp-step800.gguf
+val loss 2.6562  ppl 14.24  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step800.gguf
+########## out/smolrp-step900.gguf
+val loss 2.6499  ppl 14.15  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step900.gguf
+########## out/smolrp-step1000.gguf
+val loss 2.6458  ppl 14.10  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step1000.gguf
+########## out/smolrp-step1100.gguf
+val loss 2.6461  ppl 14.10  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step1100.gguf
+########## out/smolrp-step1200.gguf
+val loss 2.6435  ppl 14.06  (64 x 1024 tok, held-out file, seed 1234)  smolrp-step1200.gguf
+########## out/smolrp.gguf
+val loss 2.6416  ppl 14.03  (64 x 1024 tok, held-out file, seed 1234)  smolrp.gguf
+=== done ===

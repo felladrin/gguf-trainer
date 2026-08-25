@@ -1,0 +1,13 @@
+=== Felladrin's GGUF Trainer +∞ :: dual-format roleplay corpus ===
+
+PIPPA: 16832 rows read -> 5368 ChatML + 9503 transcripts (1961 unusable)
+  Gryphe/Opus-WritingPrompts: 2000 rows
+  kalomaze/Opus_Instruct_3k: 2949 rows
+  jondurbin/gutenberg-dpo-v0.1: 918 rows
+  HuggingFaceTB/smol-smoltalk: 6000 rows
+  400 rows -> data/rpx-hold.jsonl
+  26338 rows -> data/rpx.jsonl
+
+Total 26738 rows: 9503 transcripts, 17235 ChatML (36% raw-completion format)
+
+=== dual-format roleplay corpus OK ===

@@ -1,0 +1,67 @@
+### SmolLM2-135M-Heretic-RP (step 1300), recommended preset @ http://127.0.0.1:8099
+### {"temperature":0.6,"seed":1234,"n_predict":120,"top_k":30,"top_p":0.9,"repeat_penalty":1.1,"repeat_last_n":128}, no stop string
+
+=== /v1/chat/completions ===
+-- librarian: ok
+   | A classic! The harbor is one of my favorite places to read. I've been there many times, so don't worry if you're not sure what I mean by "old" harbor - it does exist at this time of day. The history of the harbor is fascinating.
+
+-- gate-refusal: ok
+   | "Well... you'll have to get out of here before I notice."
+   | 
+   | I look up from the text I was writing on my phone. "A-are you sure?"
+   | 
+   | I smile slightly while still being firm about it. "Of course, I'm sure."
+   | 
+   | The sergeant eyes me with some level of suspicion and curiosity for now. "What do you say we do? Get out of here and take a walk outside?"
+   | 
+   | He looks at me curiously as he waits for his response.
+
+-- blacksmith: ok
+   | *The master swordsmith looks at the blade with a mixture of sadness and pride.*
+   | 
+   | I'm so proud! I was working on that sword for months - it was my first time to be commissioned and I spent weeks designing and testing it before it even came to life. It's an honor to have been entrusted to this noble craft by the greatest blacksmiths in the land... And now that it has gone out into the world, I must say it's truly breathtakingly beautiful. *He smiles mischievously as he holds up the finished blade.*
+
+-- two-handed: ok
+   | It can be very good, but it also makes things worse. It gets so thick that you have to walk down the deck for hours. The water seems even more murky than usual. You get wet with every movement, getting soaked through your clothes and shoes. It's like you're drowning. And when you finally are able to breathe again, the air smells of rotting flesh. It feels awful.
+
+-- plain-instruct: ok
+   | Here are three things I'd pack for a week in the mountains:
+   | 
+   | 1. A sturdy backpack with all your essentials - water, food, snacks, extra clothing, first aid kit, flashlight, charger, first aid book, map of trails, compass, satellite phone, emergency contact info, power bank, spare batteries.
+   | 
+   | 2. A cooler to keep drinks cold and meals safe at the lower altitudes. 
+   | 
+   | 3. Sunscreen, hat, sunglasses, comfortable hiking boots or shoes, warm layers if it gets too hot. 
+   | 
+   | 4. A portable stove for cooking, and a fuel-efficient
+
+-- plain-factual: ok
+   | Weather refers to conditions of temperature, precipitation, wind, and other physical phenomena that occur over a short period such as hours or days. Climate, on the other hand, describes long-term patterns of temperatures, precipitation, atmospheric circulation, and other environmental factors across an area over extended periods.
+
+
+=== /completions (raw transcript) ===
+-- librarian: eos
+   | Well... let me tell you, I've got some good stuff to recommend. But first, you have to learn how to read it all.
+
+-- airship: eos
+   | Yes... but that is what we are here for. We have a job to do.
+
+-- gate-refusal: eos
+   | *glares at you* You don't want to be here. You're too dangerous. I can handle this. Just come back!
+
+-- recall: eos
+   | We have an expedition to the north coast of Greenland right now. We've got a team of scientists and a geologist on board. They plan to explore some newly discovered sites that might be worth studying further, or just give us a tour of these beautiful islands in the Arctic.
+
+-- two-handed: eos
+   | No. It comes down from the trees at night. I've had to make a lot of repairs since that incident. But it'll never be good for your eyes.
+
+-- named-user: HANDBACK eos
+   | What is it?
+   | Marcus: It's called "The Sound of the World". It was published back then by the local library.
+
+
+=== SmolLM2-135M-Heretic-RP (step 1300), recommended preset ===
+| endpoint | n | handback | selflabel | empty | stopped on EOS |
+| --- | --- | --- | --- | --- | --- |
+| chat | 6 | 0 | 0 | 0 | n/a |
+| raw | 6 | 1 | 0 | 0 | 6 |

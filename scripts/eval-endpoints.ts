@@ -3,6 +3,8 @@
 //
 //   llama-server -m out/model.gguf -c 4096 -ngl 99 --port 8080 --jinja
 //   deno run -A scripts/eval-endpoints.ts --url http://127.0.0.1:8080 --label mine
+//   deno run -A scripts/eval-endpoints.ts --url http://127.0.0.1:8080 --label mine \
+//     --sampler '{"temperature":0.6,"top_k":30,"repeat_penalty":1.1}'
 //
 // `/v1/chat/completions` renders the model's own embedded chat template, so this
 // exercises the template as shipped, not a reconstruction of it. `/completions`
@@ -224,10 +226,16 @@ export function scoreRaw(text: string, character: string, userName: string): Ver
 // ---------------------------------------------------------------------------
 
 const N_PREDICT = 120;
-// Fixed and deterministic: this measures the model, not the sampler. Lever 15
-// found the sampler moves reply length by 20 points, which would swamp the
-// counts below if it were free to vary between runs.
-const SAMPLING = { temperature: 0, seed: 1234, n_predict: N_PREDICT };
+// Fixed and deterministic by default: this measures the model, not the sampler.
+// Lever 15 found the sampler moves reply length by 20 points, which would swamp
+// the counts below if it were free to vary between runs.
+//
+// The cost of that choice is that "ran to the token cap" mostly means the model
+// looped, which greedy decoding makes any model this size do, so --sampler exists
+// to re-measure under the preset the card actually recommends. Keep the default
+// for checkpoint-to-checkpoint comparison and the preset for "what will a user
+// see"; do not mix the two in one table.
+const DETERMINISTIC = { temperature: 0, seed: 1234, n_predict: N_PREDICT };
 
 function arg(name: string, fallback: string): string {
   const hit = Deno.args.find((a) => a.startsWith(`--${name}=`));
@@ -250,6 +258,10 @@ async function main(): Promise<void> {
   const url = arg("url", "http://127.0.0.1:8080").replace(/\/$/, "");
   const label = arg("label", "model");
   const verbose = Deno.args.includes("--verbose");
+  const preset = arg("sampler", "");
+  const SAMPLING = preset
+    ? { ...DETERMINISTIC, ...JSON.parse(preset) as Record<string, unknown> }
+    : DETERMINISTIC;
 
   const tally = {
     chat: { handback: 0, selflabel: 0, empty: 0, n: 0 },
@@ -257,7 +269,7 @@ async function main(): Promise<void> {
   };
 
   console.log(`### ${label} @ ${url}`);
-  console.log(`### temp 0, seed ${SAMPLING.seed}, n_predict ${N_PREDICT}, no stop string\n`);
+  console.log(`### ${JSON.stringify(SAMPLING)}, no stop string\n`);
 
   console.log("=== /v1/chat/completions ===");
   for (const s of CHAT_SCENARIOS) {

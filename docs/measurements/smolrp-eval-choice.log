@@ -1,0 +1,8 @@
+smollm2-heretic.f32.gguf                             piqa       piqa (500 items, 0-shot, chance 50): acc_norm 70.00%  acc 66.80%  (203s)
+smollm2-heretic.f32.gguf                             arc-easy   arc-easy (500 items, 0-shot, chance 25): acc_norm 45.80%  acc 54.20%  (387s)
+smollm2-heretic.f32.gguf                             arc        arc (500 items, 0-shot, chance 25): acc_norm 25.80%  acc 24.60%  (394s)
+smollm2-heretic.f32.gguf                             hellaswag  hellaswag (500 items, 0-shot, chance 25): acc_norm 44.40%  acc 39.40%  (397s)
+SmolLM2-135M-Heretic-RP.F32.gguf                     piqa       piqa (500 items, 0-shot, chance 50): acc_norm 68.40%  acc 66.40%  (197s)
+SmolLM2-135M-Heretic-RP.F32.gguf                     arc-easy   arc-easy (500 items, 0-shot, chance 25): acc_norm 48.80%  acc 55.80%  (393s)
+SmolLM2-135M-Heretic-RP.F32.gguf                     arc        arc (500 items, 0-shot, chance 25): acc_norm 26.40%  acc 23.20%  (375s)
+SmolLM2-135M-Heretic-RP.F32.gguf                     hellaswag  hellaswag (500 items, 0-shot, chance 25): acc_norm 44.20%  acc 39.80%  (411s)

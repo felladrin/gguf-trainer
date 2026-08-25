@@ -1264,6 +1264,89 @@ The cheap version of that check is the one that found it: take a published check
 same file with both engines, and compare. It costs a minute per architecture and it is now the
 thing to run first when a loss looks wrong.
 
+### 18. One corpus for both llama.cpp endpoints, and the mask that stops a model writing the human's turn (2026-08-25)
+
+Every roleplay model in this series has been used two ways and trained for one. SillyTavern and
+Kobold Lite send a raw persona transcript to `/completions`; an OpenAI-shaped client sends ChatML to
+`/v1/chat/completions`. Minueza-3-95M-RP and LittleLamb-293M-RP were both ChatML fine-tunes, and
+LittleLamb's card says so outright: "that format is not what this model was trained on".
+
+**The measurement that motivated it.** `SmolLM2-135M-Instruct-heretic`, unmodified, on six raw
+transcript scenarios with no stop string, at temp 0.6 / top-k 30 / repeat-penalty 1.1:
+
+| Count over six raw scenarios         | base |
+| ------------------------------------ | ---- |
+| wrote the human's turn               | 5    |
+| prefixed its reply with its own name | 6    |
+| stopped on EOS                       | 1    |
+
+A base instruct model handed a transcript plays every part in it. The chat endpoint was already
+clean on the same six personas, so the whole problem is one format.
+
+**The corpus is one file with two renders, and the difference is where the mask goes.** The ChatML
+half is `assistantLossMask` as before. The transcript half (`src/data/transcript.ts`) renders a
+`[Character: X]` header, a persona line, `<START>`, then labelled turns, and supervises **exactly one
+reply**: everything up to the final `Name:` is context, the reply after it is the target, and an
+appended `<|im_end|>` closes it. The human's turns are mask 0 at every offset, so no gradient ever
+teaches the model to produce them.
+
+Three details that are the whole design, and each one was a choice with an alternative:
+
+- **One supervised reply per document, not all of them.** Supervising every character turn is more
+  token-efficient, but then the stop signal appears once per document against six replies, and the
+  model learns to continue rather than to stop. One reply per document makes the ratio 1:1.
+- **The terminator is `<|im_end|>`, not a `You:` handback.** Training the model to emit the next
+  speaker label is the horde convention and it works, with a client that sets a stop string. It also
+  trains the exact behaviour being removed. Ending on EOS stops generation with any client and with
+  no configuration, and it means the token `You:` never appears as a target anywhere in the corpus.
+- **The human's label varies.** Seven of twelve slots are `You`, the rest are other names. A model
+  trained on one literal string learns the string; the point is the shape "a name, then a colon", so
+  a SillyTavern persona called anything else still works.
+
+Byte offsets rather than token search: `BPETokenizer.byteLengths` gives each token's contribution to
+`decode()`, so the reply's byte span maps onto token indices in one pass, and a token straddling the
+boundary drops from the mask rather than half-supervising the model's own speaker label.
+
+**Result, same six scenarios and the same sampler, 1300 steps and 10.6M tokens later:**
+
+| Count over six raw scenarios         | base | fine-tune |
+| ------------------------------------ | ---- | --------- |
+| wrote the human's turn               | 5    | 1         |
+| prefixed its reply with its own name | 6    | 0         |
+| stopped on EOS                       | 1    | 6         |
+
+Chat stayed at 0 and 0 on both. Six scenarios at one sampled seed is a coarse instrument and the
+right reading is "gone from these six", not a rate.
+
+**The scorer was wrong first, in the way lever 16 warned about.** The "stopped on EOS" column read
+`res.stopped_eos`, a field this llama.cpp build does not send; it reports `stop_type: "eos"`. An
+absent field is `undefined`, `undefined` is falsy, so the column read 0 for every model. **It read 0
+for the base too, and that was true**, which is exactly why nobody looked: the broken metric agreed
+with the control. It was caught by hand-reading a completion that had obviously terminated while the
+table said it had not. `stoppedOnEos` now throws when neither field is present, because "the field is
+missing" and "the model never stopped" are different facts and only one of them is a zero.
+
+**What the battery still cannot see, and it is the thing users will notice first.** At temp 0 with no
+repetition penalty, six of the twelve completions were repetition loops running to the token cap; the
+gate sergeant said a variation of "I'm not ready for that." fourteen times in one 120-token reply.
+Under the card's preset all twelve terminated. So the deterministic battery is right for comparing
+checkpoints and actively misleading about how the model reads, which is why `eval-endpoints.ts` grew
+a `--sampler` flag and the measurements directory carries both runs. Do not put them in one table.
+
+**Checkpoint selection had nothing to select.** Held-out loss fell monotonically from 2.7647 to
+2.6416 with no turn, and the last four snapshots span 0.0045 against a mean adjacent gap of 0.0060.
+The battery broke the tie (three EOS stops at step 1300 against two, one and two) and that is also
+coarse. Both pointed at the last checkpoint, which is also the one whose optimizer state exists on
+disk, so it shipped. Worth being plain that this is two weak instruments agreeing, not one strong one
+deciding.
+
+**Q4_0 is worse than the model it was fine-tuned from.** F32 2.6416, Q8_0 2.6439, Q4_0 2.9063,
+against a base of 2.7647. The 293M sibling paid 0.1161 for Q4_0; this paid 0.2647 and gave back more
+than the fine-tune bought. Embeddings are tied at this size, so the embedding matrix doubles as the
+output projection and 4-bit lands directly on the logits, which is the likely mechanism and is not
+tested here. The file is not published. A 78 MB download whose only distinguishing property is being
+worse than its own base is a trap for whoever sorts by size.
+
 ## Explicitly not worth doing
 
 - **Guarded/clamped f16 compute**: 0.98x measured on attention at seq 4096-8192, plus
