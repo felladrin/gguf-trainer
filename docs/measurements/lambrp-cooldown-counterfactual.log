@@ -1,0 +1,33 @@
+########## out/cf-cooldown-step1817.gguf
+val loss 2.8591  ppl 17.45  (64 x 1024 tok, held-out file, seed 1234)  cf-cooldown-step1817.gguf
+########## out/cf-flat-step1817.gguf
+val loss 2.8595  ppl 17.45  (64 x 1024 tok, held-out file, seed 1234)  cf-flat-step1817.gguf
+########## out/cf-cooldown-step1867.gguf
+val loss 2.8527  ppl 17.33  (64 x 1024 tok, held-out file, seed 1234)  cf-cooldown-step1867.gguf
+########## out/cf-flat-step1867.gguf
+val loss 2.8545  ppl 17.37  (64 x 1024 tok, held-out file, seed 1234)  cf-flat-step1867.gguf
+########## out/cf-cooldown-step1917.gguf
+val loss 2.8556  ppl 17.38  (64 x 1024 tok, held-out file, seed 1234)  cf-cooldown-step1917.gguf
+########## out/cf-flat-step1917.gguf
+val loss 2.8595  ppl 17.45  (64 x 1024 tok, held-out file, seed 1234)  cf-flat-step1917.gguf
+########## out/cf-cooldown-step1967.gguf
+val loss 2.8531  ppl 17.34  (64 x 1024 tok, held-out file, seed 1234)  cf-cooldown-step1967.gguf
+########## out/cf-flat-step1967.gguf
+val loss 2.8611  ppl 17.48  (64 x 1024 tok, held-out file, seed 1234)  cf-flat-step1967.gguf
+########## out/cf-cooldown-step2017.gguf
+val loss 2.8519  ppl 17.32  (64 x 1024 tok, held-out file, seed 1234)  cf-cooldown-step2017.gguf
+########## out/cf-flat-step2017.gguf
+val loss 2.8552  ppl 17.38  (64 x 1024 tok, held-out file, seed 1234)  cf-flat-step2017.gguf
+########## out/cf-cooldown-step2067.gguf
+val loss 2.8629  ppl 17.51  (64 x 1024 tok, held-out file, seed 1234)  cf-cooldown-step2067.gguf
+########## out/cf-flat-step2067.gguf
+val loss 2.8744  ppl 17.71  (64 x 1024 tok, held-out file, seed 1234)  cf-flat-step2067.gguf
+########## out/cf-cooldown-step2117.gguf
+val loss 2.8553  ppl 17.38  (64 x 1024 tok, held-out file, seed 1234)  cf-cooldown-step2117.gguf
+########## out/cf-flat-step2117.gguf
+val loss 2.8581  ppl 17.43  (64 x 1024 tok, held-out file, seed 1234)  cf-flat-step2117.gguf
+########## out/cf-cooldown-step2167.gguf
+val loss 2.8566  ppl 17.40  (64 x 1024 tok, held-out file, seed 1234)  cf-cooldown-step2167.gguf
+########## out/cf-flat-step2167.gguf
+val loss 2.8595  ppl 17.45  (64 x 1024 tok, held-out file, seed 1234)  cf-flat-step2167.gguf
+=== done ===

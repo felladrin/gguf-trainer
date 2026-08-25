@@ -1,0 +1,63 @@
+=== finetune: qwen3 -> GGUF ===
+
+Device:
+  adapter    : AMD Radeon Graphics (RADV GFX1151) (vendor 4098, arch ?)
+  limits     : maxBuffer 2048 MiB, maxStorageBinding 2048 MiB, workgroupStorage 16 KiB, invocations/wg 256
+  features   : timestamp-query yes, shader-f16 no
+  system mem : 110.3 GiB free / 124.4 GiB (unified pool)
+Tokenizer: loaded data/lambrp-train.tokenizer.json (vocab 151936, specials <|endoftext|>,<|im_start|>,<|im_end|>,<|object_ref_start|>,<|object_ref_end|>,<|box_start|>,<|box_end|>,<|quad_start|>,<|quad_end|>,<|vision_start|>,<|vision_end|>,<|vision_pad|>,<|image_pad|>,<|video_pad|>,<tool_call>,</tool_call>,<|fim_prefix|>,<|fim_middle|>,<|fim_suffix|>,<|fim_pad|>,<|repo_name|>,<|file_sep|>,<tool_response>,</tool_response>,<think>,</think>)
+Tokens: data/lambrp-train.tokens (16.8M, pretokenized)
+Mask: data/lambrp-train.mask (assistant-only loss over 16798386 tokens)
+Run: 2200 x 2 x 2048 = 9M tokens (0.5 epochs of 17M), eos=151645, resuming @ step 1767
+Model: qwen3, 28 layers, hidden=544, heads=16/8, headDim=128, ffn=2560, ctx=40960, rope=1000000, QK-norm, ~293.3M params
+Resumed weights from out/lamb-ckpt-1767.gguf (310 tensors)
+Parity probe: CPU 3.3022 vs GPU 3.3022 (|Δ|=4.3e-6)
+--coldOpt: ignoring any optimizer state (momentum from another objective)
+Schedule: muon lr 0.00005, aux lr 0.00002, WSD warmup 220 / cooldown 440 steps, quant f32
+Chat template: data/lambrp-train.template.txt (embedded in every export)
+  step    1767  loss 2.0606  (0.000 st/s, 0.7min, eta --:--:--:--)
+  step    1789  loss 1.9712  (0.017 st/s, 21.3min, eta 0:06:38:37)
+  step    1811  loss 2.3424  (0.019 st/s, 37.9min, eta 0:05:34:52)
+  [ckpt @ 1817] cf-cooldown.gguf 1179MB + optstate 1504MB, loss 2.342, 0.020 st/s, eta 0:05:26:27, mem 22548MB gpu (pool 18053 + state 4495)
+  step    1833  loss 2.3076  (0.020 st/s, 54.6min, eta 0:05:03:48)
+  step    1855  loss 2.1721  (0.021 st/s, 71.2min, eta 0:04:39:02)
+  [ckpt @ 1867] cf-cooldown.gguf 1179MB + optstate 1504MB, loss 2.172, 0.021 st/s, eta 0:04:27:54, mem 22548MB gpu (pool 18053 + state 4495)
+  step    1877  loss 2.5275  (0.021 st/s, 88.0min, eta 0:04:18:19)
+  step    1899  loss 2.8955  (0.021 st/s, 104.5min, eta 0:03:58:24)
+  [ckpt @ 1917] cf-cooldown.gguf 1179MB + optstate 1504MB, loss 2.896, 0.021 st/s, eta 0:03:43:08, mem 22548MB gpu (pool 18053 + state 4495)
+  step    1921  loss 3.1779  (0.021 st/s, 121.3min, eta 0:03:39:48)
+  step    1943  loss 2.1508  (0.021 st/s, 137.8min, eta 0:03:21:16)
+  step    1965  loss 2.0712  (0.021 st/s, 154.3min, eta 0:03:03:07)
+  [ckpt @ 1967] cf-cooldown.gguf 1179MB + optstate 1504MB, loss 2.071, 0.021 st/s, eta 0:03:01:44, mem 22548MB gpu (pool 18053 + state 4495)
+  step    1987  loss 2.3504  (0.021 st/s, 171.0min, eta 0:02:45:33)
+  step    2009  loss 2.5173  (0.022 st/s, 187.5min, eta 0:02:27:59)
+  [ckpt @ 2017] cf-cooldown.gguf 1179MB + optstate 1504MB, loss 2.517, 0.022 st/s, eta 0:02:21:48, mem 22548MB gpu (pool 18053 + state 4495)
+  step    2031  loss 2.5986  (0.022 st/s, 204.2min, eta 0:02:10:44)
+  step    2053  loss 3.1128  (0.022 st/s, 220.7min, eta 0:01:53:27)
+  [ckpt @ 2067] cf-cooldown.gguf 1179MB + optstate 1504MB, loss 3.113, 0.022 st/s, eta 0:01:42:38, mem 22548MB gpu (pool 18053 + state 4495)
+  step    2075  loss 2.3341  (0.022 st/s, 237.6min, eta 0:01:36:25)
+  step    2097  loss 2.4484  (0.022 st/s, 254.1min, eta 0:01:19:18)
+  [ckpt @ 2117] cf-cooldown.gguf 1179MB + optstate 1504MB, loss 2.448, 0.022 st/s, eta 0:01:03:52, mem 22548MB gpu (pool 18053 + state 4495)
+  step    2119  loss 1.9867  (0.022 st/s, 270.8min, eta 0:01:02:19)
+  step    2141  loss 2.1735  (0.022 st/s, 287.3min, eta 0:00:45:19)
+  step    2163  loss 2.5491  (0.022 st/s, 303.8min, eta 0:00:28:23)
+  [ckpt @ 2167] cf-cooldown.gguf 1179MB + optstate 1504MB, loss 2.549, 0.022 st/s, eta 0:00:25:20, mem 22548MB gpu (pool 18053 + state 4495)
+  step    2185  loss 2.2515  (0.022 st/s, 320.5min, eta 0:00:11:30)
+  step    2199  loss 2.0942  (0.022 st/s, 331.0min, eta 0:00:00:46)
+
+Training: loss 2.368 -> 2.407 (mean of first/last 10) in 331.0min, 89 tok/s, peak 22548MB gpu (pool 18053 + state 4495)
+
+Sample:
+Once upon a time, there was a little girl named Lily who loved to play with her toys. One day, she found an old teddy bear in the attic and brought it home.
+
+Lily's parents were very worried about what would happen if they let her take the teddy bear away. They told her that it was too big
+
+The old man walked slowly toward the door, his face pale and gaunt. He had been walking for hours now, but he was still so tired that he could barely move.
+
+"I'm sorry," said the old man, his voice trembling with fear. "Please come in."
+
+He turned to leave, but a gust
+
+Wrote out/cf-cooldown.gguf (1179 MB, 310 tensors, qwen3 ✓, ctx 40960) + cf-cooldown.gguf.optstate (1504 MB). Next stage resumes with --resume.
+Wrote cf-cooldown.gguf.run.sh (run with: bash out/cf-cooldown.gguf.run.sh)
+=== finetune complete ===
