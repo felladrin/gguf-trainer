@@ -1,19 +1,21 @@
 .DS_Store
 
 # Working directories: models, tokens and corpora are outputs, never source.
-out/
-data/
-demo-out/
+# Leading slashes matter: an unanchored `data/` also swallows src/data/, which is
+# source, and a new file there is then invisible to git rather than rejected.
+/out/
+/data/
+/demo-out/
 # Downloaded base checkpoints, converted on the way in.
-base/
+/base/
 
 # Raw and pretokenized corpora: downloaded or derived, never source.
-corpus/
+/corpus/
 # Local run artifacts from before the CLI: checkpoints, token streams, logs.
-examples/
+/examples/
 # Downloaded validation sets and eval output.
-evaldata/
+/evaldata/
 
 # Agent scratch, not project source.
-memory/
-.consult/
+/memory/
+/.consult/

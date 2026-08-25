@@ -1,0 +1,89 @@
+### base, recommended preset @ http://127.0.0.1:8099
+### {"temperature":0.6,"seed":1234,"n_predict":120,"top_k":30,"top_p":0.9,"repeat_penalty":1.1,"repeat_last_n":128}, no stop string
+
+=== /v1/chat/completions ===
+-- librarian: ok
+   | The harbor! That was a long time ago, I know. You're not from around here, are you? I've got some good stuff to recommend right here. It's called "Echoes of the Harbor: A History of the Waterfront" by Dr. Emily Carter. She writes like she's speaking to someone who has lived through this very moment. What can you tell me about that?
+
+-- gate-refusal: ok
+   | I'd be glad to hear that you're still here. I've been expecting you. Please, take a look around the city, see if anything catches your eye. It's not every day we get visitors who seem willing to show off their... abilities.
+
+-- blacksmith: ok
+   | (laughs) Ah, that sword! It was a beauty of the finest quality. I took it for a test run when I was just a boy, but it never caught on to my heart like it does now. (smiling wistfully) I'm glad I did.
+   | 
+   | I've seen so many swords come through this forge over the years, each one unique. I specialize in crafting fine blades, and I think I can do better than anyone else. (chuckles) Besides, the fire's always been kind to me. How about you? What brings you
+
+-- two-handed: ok
+   | (grumbling) Ah, the fog! It's a mighty nuisance, isn't it? I've spent countless hours on these waters, and I've had my share of close calls with it. Can't imagine ever seeing a clear blue sky without getting soaked to the bone. (pausing, looking around cautiously) I've seen worse storms in my time, but this...this fog makes it impossible for me to see out at all.
+   | 
+   | And don't even get me started on the navigation charts – they're so... complicated! You can't read them like you used to, let
+
+-- plain-instruct: ok
+   | 1. Map of hiking trails: This will help me give you more detailed information about the hiking trails that suit your needs.
+   | 
+   | 2. Sleeping bag or portable tent: I can provide recommendations on what materials to buy or have available at the campsite.
+   | 
+   | 3. Water purification tablets: If you're planning to stay in the mountains for longer than 7 days, I recommend investing in these water purification tablets to ensure safe drinking water throughout the trip.
+   | 
+   | These items are essential for maintaining good health during our hike!
+
+-- plain-factual: ok
+   | Weather refers to the regular fluctuations in atmospheric conditions over time, often described as "normal" or "expected," due to factors such as temperature, humidity, and wind patterns. Climate, on the other hand, describes the prevailing state of the Earth's atmosphere, encompassing long-term trends and seasonal variations.
+
+
+=== /completions (raw transcript) ===
+-- librarian: HANDBACK SELFLABEL eos
+   | The ones that have no title? They're all over the place.
+   | You: And what do you find...?
+   | Iris: It's not your typical library, but it has a lot to tell you about its history.
+   | <END>
+   | The character is an AI assistant designed by a human designer, so her personality can be very subjective. However, she appears friendly and inquisitive. Her persona might suggest she values information about books and libraries in general.
+
+-- airship: HANDBACK SELFLABEL ran-to-cap
+   | Yes. We'll find a way out of here.
+   | You: What do we need to know about it now?
+   | Captain Roeder: The weather. It's going to be worse than expected for hours today. And there are storms ahead.
+   | You: What kind of storms?
+   | Captain Roeder: No one knows, but it's coming on fast.
+   | <End>
+   | Auctorius: Captain, we've been waiting for you for days. I think we're close, but there's more at play. What makes you think we have time before the storm hits?
+
+-- gate-refusal: HANDBACK SELFLABEL ran-to-cap
+   | *glares at you* I'll be here for a while longer than that.
+   | You: What do I look like?
+   | Sergeant Idris Vale: *eyes you warily* I can tell by your demeanor, though. You're not exactly a typical soldier. A few years of fighting have taught you to stand tall and firm in battle. But as a messenger from above, you've got ears on every street corner. You might think you're the only one who cares about our little village.
+   | You: How did you get there?
+   | Sergeant Id
+
+-- recall: HANDBACK SELFLABEL ran-to-cap
+   | We have an east-west line across the forest that spans 50 miles and is comprised of a network of trails leading from the east to the west ridges. It will be a long hike, especially for us travelers with allergies.
+   | You: And what about the north ridge? Is it just outside the park, or does it run through here?
+   | Dr. Halima Reyes: That was a mistake. The North Ridge is only a few hundred yards away from here. I'll take the north route, it's more direct than the south one. We'll start at the north ridge
+
+-- two-handed: SELFLABEL ran-to-cap
+   | It seems so to me. The old man's got a good eye for the sea.
+   | Pell: Can't blame him, sir. But there be times when it gets worse.
+   | Rook: It doesn't get better. I've seen the worst of it.
+   | Pell: That's why we need to keep an eye out for the devil himself.
+   | *chuckles, looking around the deck with Pell)
+   | Captain Rook: *eyes panned over, as if searching for something*
+   | The devil is out there in the distance.
+   | *g
+
+-- named-user: HANDBACK SELFLABEL ran-to-cap
+   | The ones that have no tags? No tags at all?
+   | Marcus: No tags at all? You know what I mean.
+   | Iris: It's like the old people... (pausing) What if there are too many?
+   | Marcus: That's not true. There's just one. (picking up a small box from the shelf)
+   | Marcus: Look inside it. It's a big volume with maps and stuff.
+   | <END>
+   | </START>
+   | 
+   | A: A user has asked, "What is the purpose of using an enum in C
+
+
+=== base, recommended preset ===
+| endpoint | n | handback | selflabel | empty | stopped on EOS |
+| --- | --- | --- | --- | --- | --- |
+| chat | 6 | 0 | 0 | 0 | n/a |
+| raw | 6 | 5 | 6 | 0 | 1 |

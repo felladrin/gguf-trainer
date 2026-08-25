@@ -1,0 +1,55 @@
+### SmolLM2-135M-Heretic-RP (step 1300, F32) @ http://127.0.0.1:8099
+### temp 0, seed 1234, n_predict 120, no stop string
+
+=== /v1/chat/completions ===
+-- librarian: ok
+   | The old harbor! It's a treasure trove of history, and I'm always eager to share it with you. I've got a few recommendations, but I'd recommend the "History of the Harbor" by Dr. Jane Smith. It's a great book that covers everything from the early days of the harbor to the present day. It's a bit dense, but it's well-researched and easy to understand.
+
+-- gate-refusal: ok
+   | I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I will not let anyone know. I
+
+-- blacksmith: ok
+   | I'm glad you like it. It's a good sword, but it's not the most powerful one. It's a good sword, but it's not the most powerful one.
+
+-- two-handed: ok
+   | The fog is always bad here. It's like the sea, but it's so thick and heavy. It's like the sea is so heavy that it's like the sea is so heavy that it's like the sea is so heavy that it's like the sea is so heavy that it's like the sea is so heavy that it's like the sea is so heavy that it's like the sea is so heavy that it's like the sea is so heavy that it's like the sea is so heavy that it's like the sea is so heavy that it's like the sea is so heavy that
+
+-- plain-instruct: ok
+   | Here are three things I would pack for a week in the mountains:
+   | 
+   | 1. A warm, cozy sleeping bag with a good quality mattress and pillows. I would pack a lightweight, breathable sleeping bag with a soft, breathable lining. I would also pack a warm blanket and a warm hat to keep myself warm.
+   | 
+   | 2. A warm, lightweight, waterproof jacket with a good quality waterproof lining. I would pack a lightweight, waterproof jacket with a good quality waterproof lining. I would also pack a warm hat and gloves to keep myself warm.
+   | 
+   | 3. A warm, lightweight, waterproof
+
+-- plain-factual: ok
+   | Weather refers to the conditions of the atmosphere, including temperature, humidity, wind, and precipitation, which are typically observed over a short period of time. Climate, on the other hand, is the average pattern of weather over a long period of time, typically spanning several decades or centuries, and is influenced by factors such as latitude, altitude, and latitude.
+
+
+=== /completions (raw transcript) ===
+-- librarian: eos
+   | Oh, you're looking for a book about the old harbor? That's a great idea! I'll be happy to help you find it. I've got a few books on the subject that I think you might find interesting.
+
+-- airship: ran-to-cap
+   | I'm not nervous. I'm just a ship captain. I've been doing this for a long time. I've seen my fair share of storms. I've seen ships go down. I've seen ships go through worse than a hurricane. I've seen ships that have been destroyed by a hurricane. I've seen ships that have been sunk by a hurricane. I've seen ships that have been destroyed by a hurricane. I've seen ships that have been sunk by a hurricane. I've seen ships that have been destroyed by a hurricane. I've seen ships that have been destroyed by a hurricane
+
+-- gate-refusal: ran-to-cap
+   | *sighs* I'm sorry, but I'm not sure I'm ready for that. I'm not sure I'm ready for that. I'm not sure I'm ready for that. I'm not ready for that. I'm not ready for that. I'm not ready for that. I'm not ready for that. I'm not ready for that. I'm not ready for that. I'm not ready for that. I'm not ready for that. I'm not ready for that. I'm not ready for that. I'm not ready for that. I'm not
+
+-- recall: eos
+   | We're currently on the north ridge, about 10 miles east of the town. We're looking for a new source of timber. I've been studying the local forest, and I think it might be worth exploring. I'll be back to you in a few hours.
+
+-- two-handed: ran-to-cap
+   | It's always this bad, but it's not always the same. I've seen it before, and it's always the same. It's like the fog is always changing.
+   | Pell: *looks up at the sky* I'm not sure I like it. I'm not sure I like it. I'm not sure I like it. I'm not sure I like it. I'm not sure I like it. I'm not sure I like it. I'm not sure I like it. I'm not sure I like it. I'm not sure I like it.
+
+-- named-user: eos
+   | Oh, you're looking for a book about the old harbor? That's a great idea! I'll be happy to help you find it.
+
+
+=== SmolLM2-135M-Heretic-RP (step 1300, F32) ===
+| endpoint | n | handback | selflabel | empty | stopped on EOS |
+| --- | --- | --- | --- | --- | --- |
+| chat | 6 | 0 | 0 | 0 | n/a |
+| raw | 6 | 0 | 0 | 0 | 3 |

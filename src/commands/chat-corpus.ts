@@ -9,6 +9,13 @@
 // rows: that second form is how a `style-seed` -> `style-restyle` corpus reaches
 // the trainer.
 //
+// A local row may also carry `"format": "transcript"` with `character`,
+// `user_label`, `persona` and `examples` beside its `messages`. Those render as a
+// raw "Name:" transcript instead of ChatML, supervising one reply, so one corpus
+// can train the model for BOTH llama.cpp endpoints: `/v1/chat/completions`, which
+// sends ChatML, and `/completions`, which sends a persona block and turn labels.
+// See src/data/transcript.ts for why the human's turns are masked out there.
+//
 // Writes <out>.tokens, <out>.mask, <out>.tokenizer.json, <out>.template.txt.
 //
 // This NEVER trains a vocab: the embedding matrix froze at pretraining, so a new
@@ -28,6 +35,7 @@ import {
   detectMapping,
   rowToMessages,
 } from "../data/chat.ts";
+import { renderTranscript, transcriptLossMask } from "../data/transcript.ts";
 import { BPETokenizer } from "../tokenizer/bpe.ts";
 import type { TokenizerData } from "../tokenizer/bpe.ts";
 import {
@@ -43,6 +51,41 @@ import { UsageError } from "../cli/args.ts";
 
 function die(msg: string): never {
   throw new UsageError(msg);
+}
+
+type Doc = { text: string; replyStart?: number };
+
+function field(row: unknown, key: string): string {
+  const v = (row as Record<string, unknown> | null)?.[key];
+  return typeof v === "string" ? v : "";
+}
+
+/** A row asking for the raw-transcript format, or null for the ChatML default.
+ * The system turn is the persona block, the rest are the transcript's turns. */
+function asTranscript(row: unknown, messages: { role: string; content: string }[]): Doc | null {
+  if (field(row, "format") !== "transcript") return null;
+  const character = field(row, "character");
+  if (!character) return null;
+  const system = messages.find((m) => m.role === "system");
+  return renderTranscript({
+    character,
+    userLabel: field(row, "user_label") || "You",
+    persona: field(row, "persona") || system?.content,
+    examples: field(row, "examples"),
+    turns: messages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => ({ human: m.role === "user", text: m.content })),
+  });
+}
+
+function asChatML(render: Template, messages: { role: string; content: string }[]): Doc | null {
+  let text: string;
+  try {
+    text = render.render({ messages, add_generation_prompt: false });
+  } catch {
+    return null; // a row the template cannot render
+  }
+  return text.trim() ? { text } : null;
 }
 
 async function run(v: Values) {
@@ -105,9 +148,9 @@ async function run(v: Values) {
   if (!urls.length) die(`no parquet shards found for ${dataset} default/train`);
   console.log(local ? `local file` : `${urls.length} parquet shards available`);
 
-  const convos: string[] = [];
+  const convos: Doc[] = [];
   let mapping: ReturnType<typeof detectMapping> = null;
-  let skipped = 0, totalChars = 0;
+  let skipped = 0, totalChars = 0, transcripts = 0;
   for (const url of urls) {
     if (convos.length >= maxRows) break;
     console.log(`${local ? "reading" : "downloading"} ${url.split("/").pop()} …`);
@@ -124,25 +167,21 @@ async function run(v: Values) {
         skipped++;
         continue;
       }
-      let text: string;
-      try {
-        text = render.render({ messages, add_generation_prompt: false });
-      } catch {
-        skipped++; // a row the template cannot render
-        continue;
-      }
-      if (!text.trim()) {
+      const doc = asTranscript(row, messages) ?? asChatML(render, messages);
+      if (!doc) {
         skipped++;
         continue;
       }
-      convos.push(text);
-      totalChars += text.length;
+      if (doc.replyStart !== undefined) transcripts++;
+      convos.push(doc);
+      totalChars += doc.text.length;
     }
     console.log(`  ${convos.length}/${maxRows} conversations (${skipped} skipped)`);
   }
   if (!convos.length) die("no usable conversations");
   console.log(
-    `corpus: ${(totalChars / 1e6).toFixed(1)}M chars from ${convos.length} conversations`,
+    `corpus: ${(totalChars / 1e6).toFixed(1)}M chars from ${convos.length} conversations` +
+      (transcripts ? ` (${transcripts} as raw transcripts, the rest ChatML)` : ""),
   );
 
   // --- 3. Encode + assistant-only mask ----------------------------------------
@@ -157,8 +196,18 @@ async function run(v: Values) {
   let len = 0;
   const decode = (x: number[]) => tok.decode(x);
   for (let i = 0; i < convos.length; i++) {
-    const e = tok.encode(convos[i]);
-    const m = assistantLossMask(e, imStart, imEnd, decode);
+    const { text, replyStart } = convos[i];
+    const e = tok.encode(text);
+    let m: number[];
+    if (replyStart === undefined) {
+      m = assistantLossMask(e, imStart, imEnd, decode);
+    } else {
+      // The terminator is appended rather than rendered: it is a control token,
+      // and a control token inside the text would decode to nothing and shift
+      // every byte offset after it.
+      e.push(imEnd);
+      m = transcriptLossMask(tok.byteLengths(e), replyStart);
+    }
     if (len + e.length + 1 > ids.length) {
       const cap = Math.max(ids.length * 2, len + e.length + 1);
       const grownIds = new IdBuffer(cap);

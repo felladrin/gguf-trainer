@@ -1,0 +1,4 @@
+########## out/release-smolrp/SmolLM2-135M-Heretic-RP.Q8_0.gguf
+val loss 2.6439  ppl 14.07  (64 x 1024 tok, held-out file, seed 1234)  SmolLM2-135M-Heretic-RP.Q8_0.gguf
+########## out/release-smolrp/SmolLM2-135M-Heretic-RP.Q4_0.gguf
+val loss 2.9063  ppl 18.29  (64 x 1024 tok, held-out file, seed 1234)  SmolLM2-135M-Heretic-RP.Q4_0.gguf
