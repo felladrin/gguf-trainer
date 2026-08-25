@@ -1,8 +1,15 @@
 // Llama: the plain pre-norm GQA transformer that most open models are.
 //
-// SmolLM2, TinyLlama, Qwen2 and Mistral all fit this shape, so a model trained
-// here loads in llama.cpp under the `llama` arch and can be compared directly
-// against them.
+// SmolLM2, TinyLlama and Mistral all fit this shape, so a model trained here
+// loads in llama.cpp under the `llama` arch and can be compared directly against
+// them.
+//
+// NOT Qwen2: llama.cpp registers `Qwen2ForCausalLM` on its own class and writes
+// `general.architecture = "qwen2"` (conversion/qwen.py, MODEL_ARCH_NAMES in
+// gguf-py/gguf/constants.py), which this registry does not know, so a converted
+// Qwen2 or Qwen2.5 checkpoint cannot be resumed here. Qwen3 can: it has its own
+// file. SmolLM3 is the same trap in the other direction, converting to `smollm3`
+// despite the name.
 //
 // Everything Gemma3 adds, this one leaves out: no QK-norm, no sandwich norms, no
 // embedding scale, one RoPE base instead of two, full attention on every layer.
@@ -267,7 +274,7 @@ const FLAGS: Flag[] = [
 export const llama: Architecture<LlamaConfig> = {
   name: "llama",
   summary: "Llama: pre-norm GQA, SwiGLU, single RoPE base, full attention.",
-  reference: "HuggingFaceTB/SmolLM2-135M, TinyLlama, Qwen2, Mistral",
+  reference: "HuggingFaceTB/SmolLM2-135M, TinyLlama, Mistral",
   flags: FLAGS,
 
   configFromFlags(shape: BaseShape, v: Values): LlamaConfig {

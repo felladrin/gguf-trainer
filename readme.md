@@ -43,6 +43,38 @@ deno run -A cli.ts pretrain --data your.tokens --out out/continued.gguf \
   --hidden 640 --layers 12 --steps 5000 --seq-len 2048 --batch 8
 ```
 
+## Base models to fine-tune
+
+Any published checkpoint works as a starting point if it clears two gates.
+
+**It has to convert to one of the three architectures.** `inspect` reads `general.architecture` out of the GGUF and looks it up in the registry, so `gemma3`, `llama` and `qwen3` load and nothing else does. The name on the model card is not a guide: Qwen2 and Qwen2.5 convert to a `qwen2` arch and SmolLM3 converts to `smollm3`, so neither loads here even though Qwen3 and SmolLM2 both do.
+
+**For chat or roleplay fine-tuning it also needs ChatML in its vocab.** `chat-corpus` aborts unless `<|im_start|>`, `<|im_end|>` and `<|endoftext|>` each encode as a single token. A base without them is still fine for continued pretraining with `pretrain --resume`; it just cannot go through the SFT path. Read that column before downloading anything.
+
+Verified against the Hugging Face API on 2026-08-25, smallest first. All Apache-2.0, none gated.
+
+| Model                                                                               | `--arch` | Params | Chat fine-tune | Good for                                                                                       |
+| :---------------------------------------------------------------------------------- | :------- | -----: | :------------- | :--------------------------------------------------------------------------------------------- |
+| [Minueza-3-95M-Base](https://huggingface.co/Felladrin/Minueza-3-95M-Base)           | `gemma3` |  94.7M | yes            | the fastest loop, and no conversion step: it ships as GGUF with its optimizer state beside it  |
+| [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M)                   | `llama`  |   135M | yes            | the best-trained tiny base, and the shape measured here at 424 tokens/s                        |
+| [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) | `llama`  |   135M | yes            | same weights and vocab, already following turns, so SFT teaches a voice rather than the format |
+| [LittleLamb](https://huggingface.co/MultiverseComputingCAI/LittleLamb)              | `qwen3`  |   293M | yes            | the small `qwen3` option, heavily trained for its size                                         |
+| [SmolLM2-360M](https://huggingface.co/HuggingFaceTB/SmolLM2-360M)                   | `llama`  |   362M | yes            | the step up when 135M stops improving, and still an overnight run                              |
+| [Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base)                      | `qwen3`  |   596M | yes            | an untouched base that already carries ChatML, near the practical size ceiling                 |
+| [TinyLlama_v1.1](https://huggingface.co/TinyLlama/TinyLlama_v1.1)                   | `llama`  |   1.1B | no             | `pretrain --resume` only, and slow here; the no-ChatML case                                    |
+
+Three models have been taken end to end with this repo, one per architecture, so the recipe is not theoretical. Two came from rows above: [Minueza-3-95M-RP](https://huggingface.co/Felladrin/Minueza-3-95M-RP) from Minueza-3-95M-Base (`gemma3`) and [LittleLamb-293M-RP](https://huggingface.co/Felladrin/LittleLamb-293M-RP) from LittleLamb (`qwen3`). The `llama` one, [SmolLM2-135M-Heretic-RP](https://huggingface.co/Felladrin/SmolLM2-135M-Heretic-RP), started from an abliterated fork of SmolLM2-135M-Instruct rather than from the row above.
+
+What rules a model out, in the order worth checking. **Architecture** first, since it is the only fatal one and the name misleads: OLMo 2 converts to `olmo2`, Granite 4 to `granitehybrid`, StableLM 2 to `stablelm`, LFM2 to `lfm2`, Pythia to `gptneox`, and none of those load whatever else they offer. Then **access and license**: Google's Gemma 3 checkpoints are genuine `gemma3` and would otherwise fit, but they need an access request and carry the Gemma license, and StableLM 2 and LFM2 attach commercial conditions. Then **size**, since much past 1B stops being practical on one consumer GPU. Missing ChatML is the only one of the four that is not fatal, and one missing token counts the same as three.
+
+Checking one that is not listed takes a single command. Convert it with llama.cpp's `convert_hf_to_gguf.py`, then:
+
+```sh
+deno run -A cli.ts inspect --model your-base.gguf --dump-tokenizer data/your-base.tokenizer.json
+```
+
+That prints the architecture, the exact `--resume` flags the checkpoint needs, and whether the vocab can drive `chat-corpus`. If the architecture is not one of the three, nothing else matters. The full recipe is in [agents.md](agents.md) under "Fine-tune a downloaded checkpoint".
+
 [agents.md](agents.md) is the full manual: recipes for every workflow, the invariants that waste a run when broken, what each failure message means, and the measured throughput. It's written for a coding agent, which happens to make it the fastest read for a person too.
 
 ## Commands
@@ -70,7 +102,8 @@ Every command has `--help`, and `deno run -A cli.ts help --json` dumps the whole
 
 Three, for now: `gemma3` (GQA + QK-norm, sandwich norms, GeGLU, sliding-window attention), `llama` (pre-norm GQA, SwiGLU, full attention, the SmolLM2 and TinyLlama shape) and `qwen3` (llama plus per-head QK-RMSNorm).
 
-Pick one with `--arch`. A checkpoint records its own, so resuming never needs it.
+Pick one with `--arch`. A checkpoint records its own, so resuming never needs it, and
+[Base models to fine-tune](#base-models-to-fine-tune) lists published checkpoints that load.
 
 Each architecture is a single file in `src/arch/` plus one line in the registry, and it gets the gradient checks and the export round-trip test for free. If you want to add one, it's documented in [docs/adding-an-architecture.md](docs/adding-an-architecture.md).
 
