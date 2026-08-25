@@ -1196,6 +1196,67 @@ that turns at a phase boundary is not evidence about the phase either. Anything 
 moves less than the excursions the series makes for no reason needs a shared-checkpoint
 counterfactual before it becomes a claim, and running one costs a night.
 
+### 17. The `llama` architecture rotated the wrong dimension pairs, and nothing in the suite noticed (2026-08-25)
+
+Fine-tuning SmolLM2-135M-Instruct-heretic opened with a masked training loss of 6.44 and a held-out
+loss of 6.18. For a 2T-token instruct model on ordinary chat data those numbers are not plausible,
+and the corpus was the obvious suspect. It was not the corpus.
+
+**The measurement that named it.** A file of `The cat sat on the mat.` repeated 400 times, scored
+by both engines on the same GGUF:
+
+| Engine                       | Perplexity |
+| ---------------------------- | ---------- |
+| llama.cpp `llama-perplexity` | 1.006      |
+| this trainer, `eval-loss`    | 5.73       |
+
+A model that cannot predict the 399th repetition of a sentence it has already seen 398 times is not
+reading its own context. Greedy continuation says the same thing in one line: from
+`The cat sat on the ...`, llama.cpp continues `mat. The cat sat on the mat.` and this engine
+continued `floor. The cat was sitting on the floor.` Locally fluent, no memory.
+
+**The cause.** llama.cpp maps `LLM_ARCH_LLAMA` to `LLAMA_ROPE_TYPE_NORM`, which rotates dimension
+pairs (2j, 2j+1). `rope()` here rotates (j, j+headDim/2), the NeoX convention. Both are the same
+rotation over a different row order, and `conversion/llama.py` in llama.cpp does exactly this
+reorder when it imports from Hugging Face, whose `LlamaAttention` uses the half-split form. So a
+converted checkpoint arrives in the interleaved order and this engine rotated it as though it were
+half-split. `src/arch/llama.ts` now reorders Q and K on load and back on export; `tests/llama-rope-layout.ts`
+pins the convention.
+
+Confirmation, same holdout and same knobs, before and after:
+
+| Measurement                              | Before | After |
+| ---------------------------------------- | ------ | ----- |
+| repeated-sentence perplexity             | 5.73   | 1.09  |
+| held-out loss, base checkpoint           | 6.18   | 2.73  |
+| training loss, first steps of the RP run | ~6.4   | ~2.4  |
+
+Greedy continuation now matches llama.cpp token for token on the repetition prompt.
+
+**Only `llama` was affected, and that is why it survived.** `gemma3` and `qwen3` are both NeoX in
+llama.cpp, so the shared `rope()` was already right for them, and every published model from this
+repo is one of those two: Minueza-3 is gemma3, LittleLamb is qwen3. `--arch llama` had never carried
+a released checkpoint.
+
+**What no test could see, and this is the part worth carrying forward.** The suite is built out of
+self-consistency checks, and this defect is self-consistent. `gpu-parity` compares the WebGPU
+backend against the CPU reference, and both share `rope()`, so they agreed exactly (the run banner
+printed |Δ|=0.0e+0 while the model was reading its context wrong). `gradcheck` compares analytic
+gradients against finite differences of the same forward pass, so a wrong-but-differentiable
+rotation checks out. `arch-roundtrip` exports and re-imports through this engine, and a reorder
+that is missing on both sides round-trips perfectly. Even the export contract held: llama.cpp
+loaded the file, reported the right shape, and generated readable text.
+
+Every one of those instruments compares the project against itself. None of them compares it
+against llama.cpp, which is the actual contract for a GGUF trainer, and the defect lived exactly in
+the gap. The new test pins the byte order against llama.cpp's convention explicitly rather than
+asserting a round trip, because a reorder that is merely self-consistent passes a round trip and
+still disagrees with the reference.
+
+The cheap version of that check is the one that found it: take a published checkpoint, score the
+same file with both engines, and compare. It costs a minute per architecture and it is now the
+thing to run first when a loss looks wrong.
+
 ## Explicitly not worth doing
 
 - **Guarded/clamped f16 compute**: 0.98x measured on attention at seq 4096-8192, plus

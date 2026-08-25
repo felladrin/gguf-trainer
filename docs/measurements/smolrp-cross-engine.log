@@ -1,0 +1,10 @@
+model: out/smollm2-heretic.f32.gguf
+
+-- this trainer --
+val loss 0.0893  ppl 1.09  (4 x 512 tok, held-out file, seed 1)  smollm2-heretic.f32.gguf
+
+-- llama.cpp --
+0.00.916.985 I Final estimate: PPL = 1.0063 +/- 0.00029
+
+Both should be near perplexity 1. A gap is a forward-pass disagreement,
+not a corpus problem: see docs/optimization.md lever 17.
