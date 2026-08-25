@@ -43,6 +43,53 @@ deno run -A cli.ts pretrain --data your.tokens --out out/continued.gguf \
   --hidden 640 --layers 12 --steps 5000 --seq-len 2048 --batch 8
 ```
 
+## Base models to fine-tune
+
+Any published checkpoint works as a starting point if it clears two gates.
+
+**It has to convert to one of the three architectures.** `inspect` reads `general.architecture` out
+of the GGUF and looks it up in the registry, so `gemma3`, `llama` and `qwen3` load and everything
+else does not. The name on the model card is not a reliable guide: Qwen2 and Qwen2.5 convert to a
+`qwen2` arch, and SmolLM3 converts to `smollm3`, so neither loads here despite Qwen3 and SmolLM2
+both being fine.
+
+**For chat or roleplay fine-tuning it also needs ChatML in its vocab.** `chat-corpus` aborts unless
+`<|im_start|>`, `<|im_end|>` and `<|endoftext|>` each encode as a single token. A base without them
+is still perfectly good for continued pretraining with `pretrain --resume`; it just cannot go
+through the SFT path.
+
+Verified against the Hugging Face API on 2026-08-25, smallest first:
+
+| Model                                                                               | `--arch` | Params | Chat fine-tune | Good for                                                                       |
+| :---------------------------------------------------------------------------------- | :------- | -----: | :------------- | :----------------------------------------------------------------------------- |
+| [Minueza-3-95M-Base](https://huggingface.co/Felladrin/Minueza-3-95M-Base)           | `gemma3` |  94.7M | yes            | the fastest loop, and the one trained by this repo                             |
+| [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M)                   | `llama`  |   135M | yes            | the best-trained tiny base; start here if you want a real result               |
+| [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) | `llama`  |   135M | yes            | same, already instruction-tuned, so SFT adds a register rather than the format |
+| [LittleLamb](https://huggingface.co/MultiverseComputingCAI/LittleLamb)              | `qwen3`  |   293M | yes            | the qwen3 option, and heavily trained for its size                             |
+| [SmolLM2-360M](https://huggingface.co/HuggingFaceTB/SmolLM2-360M)                   | `llama`  |   362M | yes            | a step up while still finishing overnight                                      |
+| [Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base)                      | `qwen3`  |   596M | yes            | about as large as this trainer is practical at                                 |
+| [TinyLlama_v1.1](https://huggingface.co/TinyLlama/TinyLlama_v1.1)                   | `llama`  |   1.1B | no             | continued pretraining only, and slow here; the no-ChatML case                  |
+
+All Apache-2.0 and none gated. Google's Gemma 3 checkpoints are `gemma3` and would otherwise fit,
+but they are access-gated and carry the Gemma licence rather than a permissive one, which makes
+them a poor first suggestion.
+
+Three of these have been taken end to end with this repo, so the recipe is not theoretical:
+[Minueza-3-95M-RP](https://huggingface.co/Felladrin/Minueza-3-95M-RP),
+[LittleLamb-293M-RP](https://huggingface.co/Felladrin/LittleLamb-293M-RP) and
+[SmolLM2-135M-Heretic-RP](https://huggingface.co/Felladrin/SmolLM2-135M-Heretic-RP).
+
+Evaluating one that is not listed takes a single command. Convert it with llama.cpp's
+`convert_hf_to_gguf.py`, then:
+
+```sh
+deno run -A cli.ts inspect --model your-base.gguf --dump-tokenizer data/your-base.tokenizer.json
+```
+
+That prints the architecture, the exact `--resume` flags the checkpoint needs, and whether the
+vocab can drive `chat-corpus`. If the architecture is not one of the three, nothing else matters.
+The full recipe is in [agents.md](agents.md) under "Fine-tune a downloaded checkpoint".
+
 [agents.md](agents.md) is the full manual: recipes for every workflow, the invariants that waste a run when broken, what each failure message means, and the measured throughput. It's written for a coding agent, which happens to make it the fastest read for a person too.
 
 ## Commands
@@ -70,7 +117,8 @@ Every command has `--help`, and `deno run -A cli.ts help --json` dumps the whole
 
 Three, for now: `gemma3` (GQA + QK-norm, sandwich norms, GeGLU, sliding-window attention), `llama` (pre-norm GQA, SwiGLU, full attention, the SmolLM2 and TinyLlama shape) and `qwen3` (llama plus per-head QK-RMSNorm).
 
-Pick one with `--arch`. A checkpoint records its own, so resuming never needs it.
+Pick one with `--arch`. A checkpoint records its own, so resuming never needs it, and
+[Base models to fine-tune](#base-models-to-fine-tune) lists published checkpoints that load.
 
 Each architecture is a single file in `src/arch/` plus one line in the registry, and it gets the gradient checks and the export round-trip test for free. If you want to add one, it's documented in [docs/adding-an-architecture.md](docs/adding-an-architecture.md).
 

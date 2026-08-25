@@ -222,7 +222,7 @@ cp out/base.gguf.optstate out/My-Model-95M.F32.gguf.optstate   # so others can c
 | `--arch`           | Shape                                                          | Compatible with                                |
 | ------------------ | -------------------------------------------------------------- | ---------------------------------------------- |
 | `gemma3` (default) | GQA + QK-norm, sandwich norms, GeGLU, sliding-window attention | google/gemma-3-*, Felladrin/Minueza-3-95M-Base |
-| `llama`            | pre-norm GQA, SwiGLU, one RoPE base, full attention            | SmolLM2, TinyLlama, Qwen2, Mistral             |
+| `llama`            | pre-norm GQA, SwiGLU, one RoPE base, full attention            | SmolLM2, TinyLlama, Mistral                    |
 | `qwen3`            | llama plus per-head QK-RMSNorm, head size free of the width    | Qwen3-0.6B, Qwen3-1.7B                         |
 
 Each one is a single file in `src/arch/` registered in `src/model/registry.ts`, and the CLI, the
