@@ -241,8 +241,9 @@ for (const arch of ARCHITECTURES) {
   const untiedGroups = untiedModel.paramGroups();
   const untiedGrouped = new Set([...untiedGroups.muon, ...untiedGroups.aux]);
   check(
-    "the untied output head is in an optimizer group",
-    untiedGrouped.size === untiedModel.params().length,
+    "the untied output head is in exactly one optimizer group",
+    untiedGrouped.size === untiedModel.params().length &&
+      untiedGroups.muon.length + untiedGroups.aux.length === untiedModel.params().length,
     `${
       untiedGroups.muon.length + untiedGroups.aux.length
     } grouped of ${untiedModel.params().length} params`,
