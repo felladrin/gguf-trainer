@@ -286,10 +286,17 @@ export const llama: Architecture<LlamaConfig> = {
       shape.headDim,
     );
     const nHeads = v.has("heads") ? v.num("heads") : base.nHeads;
+    const nKVHeads = v.has("kv-heads") ? v.num("kv-heads") : Math.max(1, Math.round(nHeads / 3));
+    if (nHeads % nKVHeads !== 0) {
+      throw new Error(
+        `--kv-heads ${nKVHeads} does not divide --heads ${nHeads}; ` +
+          `GQA needs a whole number of query heads per KV head`,
+      );
+    }
     return {
       ...base,
       nHeads,
-      nKVHeads: v.has("kv-heads") ? v.num("kv-heads") : Math.max(1, Math.round(nHeads / 3)),
+      nKVHeads,
       ffnDim: v.has("ffn-dim") ? v.num("ffn-dim") : base.ffnDim,
       ropeBase: v.has("rope-base") ? v.num("rope-base") : base.ropeBase,
       rmsEps: v.has("rms-eps") ? v.num("rms-eps") : base.rmsEps,

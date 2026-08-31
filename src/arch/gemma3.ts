@@ -217,18 +217,25 @@ export function gemma3Config(
   maxSeq = 8192,
   headDim = 64,
   slidingWindow = 1024,
+  heads?: number,
 ): Gemma3Config {
-  if (hiddenSize % (headDim * 2) !== 0) {
-    throw new Error(`hiddenSize ${hiddenSize} must be a multiple of headDim*2 (${headDim * 2})`);
+  // Only the DERIVED head count needs the width to divide: with an explicit
+  // --heads the attention block is nHeads * headDim wide and the oProj maps it
+  // back to hiddenSize, so the division is not required.
+  if (heads === undefined && hiddenSize % (headDim * 2) !== 0) {
+    throw new Error(
+      `hiddenSize ${hiddenSize} must be a multiple of headDim*2 (${headDim * 2}), ` +
+        `or pass --heads to set the query-head count directly`,
+    );
   }
-  const nHeads = hiddenSize / headDim;
+  const nHeads = heads ?? hiddenSize / headDim;
   return {
     arch: "gemma3",
     vocabSize,
     hiddenSize,
     nLayers,
     nHeads,
-    nKVHeads: nHeads / 2,
+    nKVHeads: Math.max(1, Math.round(nHeads / 2)),
     headDim,
     ffnDim: Math.round((hiddenSize * 4) / 32) * 32,
     ropeBase: 1_000_000,
@@ -316,15 +323,22 @@ export const gemma3: Architecture<Gemma3Config> = {
       shape.maxSeq,
       shape.headDim,
       v.num("window"),
+      v.has("heads") ? v.num("heads") : undefined,
     );
+    const nKVHeads = v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads;
+    if (base.nHeads % nKVHeads !== 0) {
+      throw new Error(
+        `--kv-heads ${nKVHeads} does not divide --heads ${base.nHeads}; ` +
+          `GQA needs a whole number of query heads per KV head`,
+      );
+    }
     return {
       ...base,
       swaPattern: v.num("swa-pattern"),
       ropeBase: v.has("rope-base") ? v.num("rope-base") : base.ropeBase,
       rmsEps: v.has("rms-eps") ? v.num("rms-eps") : base.rmsEps,
-      nHeads: v.has("heads") ? v.num("heads") : base.nHeads,
       ropeBaseLocal: v.num("rope-base-local"),
-      nKVHeads: v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads,
+      nKVHeads,
       ffnDim: v.has("ffn-dim") ? v.num("ffn-dim") : base.ffnDim,
       tieEmbeddings: !v.bool("untied-embeddings"),
     };

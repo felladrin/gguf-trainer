@@ -22,6 +22,7 @@ import { ARCHITECTURES } from "../src/model/registry.ts";
 import { loadModelFromGGUF } from "../src/export/load-gguf.ts";
 import { readGGUF } from "../src/gguf/gguf.ts";
 import { resumeFlags } from "../src/commands/inspect.ts";
+import { Values } from "../src/cli/args.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import type { ModelConfig } from "../src/model/arch.ts";
 
@@ -167,11 +168,14 @@ for (const arch of ARCHITECTURES) {
     typeof epsMismatch === "string" && epsMismatch.includes("rms-eps"),
     epsMismatch ?? "returned null",
   );
-  // The gate names a flag when it aborts; inspect must print that flag, or the
-  // user cannot satisfy a resume the gate refuses (#35, #36). vocab is the one
-  // exception: it comes from the tokenizer, not from a flag.
-  const gateLine = resumeFlags(readGGUF(ropeBytes));
-  const printed = new Set(gateLine.split(" ").filter((p) => p.startsWith("--")));
+  // The gate names a flag when it aborts; inspect must print that flag WITH THE
+  // CHECKPOINT'S VALUE next to it, or the user cannot satisfy a resume the gate
+  // refuses (#35, #36). vocab is the one exception: it comes from the tokenizer,
+  // not from a flag.
+  const gateLine = resumeFlags(
+    readGGUF(arch.exportGGUF(model, tok.export(), cfg, { quant: "f32" })),
+  );
+  const tokens = gateLine.split(" ");
   for (const [key, val] of Object.entries(C)) {
     if (typeof val !== "number") continue;
     // deno-lint-ignore no-explicit-any
@@ -179,12 +183,85 @@ for (const arch of ARCHITECTURES) {
     if (typeof named !== "string") continue;
     const flag = named.split(":")[0];
     check(
-      `the gate's --${flag} is a flag inspect prints`,
-      flag === "vocab" || printed.has(`--${flag}`),
+      `inspect prints the checkpoint's value next to --${flag}`,
+      flag === "vocab" ||
+        Math.fround(Number(tokens[tokens.indexOf(`--${flag}`) + 1])) === Math.fround(val),
       gateLine,
     );
   }
+
+  // GQA with a fractional group would train something llama.cpp cannot
+  // reproduce; the flags refuse it before any compute.
+  let gqaMsg = "";
+  try {
+    arch.configFromFlags(
+      {
+        vocabSize: C.vocabSize,
+        hiddenSize: C.hiddenSize,
+        nLayers: C.nLayers,
+        maxSeq: C.maxSeq,
+        headDim: C.headDim,
+      },
+      new Values(
+        new Map<string, string | number | boolean>([
+          ["heads", 8],
+          ["kv-heads", 3],
+          ["window", 64],
+          ["swa-pattern", 6],
+          ["rope-base-local", 10000],
+        ]),
+      ),
+    );
+  } catch (e) {
+    gqaMsg = (e as Error).message;
+  }
+  check(
+    "configFromFlags refuses --kv-heads that does not divide --heads",
+    gqaMsg.includes("8") && gqaMsg.includes("3"),
+    gqaMsg || "did not throw",
+  );
   if (arch.name === "gemma3") {
+    // A width that headDim*2 does not divide is unbuildable while the head
+    // count is derived, and buildable once --heads names it (the 270M shape:
+    // 640 hidden, 256 head-dim, 4 heads).
+    const wideShape = { vocabSize: 300, hiddenSize: 12, nLayers: 2, maxSeq: 64, headDim: 4 };
+    let wideMsg = "";
+    try {
+      arch.configFromFlags(
+        wideShape,
+        new Values(
+          new Map<string, string | number | boolean>([
+            ["window", 64],
+            ["swa-pattern", 6],
+            ["rope-base-local", 10000],
+          ]),
+        ),
+      );
+    } catch (e) {
+      wideMsg = (e as Error).message;
+    }
+    check(
+      "a derived head count still refuses an indivisible width, naming --heads",
+      wideMsg.includes("--heads"),
+      wideMsg || "did not throw",
+    );
+    const wide = arch.configFromFlags(
+      wideShape,
+      new Values(
+        new Map<string, string | number | boolean>([
+          ["heads", 3],
+          ["kv-heads", 1],
+          ["window", 64],
+          ["swa-pattern", 6],
+          ["rope-base-local", 10000],
+        ]),
+      ),
+    );
+    check(
+      "--heads unlocks the indivisible width",
+      wide.nHeads === 3 && wide.nKVHeads === 1,
+      `nHeads=${wide.nHeads} nKVHeads=${wide.nKVHeads}`,
+    );
     const wrongLocal = { ...C, ropeBaseLocal: C.ropeBaseLocal * 10 };
     const localMismatch = arch.configMatches(C, wrongLocal);
     check(

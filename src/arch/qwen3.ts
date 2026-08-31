@@ -266,9 +266,16 @@ export const qwen3: Architecture<Qwen3Config> = {
       shape.headDim,
       v.has("heads") ? v.num("heads") : undefined,
     );
+    const nKVHeads = v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads;
+    if (base.nHeads % nKVHeads !== 0) {
+      throw new Error(
+        `--kv-heads ${nKVHeads} does not divide --heads ${base.nHeads}; ` +
+          `GQA needs a whole number of query heads per KV head`,
+      );
+    }
     return {
       ...base,
-      nKVHeads: v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads,
+      nKVHeads,
       ffnDim: v.has("ffn-dim") ? v.num("ffn-dim") : base.ffnDim,
       ropeBase: v.has("rope-base") ? v.num("rope-base") : base.ropeBase,
       rmsEps: v.has("rms-eps") ? v.num("rms-eps") : base.rmsEps,
