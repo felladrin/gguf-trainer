@@ -278,6 +278,12 @@ const FLAGS: Flag[] = [
     describe: "gemma3: RoPE frequency base on the sliding-window layers",
   },
   {
+    name: "heads",
+    type: "number",
+    placeholder: "N",
+    describe: "query heads (default: hidden / head-dim)",
+  },
+  {
     name: "kv-heads",
     type: "number",
     placeholder: "N",
@@ -316,6 +322,7 @@ export const gemma3: Architecture<Gemma3Config> = {
       swaPattern: v.num("swa-pattern"),
       ropeBase: v.has("rope-base") ? v.num("rope-base") : base.ropeBase,
       rmsEps: v.has("rms-eps") ? v.num("rms-eps") : base.rmsEps,
+      nHeads: v.has("heads") ? v.num("heads") : base.nHeads,
       ropeBaseLocal: v.num("rope-base-local"),
       nKVHeads: v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads,
       ffnDim: v.has("ffn-dim") ? v.num("ffn-dim") : base.ffnDim,

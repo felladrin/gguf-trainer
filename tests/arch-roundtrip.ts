@@ -123,9 +123,8 @@ for (const arch of ARCHITECTURES) {
   const C = cfg as Record<string, any>;
   const withRope = { ...C, ropeBase: 12_345.6789 };
   const ropeModel = arch.build(withRope, mulberry32(8));
-  const ropeLoaded = loadModelFromGGUF(
-    arch.exportGGUF(ropeModel, tok.export(), withRope, { quant: "f32" }),
-  );
+  const ropeBytes = arch.exportGGUF(ropeModel, tok.export(), withRope, { quant: "f32" });
+  const ropeLoaded = loadModelFromGGUF(ropeBytes);
   // deno-lint-ignore no-explicit-any
   const loadedBase = (ropeLoaded.cfg as any).ropeBase;
   check(
@@ -169,17 +168,22 @@ for (const arch of ARCHITECTURES) {
     epsMismatch ?? "returned null",
   );
   // The gate names a flag when it aborts; inspect must print that flag, or the
-  // user cannot satisfy a resume the gate refuses (the #36 rms-eps bug).
-  const gateLine = resumeFlags(
-    readGGUF(arch.exportGGUF(ropeModel, tok.export(), withRope, { quant: "f32" })),
-  );
-  check(
-    "inspect prints the flags the gate names",
-    gateLine.includes("--rope-base") &&
-      gateLine.includes("--rms-eps") &&
-      (arch.name !== "gemma3" || gateLine.includes("--rope-base-local")),
-    gateLine,
-  );
+  // user cannot satisfy a resume the gate refuses (#35, #36). vocab is the one
+  // exception: it comes from the tokenizer, not from a flag.
+  const gateLine = resumeFlags(readGGUF(ropeBytes));
+  const printed = new Set(gateLine.split(" ").filter((p) => p.startsWith("--")));
+  for (const [key, val] of Object.entries(C)) {
+    if (typeof val !== "number") continue;
+    // deno-lint-ignore no-explicit-any
+    const named = arch.configMatches(C, { ...C, [key]: val * 2 + 1 } as any);
+    if (typeof named !== "string") continue;
+    const flag = named.split(":")[0];
+    check(
+      `the gate's --${flag} is a flag inspect prints`,
+      flag === "vocab" || printed.has(`--${flag}`),
+      gateLine,
+    );
+  }
   if (arch.name === "gemma3") {
     const wrongLocal = { ...C, ropeBaseLocal: C.ropeBaseLocal * 10 };
     const localMismatch = arch.configMatches(C, wrongLocal);
