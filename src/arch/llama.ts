@@ -47,6 +47,8 @@ import type { Flag, Values } from "../cli/args.ts";
 import {
   addMatrix,
   addVector,
+  assertWholeGQA,
+  defaultKVHeads,
   diffFields,
   metaNum,
   metaNumOr,
@@ -222,7 +224,7 @@ export function llamaConfig(
     hiddenSize,
     nLayers,
     nHeads,
-    nKVHeads: Math.max(1, Math.round(nHeads / 3)),
+    nKVHeads: defaultKVHeads(nHeads, 3),
     headDim,
     // Rounded to a multiple of 32 so q8_0/q4_0 never falls back to f16 here.
     ffnDim: Math.round((hiddenSize * 8 / 3) / 32) * 32,
@@ -244,7 +246,8 @@ const FLAGS: Flag[] = [
     name: "kv-heads",
     type: "number",
     placeholder: "N",
-    describe: "key/value heads for GQA (default: a third of the query heads)",
+    describe:
+      "key/value heads for GQA (default: a third of the query heads, rounded down to a divisor)",
   },
   {
     name: "ffn-dim",
@@ -286,10 +289,12 @@ export const llama: Architecture<LlamaConfig> = {
       shape.headDim,
     );
     const nHeads = v.has("heads") ? v.num("heads") : base.nHeads;
+    const nKVHeads = v.has("kv-heads") ? v.num("kv-heads") : defaultKVHeads(nHeads, 3);
+    assertWholeGQA(nHeads, nKVHeads);
     return {
       ...base,
       nHeads,
-      nKVHeads: v.has("kv-heads") ? v.num("kv-heads") : Math.max(1, Math.round(nHeads / 3)),
+      nKVHeads,
       ffnDim: v.has("ffn-dim") ? v.num("ffn-dim") : base.ffnDim,
       ropeBase: v.has("rope-base") ? v.num("rope-base") : base.ropeBase,
       rmsEps: v.has("rms-eps") ? v.num("rms-eps") : base.rmsEps,
@@ -435,6 +440,7 @@ export const llama: Architecture<LlamaConfig> = {
       { key: "headDim", flag: "head-dim" },
       { key: "ffnDim", flag: "ffn-dim" },
       { key: "maxSeq", flag: "max-seq" },
+      { key: "rmsEps", flag: "rms-eps" },
       { key: "ropeBase", flag: "rope-base" },
     ]);
   },

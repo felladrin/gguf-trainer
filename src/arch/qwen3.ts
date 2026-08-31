@@ -42,6 +42,8 @@ import type { Flag, Values } from "../cli/args.ts";
 import {
   addMatrix,
   addVector,
+  assertWholeGQA,
+  defaultKVHeads,
   diffFields,
   metaNum,
   metaNumOr,
@@ -202,7 +204,7 @@ export function qwen3Config(
     hiddenSize,
     nLayers,
     nHeads,
-    nKVHeads: Math.max(1, Math.round(nHeads / 2)),
+    nKVHeads: defaultKVHeads(nHeads, 2),
     headDim,
     // Rounded to a multiple of 32 so q8_0/q4_0 never falls back to f16 here.
     ffnDim: Math.round((hiddenSize * 3) / 32) * 32,
@@ -224,7 +226,8 @@ const FLAGS: Flag[] = [
     name: "kv-heads",
     type: "number",
     placeholder: "N",
-    describe: "key/value heads for GQA (qwen3 default: half the query heads)",
+    describe:
+      "key/value heads for GQA (qwen3 default: half the query heads, rounded down to a divisor)",
   },
   {
     name: "ffn-dim",
@@ -266,9 +269,11 @@ export const qwen3: Architecture<Qwen3Config> = {
       shape.headDim,
       v.has("heads") ? v.num("heads") : undefined,
     );
+    const nKVHeads = v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads;
+    assertWholeGQA(base.nHeads, nKVHeads);
     return {
       ...base,
-      nKVHeads: v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads,
+      nKVHeads,
       ffnDim: v.has("ffn-dim") ? v.num("ffn-dim") : base.ffnDim,
       ropeBase: v.has("rope-base") ? v.num("rope-base") : base.ropeBase,
       rmsEps: v.has("rms-eps") ? v.num("rms-eps") : base.rmsEps,
@@ -407,6 +412,7 @@ export const qwen3: Architecture<Qwen3Config> = {
       { key: "headDim", flag: "head-dim" },
       { key: "ffnDim", flag: "ffn-dim" },
       { key: "maxSeq", flag: "max-seq" },
+      { key: "rmsEps", flag: "rms-eps" },
       { key: "ropeBase", flag: "rope-base" },
     ]);
   },

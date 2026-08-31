@@ -12,7 +12,7 @@
 //   3. export -> loadWeights -> forward reproduces the original logits BIT FOR
 //      BIT at f32. Any tensor-name typo, transposed matrix or forgotten weight
 //      lands here.
-//   4. configMatches() rejects a shape (or RoPE base) that differs, naming the field.
+//   4. configMatches() rejects a shape, RoPE base or rms-eps that differs, naming the field.
 //
 // Quantized exports get the same treatment with a tolerance, because q8_0 is
 // where a wrong block layout hides.
@@ -20,6 +20,9 @@
 import { mulberry32 } from "../src/model/autograd.ts";
 import { ARCHITECTURES } from "../src/model/registry.ts";
 import { loadModelFromGGUF } from "../src/export/load-gguf.ts";
+import { readGGUF } from "../src/gguf/gguf.ts";
+import { resumeFlags } from "../src/commands/inspect.ts";
+import { Values } from "../src/cli/args.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import type { ModelConfig } from "../src/model/arch.ts";
 
@@ -114,15 +117,15 @@ for (const arch of ARCHITECTURES) {
     arch.configMatches(cfg as any, cfg as any) === null,
   );
 
-  // 6. the RoPE base is part of the resume gate: a checkpoint with a different
-  //    base must be refused and named, not silently trained at the flag default.
+  // 6. the RoPE base and rms-eps are part of the resume gate: a checkpoint
+  //    with different values must be refused and named, not silently trained
+  //    at the flag defaults.
   // deno-lint-ignore no-explicit-any
   const C = cfg as Record<string, any>;
   const withRope = { ...C, ropeBase: 12_345.6789 };
   const ropeModel = arch.build(withRope, mulberry32(8));
-  const ropeLoaded = loadModelFromGGUF(
-    arch.exportGGUF(ropeModel, tok.export(), withRope, { quant: "f32" }),
-  );
+  const ropeBytes = arch.exportGGUF(ropeModel, tok.export(), withRope, { quant: "f32" });
+  const ropeLoaded = loadModelFromGGUF(ropeBytes);
   // deno-lint-ignore no-explicit-any
   const loadedBase = (ropeLoaded.cfg as any).ropeBase;
   check(
@@ -156,7 +159,175 @@ for (const arch of ARCHITECTURES) {
     typeof ulpMismatch === "string" && ulpMismatch.includes("rope-base"),
     ulpMismatch ?? "returned null",
   );
+  const epsMismatch = arch.configMatches(
+    { ...C, rmsEps: 1e-5 },
+    { ...C, rmsEps: 2e-5 },
+  );
+  check(
+    "configMatches rejects a different rms-eps, naming the flag",
+    typeof epsMismatch === "string" && epsMismatch.includes("rms-eps"),
+    epsMismatch ?? "returned null",
+  );
+  // The gate names a flag when it aborts; inspect must print that flag WITH THE
+  // CHECKPOINT'S VALUE next to it, or the user cannot satisfy a resume the gate
+  // refuses (#35, #36). vocab is the one exception: it comes from the tokenizer,
+  // not from a flag.
+  const gateLine = resumeFlags(
+    readGGUF(arch.exportGGUF(model, tok.export(), cfg, { quant: "f32" })),
+  );
+  const tokens = gateLine.split(" ");
+  for (const [key, val] of Object.entries(C)) {
+    if (typeof val !== "number") continue;
+    // deno-lint-ignore no-explicit-any
+    const named = arch.configMatches(C, { ...C, [key]: val * 2 + 1 } as any);
+    if (typeof named !== "string") continue;
+    const flag = named.split(":")[0];
+    check(
+      `inspect prints the checkpoint's value next to --${flag}`,
+      flag === "vocab" ||
+        Math.fround(Number(tokens[tokens.indexOf(`--${flag}`) + 1])) === Math.fround(val),
+      gateLine,
+    );
+  }
+
+  // GQA with a fractional group would train something llama.cpp cannot
+  // reproduce; the flags refuse it before any compute.
+  let gqaMsg = "";
+  try {
+    arch.configFromFlags(
+      {
+        vocabSize: C.vocabSize,
+        hiddenSize: C.hiddenSize,
+        nLayers: C.nLayers,
+        maxSeq: C.maxSeq,
+        headDim: C.headDim,
+      },
+      new Values(
+        new Map<string, string | number | boolean>([
+          ["heads", 8],
+          ["kv-heads", 3],
+          ["window", 64],
+          ["swa-pattern", 6],
+          ["rope-base-local", 10000],
+        ]),
+      ),
+    );
+  } catch (e) {
+    gqaMsg = (e as Error).message;
+  }
+  check(
+    "configFromFlags refuses --kv-heads that does not divide --heads",
+    gqaMsg.includes("--kv-heads 3") && gqaMsg.includes("--heads 8"),
+    gqaMsg || "did not throw",
+  );
+
+  let zeroMsg = "";
+  try {
+    arch.configFromFlags(
+      {
+        vocabSize: C.vocabSize,
+        hiddenSize: C.hiddenSize,
+        nLayers: C.nLayers,
+        maxSeq: C.maxSeq,
+        headDim: C.headDim,
+      },
+      new Values(
+        new Map<string, string | number | boolean>([
+          ["heads", 0],
+          ["window", 64],
+          ["swa-pattern", 6],
+          ["rope-base-local", 10000],
+        ]),
+      ),
+    );
+  } catch (e) {
+    zeroMsg = (e as Error).message;
+  }
+  check(
+    "configFromFlags refuses --heads 0",
+    zeroMsg.includes("--heads 0"),
+    zeroMsg || "did not throw",
+  );
+
+  // The CLI's default shape (no --heads/--kv-heads) must keep whole GQA groups:
+  // the guard may only fire on flags the user actually passed, never on the
+  // derived default. 640 hidden gives 10 heads, where the divisor search must
+  // step down (floor(10/3)=3 does not divide 10), so a stubbed search fails here.
+  for (const hiddenDefault of [512, 640]) {
+    const defCfg = arch.configFromFlags(
+      {
+        vocabSize: C.vocabSize,
+        hiddenSize: hiddenDefault,
+        nLayers: 2,
+        maxSeq: 64,
+        headDim: 64,
+      },
+      new Values(
+        new Map<string, string | number | boolean>([
+          ["window", 64],
+          ["swa-pattern", 6],
+          ["rope-base-local", 10000],
+        ]),
+      ),
+    );
+    check(
+      `the default shape keeps whole GQA groups (hidden ${hiddenDefault})`,
+      defCfg.nHeads % defCfg.nKVHeads === 0,
+      `heads=${defCfg.nHeads} kv=${defCfg.nKVHeads}`,
+    );
+  }
   if (arch.name === "gemma3") {
+    // A width that headDim*2 does not divide is unbuildable while the head
+    // count is derived, and buildable once --heads names it (the 270M shape:
+    // 640 hidden, 256 head-dim, 4 heads). headDim 8 keeps the block genuinely
+    // wide (3 x 8 = 24 over a width of 12), so the q/o projections are too.
+    const wideShape = { vocabSize: 300, hiddenSize: 12, nLayers: 2, maxSeq: 64, headDim: 8 };
+    let wideMsg = "";
+    try {
+      arch.configFromFlags(
+        wideShape,
+        new Values(
+          new Map<string, string | number | boolean>([
+            ["window", 64],
+            ["swa-pattern", 6],
+            ["rope-base-local", 10000],
+          ]),
+        ),
+      );
+    } catch (e) {
+      wideMsg = (e as Error).message;
+    }
+    check(
+      "a derived head count still refuses an indivisible width, naming --heads",
+      wideMsg.includes("--heads"),
+      wideMsg || "did not throw",
+    );
+    const wide = arch.configFromFlags(
+      wideShape,
+      new Values(
+        new Map<string, string | number | boolean>([
+          ["heads", 3],
+          ["kv-heads", 1],
+          ["window", 64],
+          ["swa-pattern", 6],
+          ["rope-base-local", 10000],
+        ]),
+      ),
+    );
+    check(
+      "--heads unlocks the indivisible width",
+      wide.nHeads === 3 && wide.nKVHeads === 1,
+      `nHeads=${wide.nHeads} nKVHeads=${wide.nKVHeads}`,
+    );
+    // The wide block (nHeads * headDim != hidden) must stay countable, or a
+    // future gemma3 change that assumes square heads silently breaks it.
+    const wideModel = arch.build(wide, mulberry32(11));
+    const wideReal = wideModel.params().reduce((n, p) => n + p.size, 0);
+    check(
+      "paramCount matches the built wide model",
+      arch.paramCount(wide) === wideReal,
+      `declared ${arch.paramCount(wide)}, built ${wideReal}`,
+    );
     const wrongLocal = { ...C, ropeBaseLocal: C.ropeBaseLocal * 10 };
     const localMismatch = arch.configMatches(C, wrongLocal);
     check(

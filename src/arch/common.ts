@@ -159,3 +159,29 @@ export function diffFields<C>(
   }
   return null;
 }
+
+/**
+ * The largest divisor of nHeads no bigger than nHeads / ratio, so the derived
+ * KV-head count keeps the GQA groups whole. Math.round(nHeads / ratio) can
+ * miss: 8 query heads at 3:1 rounds to 3, and 8 % 3 is a group llama.cpp will
+ * not load.
+ */
+export function defaultKVHeads(nHeads: number, ratio: number): number {
+  for (let k = Math.max(1, Math.floor(nHeads / ratio)); k > 1; k--) {
+    if (nHeads % k === 0) return k;
+  }
+  return 1;
+}
+
+/** GQA with a fractional group trains something llama.cpp cannot reproduce. */
+export function assertWholeGQA(nHeads: number, nKVHeads: number): void {
+  if (nHeads < 1) {
+    throw new Error(`--heads ${nHeads} must be at least 1`);
+  }
+  if (nKVHeads < 1 || nHeads % nKVHeads !== 0) {
+    throw new Error(
+      `--kv-heads ${nKVHeads} does not divide --heads ${nHeads}; ` +
+        `GQA needs a whole number of query heads per KV head`,
+    );
+  }
+}

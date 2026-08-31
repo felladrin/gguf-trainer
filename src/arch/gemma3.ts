@@ -48,6 +48,8 @@ import type { Flag, Values } from "../cli/args.ts";
 import {
   addMatrix,
   addVector,
+  assertWholeGQA,
+  defaultKVHeads,
   diffFields,
   metaNum,
   ones,
@@ -217,18 +219,25 @@ export function gemma3Config(
   maxSeq = 8192,
   headDim = 64,
   slidingWindow = 1024,
+  heads?: number,
 ): Gemma3Config {
-  if (hiddenSize % (headDim * 2) !== 0) {
-    throw new Error(`hiddenSize ${hiddenSize} must be a multiple of headDim*2 (${headDim * 2})`);
+  // Only the DERIVED head count needs the width to divide: with an explicit
+  // --heads the attention block is nHeads * headDim wide and the oProj maps it
+  // back to hiddenSize, so the division is not required.
+  if (heads === undefined && hiddenSize % (headDim * 2) !== 0) {
+    throw new Error(
+      `hiddenSize ${hiddenSize} must be a multiple of headDim*2 (${headDim * 2}), ` +
+        `or pass --heads to set the query-head count directly`,
+    );
   }
-  const nHeads = hiddenSize / headDim;
+  const nHeads = heads ?? hiddenSize / headDim;
   return {
     arch: "gemma3",
     vocabSize,
     hiddenSize,
     nLayers,
     nHeads,
-    nKVHeads: nHeads / 2,
+    nKVHeads: defaultKVHeads(nHeads, 2),
     headDim,
     ffnDim: Math.round((hiddenSize * 4) / 32) * 32,
     ropeBase: 1_000_000,
@@ -266,16 +275,28 @@ const FLAGS: Flag[] = [
     describe: "RoPE frequency base on the dense layers (gemma3 default: 1e6)",
   },
   {
+    name: "rms-eps",
+    type: "number",
+    placeholder: "F",
+    describe: "RMSNorm epsilon (gemma3 default: 1e-6)",
+  },
+  {
     name: "rope-base-local",
     type: "number",
     default: 10_000,
     describe: "gemma3: RoPE frequency base on the sliding-window layers",
   },
   {
+    name: "heads",
+    type: "number",
+    placeholder: "N",
+    describe: "query heads (default: hidden / head-dim)",
+  },
+  {
     name: "kv-heads",
     type: "number",
     placeholder: "N",
-    describe: "key/value heads for GQA (default: half the query heads)",
+    describe: "key/value heads for GQA (default: half the query heads, rounded down to a divisor)",
   },
   {
     name: "ffn-dim",
@@ -304,13 +325,17 @@ export const gemma3: Architecture<Gemma3Config> = {
       shape.maxSeq,
       shape.headDim,
       v.num("window"),
+      v.has("heads") ? v.num("heads") : undefined,
     );
+    const nKVHeads = v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads;
+    assertWholeGQA(base.nHeads, nKVHeads);
     return {
       ...base,
       swaPattern: v.num("swa-pattern"),
       ropeBase: v.has("rope-base") ? v.num("rope-base") : base.ropeBase,
+      rmsEps: v.has("rms-eps") ? v.num("rms-eps") : base.rmsEps,
       ropeBaseLocal: v.num("rope-base-local"),
-      nKVHeads: v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads,
+      nKVHeads,
       ffnDim: v.has("ffn-dim") ? v.num("ffn-dim") : base.ffnDim,
       tieEmbeddings: !v.bool("untied-embeddings"),
     };
@@ -453,9 +478,9 @@ export const gemma3: Architecture<Gemma3Config> = {
       { key: "vocabSize", flag: "vocab" },
       { key: "hiddenSize", flag: "hidden" },
       { key: "nLayers", flag: "layers" },
-      // head-dim before heads: gemma3 derives nHeads from hidden / head-dim, so a
-      // wrong --head-dim must be reported as --head-dim and not as a flag this
-      // architecture does not even accept.
+      // head-dim before heads: when the head count is derived from
+      // hidden / head-dim, a wrong --head-dim is the cause, so report the
+      // flag the user actually set rather than the derived --heads.
       { key: "headDim", flag: "head-dim" },
       { key: "nHeads", flag: "heads" },
       { key: "nKVHeads", flag: "kv-heads" },
@@ -463,6 +488,7 @@ export const gemma3: Architecture<Gemma3Config> = {
       { key: "maxSeq", flag: "max-seq" },
       { key: "slidingWindow", flag: "window" },
       { key: "swaPattern", flag: "swa-pattern" },
+      { key: "rmsEps", flag: "rms-eps" },
       { key: "ropeBase", flag: "rope-base" },
       { key: "ropeBaseLocal", flag: "rope-base-local" },
     ]);

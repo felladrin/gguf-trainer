@@ -58,10 +58,9 @@ Violating any of these wastes a run. They are checked where possible; a few cann
    Every fine-tune must reuse the base's `tokenizer.json` byte for byte. `chat-corpus` aborts if the
    tokenizer lacks the ChatML specials; `tokenize` silently trains a new vocab if you point it at a
    prefix with no tokenizer beside it.
-2. **`--resume` requires an exact architecture match.** `--hidden`, `--layers`, `--head-dim`,
-   `--window`, `--rope-base` (gemma3 also `--rope-base-local`), `--max-seq` and the vocab must equal
-   the checkpoint's. A mismatch aborts before any compute and names the field. `inspect` prints the
-   correct flags.
+2. **`--resume` requires an exact architecture match.** Every field the resume gate covers must
+   equal the checkpoint's. A mismatch aborts before any compute and names the flag, and
+   `inspect` prints the correct flags in its resume line.
 3. **The optimizer sidecar is `<model>.gguf.optstate`.** Same directory, exact name. Missing means a
    cold optimizer, which re-warms momentum over the first few hundred steps rather than failing.
 4. **Compute is f32.** f16 operands overflow to NaN at these sizes (it reproduced at exactly the
