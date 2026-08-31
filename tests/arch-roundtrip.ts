@@ -227,6 +227,26 @@ for (const arch of ARCHITECTURES) {
   // A checkpoint with its own output head must carry the flag in its resume
   // line; the model has to be built untied for the export to write the head.
   const untiedModel = arch.build(untiedCfg, mulberry32(13));
+  // Captured before the export, the way the tied path does it: an export that
+  // mutated its source would otherwise be compared against a file written from
+  // the same mutation.
+  const untiedBefore = Float32Array.from(untiedModel.forward(ids).data);
+  // The head must be counted and grouped, or it silently never trains.
+  const untiedReal = untiedModel.params().reduce((n, p) => n + p.size, 0);
+  check(
+    "paramCount includes the untied output head",
+    arch.paramCount(untiedCfg) === untiedReal,
+    `declared ${arch.paramCount(untiedCfg)}, built ${untiedReal}`,
+  );
+  const untiedGroups = untiedModel.paramGroups();
+  const untiedGrouped = new Set([...untiedGroups.muon, ...untiedGroups.aux]);
+  check(
+    "the untied output head is in an optimizer group",
+    untiedGrouped.size === untiedModel.params().length,
+    `${
+      untiedGroups.muon.length + untiedGroups.aux.length
+    } grouped of ${untiedModel.params().length} params`,
+  );
   const untiedBytes = arch.exportGGUF(untiedModel, tok.export(), untiedCfg, { quant: "f32" });
   const untiedLine = resumeFlags(readGGUF(untiedBytes));
   check(
@@ -243,7 +263,6 @@ for (const arch of ARCHITECTURES) {
     (untiedReloaded.cfg as any).tieEmbeddings === false,
     JSON.stringify((untiedReloaded.cfg as any).tieEmbeddings),
   );
-  const untiedBefore = Float32Array.from(untiedModel.forward(ids).data);
   const untiedAfter = untiedReloaded.model.forward(ids).data;
   let headDiff = 0;
   for (let i = 0; i < untiedBefore.length; i++) {
