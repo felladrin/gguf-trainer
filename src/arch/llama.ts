@@ -246,7 +246,8 @@ const FLAGS: Flag[] = [
     name: "kv-heads",
     type: "number",
     placeholder: "N",
-    describe: "key/value heads for GQA (default: a third of the query heads)",
+    describe:
+      "key/value heads for GQA (default: a third of the query heads, rounded down to a divisor)",
   },
   {
     name: "ffn-dim",

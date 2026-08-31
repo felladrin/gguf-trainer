@@ -221,29 +221,67 @@ for (const arch of ARCHITECTURES) {
     gqaMsg || "did not throw",
   );
 
-  // The CLI's default shape (512 hidden, 64 head-dim, no --heads/--kv-heads)
-  // must keep whole GQA groups: the guard may only fire on flags the user
-  // actually passed, never on the derived default.
-  const defCfg = arch.configFromFlags(
-    { vocabSize: C.vocabSize, hiddenSize: 512, nLayers: 2, maxSeq: 64, headDim: 64 },
-    new Values(
-      new Map<string, string | number | boolean>([
-        ["window", 64],
-        ["swa-pattern", 6],
-        ["rope-base-local", 10000],
-      ]),
-    ),
-  );
+  let zeroMsg = "";
+  try {
+    arch.configFromFlags(
+      {
+        vocabSize: C.vocabSize,
+        hiddenSize: C.hiddenSize,
+        nLayers: C.nLayers,
+        maxSeq: C.maxSeq,
+        headDim: C.headDim,
+      },
+      new Values(
+        new Map<string, string | number | boolean>([
+          ["heads", 0],
+          ["window", 64],
+          ["swa-pattern", 6],
+          ["rope-base-local", 10000],
+        ]),
+      ),
+    );
+  } catch (e) {
+    zeroMsg = (e as Error).message;
+  }
   check(
-    "the default shape keeps whole GQA groups",
-    defCfg.nHeads % defCfg.nKVHeads === 0,
-    `heads=${defCfg.nHeads} kv=${defCfg.nKVHeads}`,
+    "configFromFlags refuses --heads 0",
+    zeroMsg.includes("--heads 0"),
+    zeroMsg || "did not throw",
   );
+
+  // The CLI's default shape (no --heads/--kv-heads) must keep whole GQA groups:
+  // the guard may only fire on flags the user actually passed, never on the
+  // derived default. 640 hidden gives 10 heads, where the divisor search must
+  // step down (floor(10/3)=3 does not divide 10), so a stubbed search fails here.
+  for (const hiddenDefault of [512, 640]) {
+    const defCfg = arch.configFromFlags(
+      {
+        vocabSize: C.vocabSize,
+        hiddenSize: hiddenDefault,
+        nLayers: 2,
+        maxSeq: 64,
+        headDim: 64,
+      },
+      new Values(
+        new Map<string, string | number | boolean>([
+          ["window", 64],
+          ["swa-pattern", 6],
+          ["rope-base-local", 10000],
+        ]),
+      ),
+    );
+    check(
+      `the default shape keeps whole GQA groups (hidden ${hiddenDefault})`,
+      defCfg.nHeads % defCfg.nKVHeads === 0,
+      `heads=${defCfg.nHeads} kv=${defCfg.nKVHeads}`,
+    );
+  }
   if (arch.name === "gemma3") {
     // A width that headDim*2 does not divide is unbuildable while the head
     // count is derived, and buildable once --heads names it (the 270M shape:
-    // 640 hidden, 256 head-dim, 4 heads).
-    const wideShape = { vocabSize: 300, hiddenSize: 12, nLayers: 2, maxSeq: 64, headDim: 4 };
+    // 640 hidden, 256 head-dim, 4 heads). headDim 8 keeps the block genuinely
+    // wide (3 x 8 = 24 over a width of 12), so the q/o projections are too.
+    const wideShape = { vocabSize: 300, hiddenSize: 12, nLayers: 2, maxSeq: 64, headDim: 8 };
     let wideMsg = "";
     try {
       arch.configFromFlags(

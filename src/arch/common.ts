@@ -175,6 +175,9 @@ export function defaultKVHeads(nHeads: number, ratio: number): number {
 
 /** GQA with a fractional group trains something llama.cpp cannot reproduce. */
 export function assertWholeGQA(nHeads: number, nKVHeads: number): void {
+  if (nHeads < 1) {
+    throw new Error(`--heads ${nHeads} must be at least 1`);
+  }
   if (nKVHeads < 1 || nHeads % nKVHeads !== 0) {
     throw new Error(
       `--kv-heads ${nKVHeads} does not divide --heads ${nHeads}; ` +
