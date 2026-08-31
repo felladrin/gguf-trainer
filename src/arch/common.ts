@@ -130,6 +130,19 @@ export function tensorLoader(g: GGUFFile): (name: string, dst: Tensor) => void {
 }
 
 /**
+ * Two config fields match. GGUF stores floats as f32 and a flag value is f64,
+ * so compare what the file can actually hold: --rope-base 12345.6789 comes back
+ * as its f32 rounding and would never be `===`. fround is that exact
+ * transformation, with no threshold to defend; integers below 2^24 stay exact
+ * under it, so the shape fields keep rejecting every difference.
+ */
+function fieldsMatch(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  return typeof a === "number" && typeof b === "number" &&
+    Math.fround(a) === Math.fround(b);
+}
+
+/**
  * The generic shape check behind every `configMatches`: compare the listed
  * fields and report the first difference in the terms the CLI flags use.
  */
@@ -139,8 +152,9 @@ export function diffFields<C>(
   fields: { key: keyof C; flag: string }[],
 ): string | null {
   for (const { key, flag } of fields) {
-    if (built[key] !== checkpoint[key]) {
-      return `${flag}: built ${String(built[key])} vs checkpoint ${String(checkpoint[key])}`;
+    const a = built[key], b = checkpoint[key];
+    if (!fieldsMatch(a, b)) {
+      return `${flag}: built ${String(a)} vs checkpoint ${String(b)}`;
     }
   }
   return null;

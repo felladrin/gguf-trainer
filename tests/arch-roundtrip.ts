@@ -12,7 +12,7 @@
 //   3. export -> loadWeights -> forward reproduces the original logits BIT FOR
 //      BIT at f32. Any tensor-name typo, transposed matrix or forgotten weight
 //      lands here.
-//   4. configMatches() rejects a shape that differs, naming the field.
+//   4. configMatches() rejects a shape (or RoPE base) that differs, naming the field.
 //
 // Quantized exports get the same treatment with a tolerance, because q8_0 is
 // where a wrong block layout hides.
@@ -74,8 +74,8 @@ for (const arch of ARCHITECTURES) {
     const b = cfg as unknown as Record<string, unknown>;
     const mismatched = Object.keys(b).filter((k) => {
       const x = a[k], y = b[k];
-      if (typeof y === "number" && !Number.isInteger(y)) {
-        return Math.abs(Number(x) - y) > 1e-6 * Math.abs(y);
+      if (typeof x === "number" && typeof y === "number") {
+        return Math.fround(Number(x)) !== Math.fround(y);
       }
       return x !== y;
     });
@@ -113,6 +113,58 @@ for (const arch of ARCHITECTURES) {
     // deno-lint-ignore no-explicit-any
     arch.configMatches(cfg as any, cfg as any) === null,
   );
+
+  // 6. the RoPE base is part of the resume gate: a checkpoint with a different
+  //    base must be refused and named, not silently trained at the flag default.
+  // deno-lint-ignore no-explicit-any
+  const C = cfg as Record<string, any>;
+  const withRope = { ...C, ropeBase: 12_345.6789 };
+  const ropeModel = arch.build(withRope, mulberry32(8));
+  const ropeLoaded = loadModelFromGGUF(
+    arch.exportGGUF(ropeModel, tok.export(), withRope, { quant: "f32" }),
+  );
+  // deno-lint-ignore no-explicit-any
+  const loadedBase = (ropeLoaded.cfg as any).ropeBase;
+  check(
+    "non-integer rope-base survives export and still matches (f32 rounding)",
+    // deno-lint-ignore no-explicit-any
+    arch.configMatches(withRope as any, ropeLoaded.cfg as any) === null,
+    `flag ${withRope.ropeBase} vs file ${loadedBase}`,
+  );
+  const wrongRope = { ...C, ropeBase: C.ropeBase * 10 };
+  const ropeMismatch = arch.configMatches(C, wrongRope);
+  check(
+    "configMatches rejects a different rope-base, naming the flag",
+    typeof ropeMismatch === "string" && ropeMismatch.includes("rope-base"),
+    ropeMismatch ?? "returned null",
+  );
+  const intMismatch = arch.configMatches(
+    { ...C, ropeBase: 1_000_000 },
+    { ...C, ropeBase: 1_000_001 },
+  );
+  check(
+    "configMatches rejects an integer rope-base difference of one",
+    typeof intMismatch === "string" && intMismatch.includes("rope-base"),
+    intMismatch ?? "returned null",
+  );
+  const ulpMismatch = arch.configMatches(
+    { ...C, ropeBase: 1e8 },
+    { ...C, ropeBase: 1e8 + 8 },
+  );
+  check(
+    "configMatches still rejects one f32 ulp apart at 1e8",
+    typeof ulpMismatch === "string" && ulpMismatch.includes("rope-base"),
+    ulpMismatch ?? "returned null",
+  );
+  if (arch.name === "gemma3") {
+    const wrongLocal = { ...C, ropeBaseLocal: C.ropeBaseLocal * 10 };
+    const localMismatch = arch.configMatches(C, wrongLocal);
+    check(
+      "configMatches rejects a different rope-base-local, naming the flag",
+      typeof localMismatch === "string" && localMismatch.includes("rope-base-local"),
+      localMismatch ?? "returned null",
+    );
+  }
 }
 
 console.log(
