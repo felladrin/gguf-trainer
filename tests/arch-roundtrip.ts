@@ -190,10 +190,13 @@ for (const arch of ARCHITECTURES) {
     const flag = named.split(":")[0];
     if (typeof val === "boolean") {
       // A boolean flag prints only on the side it sets; the default side is
-      // satisfied by passing nothing, so the line must NOT carry it here.
+      // satisfied by passing nothing. The message's built side is C in the
+      // flag's sense (diffFields' invert), which is exactly the condition for
+      // this line to need the flag, so the polarity is read, not assumed.
+      const builtSide = named.split(" ")[2];
       check(
         `--${flag} prints exactly when the checkpoint needs it`,
-        flag === "vocab" || printed.has(`--${flag}`) === (val === false),
+        printed.has(`--${flag}`) === (builtSide === "true"),
         gateLine,
       );
       continue;
@@ -224,13 +227,32 @@ for (const arch of ARCHITECTURES) {
   // A checkpoint with its own output head must carry the flag in its resume
   // line; the model has to be built untied for the export to write the head.
   const untiedModel = arch.build(untiedCfg, mulberry32(13));
-  const untiedLine = resumeFlags(
-    readGGUF(arch.exportGGUF(untiedModel, tok.export(), untiedCfg, { quant: "f32" })),
-  );
+  const untiedBytes = arch.exportGGUF(untiedModel, tok.export(), untiedCfg, { quant: "f32" });
+  const untiedLine = resumeFlags(readGGUF(untiedBytes));
   check(
     "inspect prints --untied-embeddings for a checkpoint with its own output head",
     untiedLine.includes("--untied-embeddings"),
     untiedLine,
+  );
+  // The head must come back: the bit-exact reload check above only runs on the
+  // tied config, so this is the one that loads an untied output.weight.
+  const untiedReloaded = loadModelFromGGUF(untiedBytes);
+  // deno-lint-ignore no-explicit-any
+  check(
+    "tieEmbeddings: false round-trips through configFromGGUF",
+    (untiedReloaded.cfg as any).tieEmbeddings === false,
+    JSON.stringify((untiedReloaded.cfg as any).tieEmbeddings),
+  );
+  const untiedBefore = Float32Array.from(untiedModel.forward(ids).data);
+  const untiedAfter = untiedReloaded.model.forward(ids).data;
+  let headDiff = 0;
+  for (let i = 0; i < untiedBefore.length; i++) {
+    headDiff = Math.max(headDiff, Math.abs(untiedBefore[i] - untiedAfter[i]));
+  }
+  check(
+    "an untied output head survives export and reload",
+    headDiff === 0,
+    `maxDiff=${headDiff.toExponential(2)}`,
   );
 
   // GQA with a fractional group would train something llama.cpp cannot

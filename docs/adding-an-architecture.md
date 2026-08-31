@@ -84,8 +84,8 @@ resume line.** For an arch-specific field that means its flag in your `flags` li
 that sets a side (like `--untied-embeddings`) gets a check that prints it only when the
 checkpoint needs it; the shape flags (`--hidden`, `--layers`, `--head-dim`, `--max-seq`) come from
 `pretrain` and are already printed. A gated field missing either is an abort the user cannot
-satisfy, and a flag without a gated field is a silent mismatch that trains on the wrong value
-(the #35 RoPE base was the first half; #36's rms-eps was the second). `vocab` is the one
+satisfy (#36's gemma3 `--rms-eps` flag), and a flag without a gated field is a silent mismatch
+that trains on the wrong value (#35's RoPE base, #37's untied-embeddings). `vocab` is the one
 exception: it comes from the tokenizer, not from a flag.
 
 **Shared flag names must mean the same thing.** `--kv-heads` and `--ffn-dim` already exist; reuse

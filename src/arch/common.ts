@@ -149,12 +149,16 @@ function fieldsMatch(a: unknown, b: unknown): boolean {
 export function diffFields<C>(
   built: C,
   checkpoint: C,
-  fields: { key: keyof C; flag: string }[],
+  fields: { key: keyof C; flag: string; invert?: boolean }[],
 ): string | null {
-  for (const { key, flag } of fields) {
+  for (const { key, flag, invert } of fields) {
     const a = built[key], b = checkpoint[key];
     if (!fieldsMatch(a, b)) {
-      return `${flag}: built ${String(a)} vs checkpoint ${String(b)}`;
+      // The flag may name the negation of the field (--untied-embeddings vs
+      // tieEmbeddings); show each value in the flag's sense so the message
+      // reads as the action to take.
+      const show = (x: unknown) => String(invert ? !x : x);
+      return `${flag}: built ${show(a)} vs checkpoint ${show(b)}`;
     }
   }
   return null;
