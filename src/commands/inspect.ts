@@ -151,6 +151,11 @@ export function resumeFlags(g: GGUFFile): string {
       parts.push(`--${flag} ${cfg[key]}`);
     }
   }
+  // Boolean knobs print only on the side the flag sets: tied is the default, so
+  // a checkpoint with its own output head is the one that needs the flag.
+  if (cfg.tieEmbeddings === false && owned.has("untied-embeddings")) {
+    parts.push("--untied-embeddings");
+  }
   return parts.join(" ");
 }
 

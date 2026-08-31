@@ -442,6 +442,7 @@ export const llama: Architecture<LlamaConfig> = {
       { key: "maxSeq", flag: "max-seq" },
       { key: "rmsEps", flag: "rms-eps" },
       { key: "ropeBase", flag: "rope-base" },
+      { key: "tieEmbeddings", flag: "untied-embeddings", invert: true },
     ]);
   },
 };

@@ -414,6 +414,7 @@ export const qwen3: Architecture<Qwen3Config> = {
       { key: "maxSeq", flag: "max-seq" },
       { key: "rmsEps", flag: "rms-eps" },
       { key: "ropeBase", flag: "rope-base" },
+      { key: "tieEmbeddings", flag: "untied-embeddings", invert: true },
     ]);
   },
 };
