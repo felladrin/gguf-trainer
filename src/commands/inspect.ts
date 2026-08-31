@@ -73,6 +73,14 @@ async function run(v: Values) {
   for (const t of g.tensors) params += t.dims.reduce((a, b) => a * b, 1);
 
   if (v.bool("json")) {
+    // The scripts that drive a resume off --json need the same flags the text
+    // branch prints; the gate that consumes them refuses to guess them.
+    let resume: string | undefined;
+    try {
+      resume = resumeFlags(g);
+    } catch {
+      resume = undefined;
+    }
     console.log(JSON.stringify(
       {
         file: path,
@@ -85,6 +93,7 @@ async function run(v: Values) {
           ? g.tensors.map((t) => ({ name: t.name, dims: t.dims, type: t.type }))
           : undefined,
         dumpTokenizer: dumped,
+        resume,
       },
       null,
       2,
