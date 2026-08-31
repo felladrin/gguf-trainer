@@ -78,10 +78,11 @@ artifact of init-0 weights; adding it here would double-count.
 rather than guessing, and write `attention.key_length` whenever `head_dim * n_heads != hidden`, or
 llama.cpp will infer the wrong head size.
 
-**Every field `configMatches` gates needs its flag in `flags`.** The resume gate aborts and names
-the flag, and `inspect` only prints a flag your `flags` list declares. A gated field without a
-flag is an abort the user cannot satisfy, and a flag without a gated field is a silent mismatch
-that trains on the wrong value (the #35 RoPE base was exactly that).
+**Every field `configMatches` gates needs its flag in `flags`, and its flag in the `optional`
+list of `resumeFlags` in `src/commands/inspect.ts`.** The resume gate aborts and names the flag,
+and `inspect` prints only the flags it knows about. A gated field missing either is an abort the
+user cannot satisfy, and a flag without a gated field is a silent mismatch that trains on the
+wrong value (the #35 RoPE base was the first half; #36's rms-eps was the second).
 
 **Shared flag names must mean the same thing.** `--kv-heads` and `--ffn-dim` already exist; reuse
 them if they mean what you think. Do not give a shared flag a `default` in your arch file: the CLI

@@ -266,6 +266,12 @@ const FLAGS: Flag[] = [
     describe: "RoPE frequency base on the dense layers (gemma3 default: 1e6)",
   },
   {
+    name: "rms-eps",
+    type: "number",
+    placeholder: "F",
+    describe: "RMSNorm epsilon (gemma3 default: 1e-6)",
+  },
+  {
     name: "rope-base-local",
     type: "number",
     default: 10_000,
@@ -309,6 +315,7 @@ export const gemma3: Architecture<Gemma3Config> = {
       ...base,
       swaPattern: v.num("swa-pattern"),
       ropeBase: v.has("rope-base") ? v.num("rope-base") : base.ropeBase,
+      rmsEps: v.has("rms-eps") ? v.num("rms-eps") : base.rmsEps,
       ropeBaseLocal: v.num("rope-base-local"),
       nKVHeads: v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads,
       ffnDim: v.has("ffn-dim") ? v.num("ffn-dim") : base.ffnDim,
@@ -463,6 +470,7 @@ export const gemma3: Architecture<Gemma3Config> = {
       { key: "maxSeq", flag: "max-seq" },
       { key: "slidingWindow", flag: "window" },
       { key: "swaPattern", flag: "swa-pattern" },
+      { key: "rmsEps", flag: "rms-eps" },
       { key: "ropeBase", flag: "rope-base" },
       { key: "ropeBaseLocal", flag: "rope-base-local" },
     ]);

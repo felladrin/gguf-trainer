@@ -126,7 +126,7 @@ async function run(v: Values) {
  * The exact flags that rebuild this checkpoint's shape, derived from its own
  * config so a new architecture gets this for free.
  */
-function resumeFlags(g: GGUFFile): string {
+export function resumeFlags(g: GGUFFile): string {
   const arch = archFromGGUF(g);
   // deno-lint-ignore no-explicit-any
   const cfg = arch.configFromGGUF(g) as any;
@@ -139,6 +139,7 @@ function resumeFlags(g: GGUFFile): string {
     ["window", "slidingWindow"],
     ["swa-pattern", "swaPattern"],
     ["max-seq", "maxSeq"],
+    ["rms-eps", "rmsEps"],
     ["rope-base", "ropeBase"],
     ["rope-base-local", "ropeBaseLocal"],
   ];

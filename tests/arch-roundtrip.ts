@@ -12,7 +12,7 @@
 //   3. export -> loadWeights -> forward reproduces the original logits BIT FOR
 //      BIT at f32. Any tensor-name typo, transposed matrix or forgotten weight
 //      lands here.
-//   4. configMatches() rejects a shape (or RoPE base) that differs, naming the field.
+//   4. configMatches() rejects a shape, RoPE base or rms-eps that differs, naming the field.
 //
 // Quantized exports get the same treatment with a tolerance, because q8_0 is
 // where a wrong block layout hides.
@@ -20,6 +20,8 @@
 import { mulberry32 } from "../src/model/autograd.ts";
 import { ARCHITECTURES } from "../src/model/registry.ts";
 import { loadModelFromGGUF } from "../src/export/load-gguf.ts";
+import { readGGUF } from "../src/gguf/gguf.ts";
+import { resumeFlags } from "../src/commands/inspect.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import type { ModelConfig } from "../src/model/arch.ts";
 
@@ -114,8 +116,9 @@ for (const arch of ARCHITECTURES) {
     arch.configMatches(cfg as any, cfg as any) === null,
   );
 
-  // 6. the RoPE base is part of the resume gate: a checkpoint with a different
-  //    base must be refused and named, not silently trained at the flag default.
+  // 6. the RoPE base and rms-eps are part of the resume gate: a checkpoint
+  //    with different values must be refused and named, not silently trained
+  //    at the flag defaults.
   // deno-lint-ignore no-explicit-any
   const C = cfg as Record<string, any>;
   const withRope = { ...C, ropeBase: 12_345.6789 };
@@ -155,6 +158,27 @@ for (const arch of ARCHITECTURES) {
     "configMatches still rejects one f32 ulp apart at 1e8",
     typeof ulpMismatch === "string" && ulpMismatch.includes("rope-base"),
     ulpMismatch ?? "returned null",
+  );
+  const epsMismatch = arch.configMatches(
+    { ...C, rmsEps: 1e-5 },
+    { ...C, rmsEps: 2e-5 },
+  );
+  check(
+    "configMatches rejects a different rms-eps, naming the flag",
+    typeof epsMismatch === "string" && epsMismatch.includes("rms-eps"),
+    epsMismatch ?? "returned null",
+  );
+  // The gate names a flag when it aborts; inspect must print that flag, or the
+  // user cannot satisfy a resume the gate refuses (the #36 rms-eps bug).
+  const gateLine = resumeFlags(
+    readGGUF(arch.exportGGUF(ropeModel, tok.export(), withRope, { quant: "f32" })),
+  );
+  check(
+    "inspect prints the flags the gate names",
+    gateLine.includes("--rope-base") &&
+      gateLine.includes("--rms-eps") &&
+      (arch.name !== "gemma3" || gateLine.includes("--rope-base-local")),
+    gateLine,
   );
   if (arch.name === "gemma3") {
     const wrongLocal = { ...C, ropeBaseLocal: C.ropeBaseLocal * 10 };

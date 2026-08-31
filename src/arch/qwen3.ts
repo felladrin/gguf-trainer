@@ -407,6 +407,7 @@ export const qwen3: Architecture<Qwen3Config> = {
       { key: "headDim", flag: "head-dim" },
       { key: "ffnDim", flag: "ffn-dim" },
       { key: "maxSeq", flag: "max-seq" },
+      { key: "rmsEps", flag: "rms-eps" },
       { key: "ropeBase", flag: "rope-base" },
     ]);
   },
