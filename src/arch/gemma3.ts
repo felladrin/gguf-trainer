@@ -491,6 +491,7 @@ export const gemma3: Architecture<Gemma3Config> = {
       { key: "rmsEps", flag: "rms-eps" },
       { key: "ropeBase", flag: "rope-base" },
       { key: "ropeBaseLocal", flag: "rope-base-local" },
+      { key: "tieEmbeddings", flag: "untied-embeddings" },
     ]);
   },
 };

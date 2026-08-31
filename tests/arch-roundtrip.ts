@@ -12,7 +12,8 @@
 //   3. export -> loadWeights -> forward reproduces the original logits BIT FOR
 //      BIT at f32. Any tensor-name typo, transposed matrix or forgotten weight
 //      lands here.
-//   4. configMatches() rejects a shape, RoPE base or rms-eps that differs, naming the field.
+//   4. configMatches() rejects a shape, RoPE base, rms-eps or tied embeddings
+//      that differ, naming the flag.
 //
 // Quantized exports get the same treatment with a tolerance, because q8_0 is
 // where a wrong block layout hides.
@@ -117,9 +118,9 @@ for (const arch of ARCHITECTURES) {
     arch.configMatches(cfg as any, cfg as any) === null,
   );
 
-  // 6. the RoPE base and rms-eps are part of the resume gate: a checkpoint
-  //    with different values must be refused and named, not silently trained
-  //    at the flag defaults.
+  // 6. the RoPE base, rms-eps and tied embeddings are part of the resume gate:
+  //    a checkpoint with different values must be refused and named, not
+  //    silently trained at the flag defaults.
   // deno-lint-ignore no-explicit-any
   const C = cfg as Record<string, any>;
   const withRope = { ...C, ropeBase: 12_345.6789 };
@@ -176,12 +177,27 @@ for (const arch of ARCHITECTURES) {
     readGGUF(arch.exportGGUF(model, tok.export(), cfg, { quant: "f32" })),
   );
   const tokens = gateLine.split(" ");
+  const printed = new Set(tokens.filter((p) => p.startsWith("--")));
   for (const [key, val] of Object.entries(C)) {
-    if (typeof val !== "number") continue;
+    if (typeof val !== "number" && typeof val !== "boolean") continue;
     // deno-lint-ignore no-explicit-any
-    const named = arch.configMatches(C, { ...C, [key]: val * 2 + 1 } as any);
+    const named = arch.configMatches(
+      C,
+      // deno-lint-ignore no-explicit-any
+      { ...C, [key]: typeof val === "boolean" ? !val : val * 2 + 1 } as any,
+    );
     if (typeof named !== "string") continue;
     const flag = named.split(":")[0];
+    if (typeof val === "boolean") {
+      // A boolean flag prints only on the side it sets; the default side is
+      // satisfied by passing nothing, so the line must NOT carry it here.
+      check(
+        `--${flag} prints exactly when the checkpoint needs it`,
+        flag === "vocab" || printed.has(`--${flag}`) === (val === false),
+        gateLine,
+      );
+      continue;
+    }
     check(
       `inspect prints the checkpoint's value next to --${flag}`,
       flag === "vocab" ||
@@ -189,6 +205,33 @@ for (const arch of ARCHITECTURES) {
       gateLine,
     );
   }
+
+  // The gate is symmetric: it must name the flag whichever side is untied.
+  // deno-lint-ignore no-explicit-any
+  const untiedCfg = { ...C, tieEmbeddings: !C.tieEmbeddings } as any;
+  const tieMismatch = arch.configMatches(C, untiedCfg);
+  check(
+    "configMatches rejects a different tieEmbeddings, naming the flag",
+    typeof tieMismatch === "string" && tieMismatch.includes("untied-embeddings"),
+    tieMismatch ?? "returned null",
+  );
+  const tieMismatchBack = arch.configMatches(untiedCfg, C);
+  check(
+    "configMatches rejects the same mismatch in the other direction",
+    typeof tieMismatchBack === "string" && tieMismatchBack.includes("untied-embeddings"),
+    tieMismatchBack ?? "returned null",
+  );
+  // A checkpoint with its own output head must carry the flag in its resume
+  // line; the model has to be built untied for the export to write the head.
+  const untiedModel = arch.build(untiedCfg, mulberry32(13));
+  const untiedLine = resumeFlags(
+    readGGUF(arch.exportGGUF(untiedModel, tok.export(), untiedCfg, { quant: "f32" })),
+  );
+  check(
+    "inspect prints --untied-embeddings for a checkpoint with its own output head",
+    untiedLine.includes("--untied-embeddings"),
+    untiedLine,
+  );
 
   // GQA with a fractional group would train something llama.cpp cannot
   // reproduce; the flags refuse it before any compute.
