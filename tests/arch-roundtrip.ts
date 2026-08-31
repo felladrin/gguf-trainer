@@ -113,6 +113,36 @@ for (const arch of ARCHITECTURES) {
     // deno-lint-ignore no-explicit-any
     arch.configMatches(cfg as any, cfg as any) === null,
   );
+
+  // 6. the RoPE base is part of the resume gate: a checkpoint with a different
+  //    base must be refused and named, not silently trained at the flag default.
+  const C = cfg as Record<string, any>;
+  const withRope = { ...C, ropeBase: 12_345.6789 };
+  const ropeModel = arch.build(withRope, mulberry32(8));
+  const ropeLoaded = loadModelFromGGUF(
+    arch.exportGGUF(ropeModel, tok.export(), withRope, { quant: "f32" }),
+  );
+  check(
+    "non-integer rope-base survives export and still matches (f32 rounding)",
+    // deno-lint-ignore no-explicit-any
+    arch.configMatches(withRope as any, ropeLoaded.cfg as any) === null,
+  );
+  const wrongRope = { ...C, ropeBase: C.ropeBase * 10 };
+  const ropeMismatch = arch.configMatches(C, wrongRope);
+  check(
+    "configMatches rejects a different rope-base, naming the flag",
+    typeof ropeMismatch === "string" && ropeMismatch.includes("rope-base"),
+    ropeMismatch ?? "returned null",
+  );
+  if (arch.name === "gemma3") {
+    const wrongLocal = { ...C, ropeBaseLocal: C.ropeBaseLocal * 10 };
+    const localMismatch = arch.configMatches(C, wrongLocal);
+    check(
+      "configMatches rejects a different rope-base-local, naming the flag",
+      typeof localMismatch === "string" && localMismatch.includes("rope-base-local"),
+      localMismatch ?? "returned null",
+    );
+  }
 }
 
 console.log(

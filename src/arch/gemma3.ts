@@ -463,6 +463,8 @@ export const gemma3: Architecture<Gemma3Config> = {
       { key: "maxSeq", flag: "max-seq" },
       { key: "slidingWindow", flag: "window" },
       { key: "swaPattern", flag: "swa-pattern" },
+      { key: "ropeBase", flag: "rope-base" },
+      { key: "ropeBaseLocal", flag: "rope-base-local" },
     ]);
   },
 };

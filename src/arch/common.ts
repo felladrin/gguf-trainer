@@ -130,6 +130,17 @@ export function tensorLoader(g: GGUFFile): (name: string, dst: Tensor) => void {
 }
 
 /**
+ * Two config fields match. Integers compare exactly; non-integers compare with
+ * a relative tolerance, because GGUF stores them as f32 and a flag value is
+ * f64, so e.g. 12345.6789 comes back as its f32 rounding and is never `===`.
+ */
+function fieldsMatch(a: number, b: number): boolean {
+  if (a === b) return true;
+  if (Number.isInteger(a) || Number.isInteger(b)) return false;
+  return Math.abs(a - b) <= 1e-6 * Math.max(Math.abs(a), Math.abs(b));
+}
+
+/**
  * The generic shape check behind every `configMatches`: compare the listed
  * fields and report the first difference in the terms the CLI flags use.
  */
@@ -139,8 +150,9 @@ export function diffFields<C>(
   fields: { key: keyof C; flag: string }[],
 ): string | null {
   for (const { key, flag } of fields) {
-    if (built[key] !== checkpoint[key]) {
-      return `${flag}: built ${String(built[key])} vs checkpoint ${String(checkpoint[key])}`;
+    const a = built[key] as number, b = checkpoint[key] as number;
+    if (!fieldsMatch(a, b)) {
+      return `${flag}: built ${String(a)} vs checkpoint ${String(b)}`;
     }
   }
   return null;

@@ -130,6 +130,8 @@ function resumeFlags(g: GGUFFile): string {
     ["window", "slidingWindow"],
     ["swa-pattern", "swaPattern"],
     ["max-seq", "maxSeq"],
+    ["rope-base", "ropeBase"],
+    ["rope-base-local", "ropeBaseLocal"],
   ];
   const owned = new Set(arch.flags.map((f) => f.name));
   for (const [flag, key] of optional) {

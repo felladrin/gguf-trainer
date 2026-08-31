@@ -435,6 +435,7 @@ export const llama: Architecture<LlamaConfig> = {
       { key: "headDim", flag: "head-dim" },
       { key: "ffnDim", flag: "ffn-dim" },
       { key: "maxSeq", flag: "max-seq" },
+      { key: "ropeBase", flag: "rope-base" },
     ]);
   },
 };
