@@ -217,8 +217,27 @@ for (const arch of ARCHITECTURES) {
   }
   check(
     "configFromFlags refuses --kv-heads that does not divide --heads",
-    gqaMsg.includes("8") && gqaMsg.includes("3"),
+    gqaMsg.includes("--kv-heads 3") && gqaMsg.includes("--heads 8"),
     gqaMsg || "did not throw",
+  );
+
+  // The CLI's default shape (512 hidden, 64 head-dim, no --heads/--kv-heads)
+  // must keep whole GQA groups: the guard may only fire on flags the user
+  // actually passed, never on the derived default.
+  const defCfg = arch.configFromFlags(
+    { vocabSize: C.vocabSize, hiddenSize: 512, nLayers: 2, maxSeq: 64, headDim: 64 },
+    new Values(
+      new Map<string, string | number | boolean>([
+        ["window", 64],
+        ["swa-pattern", 6],
+        ["rope-base-local", 10000],
+      ]),
+    ),
+  );
+  check(
+    "the default shape keeps whole GQA groups",
+    defCfg.nHeads % defCfg.nKVHeads === 0,
+    `heads=${defCfg.nHeads} kv=${defCfg.nKVHeads}`,
   );
   if (arch.name === "gemma3") {
     // A width that headDim*2 does not divide is unbuildable while the head
@@ -261,6 +280,15 @@ for (const arch of ARCHITECTURES) {
       "--heads unlocks the indivisible width",
       wide.nHeads === 3 && wide.nKVHeads === 1,
       `nHeads=${wide.nHeads} nKVHeads=${wide.nKVHeads}`,
+    );
+    // The wide block (nHeads * headDim != hidden) must stay countable, or a
+    // future gemma3 change that assumes square heads silently breaks it.
+    const wideModel = arch.build(wide, mulberry32(11));
+    const wideReal = wideModel.params().reduce((n, p) => n + p.size, 0);
+    check(
+      "paramCount matches the built wide model",
+      arch.paramCount(wide) === wideReal,
+      `declared ${arch.paramCount(wide)}, built ${wideReal}`,
     );
     const wrongLocal = { ...C, ropeBaseLocal: C.ropeBaseLocal * 10 };
     const localMismatch = arch.configMatches(C, wrongLocal);

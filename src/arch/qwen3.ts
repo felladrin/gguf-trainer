@@ -42,6 +42,8 @@ import type { Flag, Values } from "../cli/args.ts";
 import {
   addMatrix,
   addVector,
+  assertWholeGQA,
+  defaultKVHeads,
   diffFields,
   metaNum,
   metaNumOr,
@@ -202,7 +204,7 @@ export function qwen3Config(
     hiddenSize,
     nLayers,
     nHeads,
-    nKVHeads: Math.max(1, Math.round(nHeads / 2)),
+    nKVHeads: defaultKVHeads(nHeads, 2),
     headDim,
     // Rounded to a multiple of 32 so q8_0/q4_0 never falls back to f16 here.
     ffnDim: Math.round((hiddenSize * 3) / 32) * 32,
@@ -267,12 +269,7 @@ export const qwen3: Architecture<Qwen3Config> = {
       v.has("heads") ? v.num("heads") : undefined,
     );
     const nKVHeads = v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads;
-    if (base.nHeads % nKVHeads !== 0) {
-      throw new Error(
-        `--kv-heads ${nKVHeads} does not divide --heads ${base.nHeads}; ` +
-          `GQA needs a whole number of query heads per KV head`,
-      );
-    }
+    assertWholeGQA(base.nHeads, nKVHeads);
     return {
       ...base,
       nKVHeads,

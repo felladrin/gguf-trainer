@@ -47,6 +47,8 @@ import type { Flag, Values } from "../cli/args.ts";
 import {
   addMatrix,
   addVector,
+  assertWholeGQA,
+  defaultKVHeads,
   diffFields,
   metaNum,
   metaNumOr,
@@ -222,7 +224,7 @@ export function llamaConfig(
     hiddenSize,
     nLayers,
     nHeads,
-    nKVHeads: Math.max(1, Math.round(nHeads / 3)),
+    nKVHeads: defaultKVHeads(nHeads, 3),
     headDim,
     // Rounded to a multiple of 32 so q8_0/q4_0 never falls back to f16 here.
     ffnDim: Math.round((hiddenSize * 8 / 3) / 32) * 32,
@@ -286,13 +288,8 @@ export const llama: Architecture<LlamaConfig> = {
       shape.headDim,
     );
     const nHeads = v.has("heads") ? v.num("heads") : base.nHeads;
-    const nKVHeads = v.has("kv-heads") ? v.num("kv-heads") : Math.max(1, Math.round(nHeads / 3));
-    if (nHeads % nKVHeads !== 0) {
-      throw new Error(
-        `--kv-heads ${nKVHeads} does not divide --heads ${nHeads}; ` +
-          `GQA needs a whole number of query heads per KV head`,
-      );
-    }
+    const nKVHeads = v.has("kv-heads") ? v.num("kv-heads") : defaultKVHeads(nHeads, 3);
+    assertWholeGQA(nHeads, nKVHeads);
     return {
       ...base,
       nHeads,

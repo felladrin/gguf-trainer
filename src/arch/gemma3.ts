@@ -48,6 +48,8 @@ import type { Flag, Values } from "../cli/args.ts";
 import {
   addMatrix,
   addVector,
+  assertWholeGQA,
+  defaultKVHeads,
   diffFields,
   metaNum,
   ones,
@@ -235,7 +237,7 @@ export function gemma3Config(
     hiddenSize,
     nLayers,
     nHeads,
-    nKVHeads: Math.max(1, Math.round(nHeads / 2)),
+    nKVHeads: defaultKVHeads(nHeads, 2),
     headDim,
     ffnDim: Math.round((hiddenSize * 4) / 32) * 32,
     ropeBase: 1_000_000,
@@ -326,12 +328,7 @@ export const gemma3: Architecture<Gemma3Config> = {
       v.has("heads") ? v.num("heads") : undefined,
     );
     const nKVHeads = v.has("kv-heads") ? v.num("kv-heads") : base.nKVHeads;
-    if (base.nHeads % nKVHeads !== 0) {
-      throw new Error(
-        `--kv-heads ${nKVHeads} does not divide --heads ${base.nHeads}; ` +
-          `GQA needs a whole number of query heads per KV head`,
-      );
-    }
+    assertWholeGQA(base.nHeads, nKVHeads);
     return {
       ...base,
       swaPattern: v.num("swa-pattern"),
@@ -481,9 +478,9 @@ export const gemma3: Architecture<Gemma3Config> = {
       { key: "vocabSize", flag: "vocab" },
       { key: "hiddenSize", flag: "hidden" },
       { key: "nLayers", flag: "layers" },
-      // head-dim before heads: gemma3 derives nHeads from hidden / head-dim, so a
-      // wrong --head-dim must be reported as --head-dim and not as a flag this
-      // architecture does not even accept.
+      // head-dim before heads: when the head count is derived from
+      // hidden / head-dim, a wrong --head-dim is the cause, so report the
+      // flag the user actually set rather than the derived --heads.
       { key: "headDim", flag: "head-dim" },
       { key: "nHeads", flag: "heads" },
       { key: "nKVHeads", flag: "kv-heads" },
