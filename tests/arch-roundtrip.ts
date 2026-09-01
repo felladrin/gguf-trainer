@@ -180,12 +180,11 @@ for (const arch of ARCHITECTURES) {
   const printed = new Set(tokens.filter((p) => p.startsWith("--")));
   for (const [key, val] of Object.entries(C)) {
     if (typeof val !== "number" && typeof val !== "boolean") continue;
-    // deno-lint-ignore no-explicit-any
-    const named = arch.configMatches(
-      C,
-      // deno-lint-ignore no-explicit-any
-      { ...C, [key]: typeof val === "boolean" ? !val : val * 2 + 1 } as any,
-    );
+    // arch is Architecture<any> from the registry, so no cast is needed here.
+    const named = arch.configMatches(C, {
+      ...C,
+      [key]: typeof val === "boolean" ? !val : val * 2 + 1,
+    });
     if (typeof named !== "string") continue;
     const flag = named.split(":")[0];
     if (typeof val === "boolean") {
@@ -259,10 +258,11 @@ for (const arch of ARCHITECTURES) {
   // tied config, so this is the one that loads an untied output.weight.
   const untiedReloaded = loadModelFromGGUF(untiedBytes);
   // deno-lint-ignore no-explicit-any
+  const untiedTie = (untiedReloaded.cfg as any).tieEmbeddings;
   check(
     "tieEmbeddings: false round-trips through configFromGGUF",
-    (untiedReloaded.cfg as any).tieEmbeddings === false,
-    JSON.stringify((untiedReloaded.cfg as any).tieEmbeddings),
+    untiedTie === false,
+    JSON.stringify(untiedTie),
   );
   const untiedAfter = untiedReloaded.model.forward(ids).data;
   let headDiff = 0;
