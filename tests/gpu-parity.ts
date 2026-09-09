@@ -36,6 +36,7 @@ import { gemma3Config, Gemma3Model } from "../src/arch/gemma3.ts";
 import { getArch } from "../src/model/registry.ts";
 import { applyLora, clearLora } from "../src/train/lora.ts";
 import { freezeForScoring, sequenceLoss } from "../src/train/loss.ts";
+import { greedyComplete } from "../src/eval/generate.ts";
 import type { Gemma3Config } from "../src/arch/gemma3.ts";
 import { Muon, newtonSchulz } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
@@ -677,6 +678,7 @@ async function main() {
   await loraModelParity(gpu);
   await recomputeMemoryGate();
   await evalFreezeGate();
+  await generateFreezeGate();
   await flatOverflowGate(gpu);
   {
     // Row-per-workgroup 2-D fold: rmsNormHeads with rows = T*H past the cap.
@@ -1492,6 +1494,60 @@ async function evalFreezeGate() {
         `pool ${mb(hot.pool)} -> ${mb(cold.pool)} MB, loss ${hot.loss.toFixed(6)} both arms`,
     );
   }
+}
+
+/**
+ * The same readback gate for `generate`, which pays it per TOKEN rather than per
+ * window: `greedyComplete` syncs once per decoded token, so an unfrozen
+ * parameter is a whole model of gradients crossing the bus on every one. Worth
+ * its own arm rather than an extra case in evalFreezeGate, because the workload
+ * is a decode loop with no loss in it and the thing that must not move is the
+ * generated text.
+ */
+async function generateFreezeGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const prompt = [3, 11, 29, 5];
+  const maxNew = 3;
+  const arm = async (freeze: boolean) => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    try {
+      if (freeze) freezeForScoring(m);
+      gpu.install();
+      gpu.uploadParams(m.params());
+      const ids = await greedyComplete(m, gpu, prompt, maxNew);
+      return {
+        readback: gpu.lastSyncReadbackBytes,
+        pool: gpu.residentBytes().pool,
+        ids: ids.join(","),
+        paramBytes: m.params().reduce((a, t) => a + t.size * 4, 0),
+      };
+    } finally {
+      gpu.destroy();
+    }
+  };
+  const hot = await arm(false);
+  const cold = await arm(true);
+  const paramBytes = hot.paramBytes;
+  // The last sync reads back the last step's logits, [ctx, vocab] f32, and the
+  // context has grown by one token per step already taken.
+  const lastLogits = (prompt.length + maxNew - 1) * cfg.vocabSize * 4;
+
+  const wasCopying = hot.readback >= paramBytes;
+  const stopped = cold.readback === lastLogits;
+  const smaller = cold.pool < hot.pool - 0.9 * paramBytes;
+  // The point of the command is its text, so this is the assertion that would
+  // make the whole change unshippable.
+  const same = hot.ids === cold.ids;
+
+  const ok = wasCopying && stopped && smaller && same;
+  if (!ok) failures++;
+  const mb = (n: number) => (n / 1e6).toFixed(2);
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} generate freeze: readback ${mb(hot.readback)} MB -> ` +
+      `${cold.readback} B (logits alone ${lastLogits} B, params ${mb(paramBytes)} MB), ` +
+      `pool ${mb(hot.pool)} -> ${mb(cold.pool)} MB, ids ${cold.ids}`,
+  );
 }
 
 /**

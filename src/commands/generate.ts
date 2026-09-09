@@ -8,6 +8,7 @@
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
 import { readFileBytes } from "../io.ts";
 import { greedyComplete } from "../eval/generate.ts";
+import { freezeForScoring } from "../train/loss.ts";
 import { initWebGPU } from "../backend/webgpu.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -20,6 +21,12 @@ async function run(v: Values) {
     throw new UsageError(`cannot read ${path}`);
   });
   const { model, tokenizer } = loadModelFromGGUF(bytes);
+  // Generation never runs backward, and greedyComplete syncs once per token, so
+  // an unfrozen parameter is a gradient buffer copied back on every one of them.
+  // Here rather than inside greedyComplete: pretrain samples through the same
+  // function mid-run, and freezing is one-way, so it would zero that model's
+  // gradients for the rest of the training.
+  freezeForScoring(model);
 
   const gpu = v.bool("cpu") ? null : await initWebGPU();
   if (gpu) {

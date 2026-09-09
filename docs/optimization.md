@@ -1007,6 +1007,38 @@ scenario above, measured returning a NaN row on the CPU and a row of zeros on th
 refusal lands mid-run rather than at start-up (#64), which matters for `pretrain`, whose trust gate
 only reads the first 16 tokens.
 
+### 27. `generate` paid lever 25's cost per token, 39% of its wall clock (2026-09-09)
+
+Filed as #58 while fixing #53, which named the two eval commands only. `greedyComplete` syncs once
+per decoded token, and `sync()` stages the gradient of every touched external back to the host, so
+an unfrozen parameter was a whole model of gradients crossing the bus per token rather than per
+window. Nothing in generation runs backward, so those buffers were allocated, never written, and
+copied anyway.
+
+Measured on `littlelamb-base.f32.gguf` (293M f32), 40 tokens from a four-word prompt, three runs
+each on the Strix Halo APU:
+
+|        | wall clock            | completion                                              |
+| ------ | --------------------- | ------------------------------------------------------- |
+| before | 29.17, 30.34, 29.81 s | `, there was a small, red, and fluffy dog named Max...` |
+| after  | 18.19, 18.17, 18.28 s | identical, to the character                             |
+
+Median 29.81 s to 18.19 s, **39.0% faster**, and 46.9 GB of gradient copies that never happen. It is
+the same `freezeForScoring` call lever 25 added, in the same place, and it lands in
+`src/commands/generate.ts` rather than in `greedyComplete`: `pretrain` samples through that same
+function mid-run, and the freeze is one-way, so putting it there would zero the training model's
+gradients for the rest of the run.
+
+`generateFreezeGate` in `tests/gpu-parity.ts` pins it the way lever 25's gate does, with one
+difference that matters: the assertion that would make the change unshippable is that the generated
+ids are identical between the arms. The frozen arm's readback is exactly the last step's logits,
+`[ctx, vocab]` f32 and nothing else. Making `freezeForScoring` a no-op leaves the readback at the
+full model; moving the call after `uploadParams` drops the readback but not the pool.
+
+Still unfixed, and the last instance of this: `pretrain`'s mid-training sample runs `greedyComplete`
+on a model that is genuinely training, so it cannot be frozen and still pays per token. It is
+bounded by `--sample-every` rather than by the run length.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
