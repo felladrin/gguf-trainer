@@ -8,7 +8,7 @@
 // These carry the non-trivial logic of the export-ergonomics + OOM-guard work;
 // importing webgpu.ts here is safe (no top-level GPU access).
 // Run:  deno run tests/export-extras.ts
-import { parseQuantList } from "../src/gguf/quantize.ts";
+import { dequantize, GGMLType, parseQuantList, serializeF32 } from "../src/gguf/quantize.ts";
 import { addMatrix, addVector, tensorLoader } from "../src/arch/common.ts";
 import { GGUFWriter, readGGUF } from "../src/gguf/gguf.ts";
 import { Tensor } from "../src/model/autograd.ts";
@@ -148,31 +148,66 @@ for (
   // dequantize fills the buffer and the weight is merely scrambled.
   throws(
     () => load("m.weight", Tensor.zeros([4, 3])),
-    "has dims [4, 3]",
-    "a transposed destination is refused",
+    "wants [3, 4]",
+    "a transposed destination is refused, naming what it wanted",
   );
   throws(
     () => load("m.weight", Tensor.zeros([2, 6])),
-    "has dims [4, 3]",
-    "a reshaped destination is refused",
+    "wants [6, 2]",
+    "a reshaped destination is refused, naming what it wanted",
   );
   throws(
     () => load("m.weight", Tensor.zeros([12])),
-    "has dims [4, 3]",
-    "a flattened destination is refused",
+    "wants [12]",
+    "a flattened destination is refused, naming what it wanted",
   );
   // The rank comparison earns its place: [4] reversed is a PREFIX of [4, 3], so
   // an element-wise check alone accepts it and dequantize happily returns the
   // first four values.
   throws(
     () => load("m.weight", Tensor.zeros([4])),
-    "has dims [4, 3]",
+    "wants [4]",
     "a destination whose shape is a prefix of the dims is refused",
   );
   throws(
     () => load("n.weight", Tensor.zeros([4])),
-    "has dims [5]",
+    "wants [4]",
     "a short vector destination is refused",
+  );
+
+  // ggml's ne is always four long with implicit 1s, so a foreign writer may
+  // declare a 1-D tensor as [n, 1]. llama.cpp accepts that and an exact
+  // comparison would refuse it.
+  {
+    const fw = new GGUFWriter();
+    fw.meta_string("general.architecture", "test");
+    fw.addTensor("v.weight", [5, 1], serializeF32(new Float32Array(5)));
+    tensorLoader(readGGUF(fw.build()))("v.weight", Tensor.zeros([5]));
+  }
+
+  // A truncated tensor. f32 threw an unnamed DataView RangeError; q4_0 decoded
+  // its missing nibbles as `undefined & 0x0f`, i.e. 0, so each came out as
+  // (0 - 8) * scale: finite, plausible, silent.
+  throws(
+    () => dequantize(GGMLType.F32, new Uint8Array(8), 4),
+    "need 16 bytes, got 8",
+    "a short f32 buffer is refused by name",
+  );
+  {
+    const q = new Uint8Array(2 + 16);
+    new DataView(q.buffer).setUint16(0, 0x3c00, true);
+    q.fill(0x88, 2);
+    ok(dequantize(GGMLType.Q4_0, q, 32).every((v) => v === 0), "a whole q4_0 block still decodes");
+    throws(
+      () => dequantize(GGMLType.Q4_0, q.slice(0, 2 + 8), 32),
+      "need 18 bytes, got 10",
+      "a q4_0 buffer truncated inside a block is refused",
+    );
+  }
+  throws(
+    () => dequantize(GGMLType.Q8_0, new Uint8Array(999), 40),
+    "count multiple of 32",
+    "a q8_0 count that is not a whole number of blocks is refused",
   );
 
   // The writer side. A 1-D tensor left inDim undefined, so `inDim % 32 !== 0`

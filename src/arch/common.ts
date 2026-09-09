@@ -134,14 +134,31 @@ export function tensorLoader(g: GGUFFile): (name: string, dst: Tensor) => void {
     // shape reversed: addMatrix sends [outDim, inDim] out as [inDim, outDim].
     // Nothing compared them before, and the destination shape comes from the
     // metadata config rather than from the file, so a tensor whose stored dims
-    // disagree loaded without a word: a transposed pair with the same element
-    // count scrambled the weight, and a short one filled a prefix and left the
-    // rest at whatever the allocation held.
-    const want = [...dst.shape].reverse();
-    if (t.dims.length !== want.length || want.some((d, i) => d !== t.dims[i])) {
+    // disagreed loaded without a word. Measured: a destination SMALLER than the
+    // file's tensor takes a prefix of it and reports nothing (a [3,4] tensor
+    // into a [4] destination loads 1,2,3,4), and a transposed pair of the same
+    // element count scrambles the weight. The other direction threw, but as an
+    // unnamed DataView RangeError; dequantize names it now.
+    //
+    // Trailing 1s are trimmed from both sides. ggml's ne is always four long
+    // with implicit 1s, so a foreign writer may declare a 1-D tensor as [n, 1],
+    // which llama.cpp accepts and an exact comparison would refuse. Trimming
+    // still refuses [4] against [4, 3], which is the case the length clause is
+    // for: [4] is a PREFIX of [4, 3], so comparing element-wise alone accepts a
+    // 1-D destination against a 2-D tensor.
+    const trim = (d: number[]) => {
+      const out = [...d];
+      while (out.length > 1 && out[out.length - 1] === 1) out.pop();
+      return out;
+    };
+    const want = trim([...dst.shape].reverse());
+    const have = trim(t.dims);
+    if (have.length !== want.length || want.some((d, i) => d !== have[i])) {
       throw new Error(
         `GGUF tensor "${name}" has dims [${t.dims.join(", ")}], but this model wants ` +
-          `[${want.join(", ")}] (shape [${dst.shape.join(", ")}] in this repo's order)`,
+          `[${want.join(", ")}] (shape [${dst.shape.join(", ")}] in this repo's order). ` +
+          `For a file this repo wrote that means corruption; for a foreign one it usually ` +
+          `means its metadata and its tensors disagree about a dimension.`,
       );
     }
     const de = dequantize(t.type, t.data, dst.size);

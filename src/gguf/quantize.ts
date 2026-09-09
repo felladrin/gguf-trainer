@@ -114,7 +114,39 @@ export function serializeQ4_0(data: Float32Array): Serialized {
 // as the basis for a future GGUF checkpoint loader.
 // ---------------------------------------------------------------------------
 
+/**
+ * Bytes `count` elements of `type` occupy, so a short buffer is refused by name
+ * rather than by a DataView RangeError, or worse. The block types are the reason
+ * this exists: a q4_0 buffer truncated inside a block decodes its missing
+ * nibbles as `undefined & 0x0f`, i.e. 0, so every one of them comes out as
+ * `(0 - 8) * scale`, a finite and entirely plausible value.
+ */
+export function bytesFor(type: GGMLTypeId, count: number): number {
+  switch (type) {
+    case GGMLType.F32:
+      return count * 4;
+    case GGMLType.F16:
+    case GGMLType.BF16:
+      return count * 2;
+    case GGMLType.Q8_0:
+      return (count / QK) * (2 + QK);
+    case GGMLType.Q4_0:
+      return (count / QK) * (2 + QK / 2);
+    default:
+      throw new Error(`dequantize: unsupported ggml type ${type}`);
+  }
+}
+
 export function dequantize(type: GGMLTypeId, bytes: Uint8Array, count: number): Float32Array {
+  if ((type === GGMLType.Q8_0 || type === GGMLType.Q4_0) && count % QK !== 0) {
+    throw new Error(`dequantize: ggml type ${type} needs a count multiple of ${QK}, got ${count}`);
+  }
+  const need = bytesFor(type, count);
+  if (bytes.length < need) {
+    throw new Error(
+      `dequantize: ${count} elements of ggml type ${type} need ${need} bytes, got ${bytes.length}`,
+    );
+  }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const out = new Float32Array(count);
   switch (type) {

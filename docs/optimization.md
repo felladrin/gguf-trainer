@@ -1335,11 +1335,19 @@ dst.data.set(de);
 ```
 
 The destination shape comes from `arch.build(cfg, ...)`, allocated from the metadata scalars before
-any bytes are read, so the file's own dims were pure decoration. A tensor whose stored dims disagree
-with the metadata loaded silently: transposed with the same element count gives a scrambled weight
-and a model that generates noise, and a short one leaves `de.length < dst.data.length` so `set` fills
-a prefix and leaves the rest at whatever the allocation held. The only guard anywhere was the
-`token_embd.weight` round-trip check in `demo.ts`, one tensor in one command.
+any bytes are read, so the file's own dims were pure decoration. Measured, with the direction the
+other way round from what this lever said first:
+
+| the destination against the file's tensor | before                                                                           |
+| ----------------------------------------- | -------------------------------------------------------------------------------- |
+| same element count, transposed            | a scrambled weight and a model that generates noise                              |
+| smaller                                   | a silent prefix load: a `[3,4]` tensor into a `[4]` destination gives 1, 2, 3, 4 |
+| larger                                    | `RangeError: Offset is outside the bounds of the DataView`, no tensor named      |
+
+`dequantize` always returns exactly `count` floats and a `Tensor`'s buffer always matches its shape,
+so the "fills a prefix and leaves the rest" case cannot happen; the prefix is taken from the FILE,
+not left in the destination. The only guard anywhere was the `token_embd.weight` round-trip check in
+`demo.ts`, one tensor in one command.
 
 The loader now compares `t.dims` against the destination shape reversed, ggml writing `ne`
 fastest-moving first, which is exactly what `addMatrix` does when it sends `[outDim, inDim]` out as
@@ -1350,9 +1358,24 @@ so an element-wise check alone accepts a 1-D destination against a 2-D tensor an
 returns the first four values quite happily. That case is what the length clause is for, and it is
 the one mutation that survived the first version of the test.
 
+Two more things landed with it, both the same shape one axis over.
+
+`dequantize` now checks that the buffer holds the bytes the type and count require, and that a block
+type gets a whole number of blocks. The `RangeError` above is the polite failure; **q4_0 has a silent
+one**. Its nibble read is a plain array index, and in JS `undefined & 0x0f` is 0, so every byte past
+the end of a truncated block decodes as `(0 - 8) * scale`: finite, plausible, no NaN. Measured on a
+block with half its nibbles missing, the last eight values came back as -8.
+
+And the dims comparison trims trailing 1s from both sides. ggml's `ne` is always four long with
+implicit 1s, so a foreign writer may declare a 1-D tensor as `[n, 1]`, which llama.cpp accepts and an
+exact comparison would refuse. This repo reads foreign GGUFs on purpose, BF16 existing only as an
+import path.
+
 `assertRank` is `assertMatrix` from lever 31 with the rank as an argument, since the writer needs 2
-for a matrix and 1 for a vector. Six mutations in `tests/export-extras.ts`, one per clause on each
-side.
+for a matrix and 1 for a vector. Nine mutations in `tests/export-extras.ts`, one per clause on each
+side. One survives and is left alone: loosening the trim's floor from `> 1` to `> 0` lets an all-1s
+dims list trim to empty, and there is no distinguishing input, since both sides then trim to empty
+together and compare equal either way.
 
 ## Quality levers
 
