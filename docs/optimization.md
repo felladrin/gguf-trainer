@@ -604,6 +604,14 @@ since no region buffer ever reaches a `queue.writeBuffer` call site. It is what 
 overlap. Deleting it as redundant keeps the whole suite green and silently returns the throughput
 to the dense number, so the comment there says so.
 
+**This looks like it contradicts lever 3b, and does not.** 3b costs 23% by submitting once per
+micro-batch on the same host-bound step; 20 gains 2.3x by submitting once per layer on it. The
+difference is not the frequency, it is the wait. `reclaimStepTransients` ends the pass, submits,
+and then AWAITS `onSubmittedWorkDone`, which drains the pipeline and stalls the host until the GPU
+catches up. `endRegion` submits and returns. Submitting is the overlap; waiting for the submission
+is the stall. That also sharpens the follow-up above: a dense-path version must submit without a
+fence, or it will reproduce 3b's 23% rather than this lever's 2.3x.
+
 Correctness is gated three ways rather than by the loss curve: `checkpoint == off` in
 `tests/gradcheck.ts` requires bit-identical gradients, `recomputeModelParity` runs all three
 architectures against the CPU reference, and `recompute across reclaim boundaries` drives
@@ -611,10 +619,11 @@ architectures against the CPU reference, and `recompute across reclaim boundarie
 
 The memory claim has its own gate, because no numeric test can see it: a region buffer that never
 returns to the pool leaves every number correct and quietly allocates around it. That is not
-hypothetical, it was the first version of this change. `recomputeMemoryGate` asserts the pool ratio
-directly, in both reclaim states because the two drains live in different functions: reclaim on is
-62% healthy and 81% with the `reclaimStepTransients` drain gone, reclaim off is 48% healthy and 74%
-with the `sync()` drain gone, so the gate fails over 70%.
+hypothetical, it was the first version of this change. `recomputeMemoryGate` asserts it structurally, one
+claim per drain, so no fitted constant carries the weight: with reclaim off the pool must not grow
+with step count (10.9 -> 10.9 MB healthy, 14.4 -> 20.8 MB with the `sync()` drain gone), and with
+reclaim on it must not grow with micro-batch count (7.6 -> 7.6 MB healthy, 10.0 -> 12.2 MB with the
+`reclaimStepTransients` drain gone). Each deletion was verified to fail its own arm.
 
 ## Correctness / robustness
 

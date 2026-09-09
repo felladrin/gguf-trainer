@@ -1299,27 +1299,32 @@ async function recomputeModelParity(gpu: WebGPUBackend) {
 }
 
 /**
- * The memory claim, which no correctness test can make: recompute must actually
- * shrink the pool, and a region buffer that never finds its way back is invisible
- * to every numeric check because the run stays correct while quietly allocating
- * around it.
+ * The memory claims, which no correctness test can make: a region buffer that
+ * never returns to the pool leaves every number correct and quietly allocates
+ * around it. That is not hypothetical, it was the first version of this change.
  *
- * `residentBytes().pool` only grows, so it is the high-water mark rather than a
- * snapshot. Both reclaim states run, because the two drains live in different
- * functions and testing one leaves the other deletable with every test green.
- * The four measured ratios, healthy against a deleted drain:
+ * Two of the three assertions are constant-free, because each compares the same
+ * quantity under two configs rather than against a fitted threshold:
  *
- *   reclaim on:  62% healthy, 81% with the reclaimStepTransients drain gone
- *   reclaim off: 48% healthy, 74% with the sync() drain gone
+ *   sync() drain    - with reclaim OFF it is the only drain, so if it is gone
+ *                     nothing ever returns and the pool grows with step count.
+ *                     Healthy, it plateaus after the first step.
+ *   reclaim drain   - with reclaim ON, region buffers must not accumulate per
+ *                     micro-batch, which is reclaim's own documented contract.
+ *                     If that drain is gone the pool grows with batchPerStep.
  *
- * so the threshold has to sit under 74 and over 62. 70% is the midpoint, and
- * every loss stays identical in the broken cases, which is why the ratio is the
- * only thing that can see this.
+ * The third is the headline claim (recompute shrinks the pool at all) and is
+ * kept deliberately loose, since the exact ratio is a property of this tiny
+ * shape: most of its pool is parameters, which recompute does not touch.
+ *
+ * `residentBytes().pool` only grows, so it is a high-water mark. Staging buffers
+ * are created outside the pool and optimizer state is counted separately, so
+ * nothing else moves these numbers.
  */
 async function recomputeMemoryGate() {
   const cfg = gemma3Config(64, 64, 4, 256, 16);
-  const tokens = Array.from({ length: 4096 }, (_, i) => (i * 7 + 3) % cfg.vocabSize);
-  const poolFor = async (recompute: boolean, reclaimTransients: boolean) => {
+  const tokens = Array.from({ length: 8192 }, (_, i) => (i * 7 + 3) % cfg.vocabSize);
+  const poolFor = async (recompute: boolean, reclaim: boolean, steps: number, batch: number) => {
     const gpu = (await initWebGPU())!;
     setCheckpointing(recompute);
     const m = new Gemma3Model(cfg, mulberry32(5));
@@ -1328,8 +1333,8 @@ async function recomputeMemoryGate() {
       await trainLMGpuResident(m, gpu, {
         tokens,
         seqLen: 128,
-        steps: 3,
-        batchPerStep: 2,
+        steps,
+        batchPerStep: batch,
         optimizer: new MuonGpu(gpu, g.muon, g.aux, {
           lr: 0.01,
           momentum: 0.95,
@@ -1337,7 +1342,7 @@ async function recomputeMemoryGate() {
         }),
         logEvery: 100,
         rng: mulberry32(7),
-        reclaimTransients,
+        reclaimTransients: reclaim,
       });
       return gpu.residentBytes().pool;
     } finally {
@@ -1347,26 +1352,32 @@ async function recomputeMemoryGate() {
       gpu.destroy();
     }
   };
-  // Both reclaim states, because each drains regionFree in a different place:
-  // reclaim on exercises the drain in reclaimStepTransients, reclaim off the one
-  // in sync(). Testing only one leaves the other deletable with every test green.
-  let ok = true;
-  const parts: string[] = [];
-  for (const reclaim of [true, false]) {
-    const dense = await poolFor(false, reclaim);
-    const recomputed = await poolFor(true, reclaim);
-    const ratio = recomputed / dense;
-    if (ratio >= 0.70) ok = false;
-    parts.push(
-      `reclaim ${reclaim ? "on" : "off"} ${(dense / 1e6).toFixed(1)}->${
-        (recomputed / 1e6).toFixed(1)
-      } MB (${(ratio * 100).toFixed(0)}%)`,
-    );
-  }
+  const mb = (n: number) => (n / 1e6).toFixed(1);
+
+  // 1. sync() drain: pool must not grow with step count when reclaim is off.
+  const s2 = await poolFor(true, false, 2, 2);
+  const s6 = await poolFor(true, false, 6, 2);
+  // 1% for bucket jitter. Healthy this is 0%; with that drain deleted the pool
+  // grows 44% (10.9 -> 10.9 MB against 14.4 -> 20.8 MB), so the slack is ample.
+  const steadySteps = s6 <= s2 * 1.01;
+
+  // 2. reclaim drain: pool must not grow with micro-batch count when on.
+  const b2 = await poolFor(true, true, 3, 2);
+  const b4 = await poolFor(true, true, 3, 4);
+  // 5% for the same reason. Healthy this is 0.013% (one 1 KB bucket); with that
+  // drain deleted the pool grows 22% (10.0 -> 12.2 MB).
+  const steadyBatch = b4 <= b2 * 1.05;
+
+  // 3. the headline claim, loose on purpose.
+  const dense = await poolFor(false, true, 3, 2);
+  const shrinks = b2 < 0.9 * dense;
+
+  const ok = steadySteps && steadyBatch && shrinks;
   if (!ok) failures++;
   console.log(
-    `  ${ok ? "ok " : "FAIL"} recompute shrinks the pool, both drains ` +
-      `[${parts.join(", ")}], each must be under 70%`,
+    `  ${ok ? "ok " : "FAIL"} recompute memory: flat in steps ` +
+      `(${mb(s2)}->${mb(s6)} MB, reclaim off), flat in micro-batches ` +
+      `(${mb(b2)}->${mb(b4)} MB, reclaim on), under dense (${mb(dense)} MB)`,
   );
 }
 

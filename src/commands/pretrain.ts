@@ -577,6 +577,9 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   });
   src.close();
   injectSource?.close();
+  // Training is over, and the sample below is inference: no backward, so a
+  // recompute boundary per layer per token buys nothing and costs a submit.
+  setCheckpointing(false);
   {
     const el = (Date.now() - t0) / 1000;
     const localSteps = steps - startStep;
