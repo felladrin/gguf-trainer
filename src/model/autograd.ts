@@ -118,6 +118,12 @@ export interface OpsBackend {
     window: number,
   ): Tensor;
   crossEntropy(logits: Tensor, targets: number[]): Tensor;
+  fusedCrossEntropy(
+    hidden: Tensor,
+    w: Tensor,
+    targets: number[],
+    chunk: number,
+  ): Tensor;
   softCrossEntropy(
     logits: Tensor,
     teacherIds: number[],
@@ -550,6 +556,91 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
       const b = t * V;
       for (let v = 0; v < V; v++) {
         logits.grad[b + v] += scale * (probs[b + v] - (v === targets[t] ? 1 : 0));
+      }
+    }
+  };
+  return loss;
+}
+
+/**
+ * Readout matmul fused into cross-entropy, streaming the vocab axis in chunks.
+ *
+ * Mathematically identical to `crossEntropy(linear(hidden, w), targets)`. The
+ * difference is what stays resident: the dense pair holds three [T, vocab]
+ * buffers (the readout's data and grad, plus the softmax scratch), and at a
+ * large vocab a single one of those passes the WebGPU storage-buffer binding
+ * limit long before memory runs out. Here the widest live buffer is
+ * [T, chunk], and backward recomputes each chunk's logits from `hidden` and
+ * `w` rather than reading them back.
+ *
+ * The cost is one extra readout matmul per step. `chunk` trades peak memory
+ * against the number of passes; it does not change the result.
+ */
+export function fusedCrossEntropy(
+  hidden: Tensor,
+  w: Tensor,
+  targets: number[],
+  chunk: number,
+): Tensor {
+  if (opsBackend) return opsBackend.fusedCrossEntropy(hidden, w, targets, chunk);
+  const [T, H] = hidden.shape;
+  const [V, H2] = w.shape;
+  if (H !== H2) throw new Error(`fusedCrossEntropy dim mismatch ${H} vs ${H2}`);
+  if (chunk <= 0) throw new Error(`fusedCrossEntropy chunk must be positive, got ${chunk}`);
+  const loss = Tensor.zeros([1]);
+
+  // Online softmax over the chunked vocab: a chunk whose maximum beats the
+  // running one rescales the sum so far instead of forcing a second pass.
+  const rowMax = new Float32Array(T).fill(-Infinity);
+  const rowSum = new Float32Array(T);
+  const tgtLogit = new Float32Array(T);
+  const dot = (t: number, v: number) => {
+    let acc = 0;
+    for (let i = 0; i < H; i++) acc += hidden.data[t * H + i] * w.data[v * H + i];
+    return acc;
+  };
+  for (let v0 = 0; v0 < V; v0 += chunk) {
+    const v1 = Math.min(v0 + chunk, V);
+    for (let t = 0; t < T; t++) {
+      let chunkMax = -Infinity;
+      for (let v = v0; v < v1; v++) {
+        const z = dot(t, v);
+        if (z > chunkMax) chunkMax = z;
+      }
+      const mNew = Math.max(rowMax[t], chunkMax);
+      let sum = 0;
+      for (let v = v0; v < v1; v++) sum += Math.exp(dot(t, v) - mNew);
+      rowSum[t] = rowSum[t] * Math.exp(rowMax[t] - mNew) + sum;
+      rowMax[t] = mNew;
+      const g = targets[t];
+      if (g >= v0 && g < v1) tgtLogit[t] = dot(t, g);
+    }
+  }
+
+  let total = 0;
+  let kept = 0;
+  for (let t = 0; t < T; t++) {
+    if (targets[t] < 0) continue; // ignored position: no loss, no gradient
+    total += Math.log(rowSum[t]) + rowMax[t] - tgtLogit[t];
+    kept++;
+  }
+  const denom = kept > 0 ? kept : 1;
+  loss.data[0] = total / denom;
+  loss._prev = [hidden, w];
+  loss._backward = () => {
+    const scale = loss.grad[0] / denom;
+    for (let v0 = 0; v0 < V; v0 += chunk) {
+      const v1 = Math.min(v0 + chunk, V);
+      for (let t = 0; t < T; t++) {
+        if (targets[t] < 0) continue;
+        for (let v = v0; v < v1; v++) {
+          const p = Math.exp(dot(t, v) - rowMax[t]) / rowSum[t];
+          const d = scale * (p - (v === targets[t] ? 1 : 0));
+          for (let i = 0; i < H; i++) {
+            hidden.grad[t * H + i] += d * w.data[v * H + i];
+            w.grad[v * H + i] += d * hidden.data[t * H + i];
+          }
+        }
       }
     }
   };

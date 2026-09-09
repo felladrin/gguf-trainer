@@ -80,6 +80,15 @@ Violating any of these wastes a run. They are checked where possible; a few cann
    At vocab 32768 the logits are `T x 32768 x 4` bytes, so 8192 needs 1 GiB and fits an adapter
    that grants its full limit (2 GiB measured); one that falls back to the WebGPU default of
    128 MiB stops at 1024. The error names the buffer.
+   **`--loss-chunk N` removes the CONTEXT half of this cap for training**: it fuses the readout
+   matmul into the loss and streams the vocab N columns at a time, so no buffer scales with
+   context and vocab together. The `[vocab, hidden]` readout weight and its gradient survive
+   untouched and are the next ceiling: 315 MiB each at vocab 151936 x hidden 544, but 2374 MiB
+   at hidden 4096, over the limit again with the flag already on. Measured: qwen3 293M at vocab
+   151936 and `--seq-len 4096` aborts on the dense path (2374 MiB against a 2048 MiB limit) and
+   trains with `--loss-chunk 8192`. Lever 19.
+   `eval-loss` and `eval-choice` still take the dense path, so a checkpoint trained at a context
+   they cannot score is possible; issue #46.
 
 ## Recipes
 
@@ -258,18 +267,19 @@ the round-trip test automatically: docs/adding-an-architecture.md.
 
 ## When something fails
 
-| Message                                                                                      | Meaning                                                      | Fix                                                                                                                         |
-| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `--resume config mismatch (hidden: built 512 vs checkpoint 640)`                             | your architecture flags differ from the checkpoint           | run `inspect` and copy the flags it prints                                                                                  |
-| `no sibling tokenizer <prefix>.tokenizer.json`                                               | `pretrain` got a `.tokens` file with no tokenizer next to it | keep the pair together, or re-run `tokenize`                                                                                |
-| `does not encode [...] atomically`                                                           | fine-tuning a base whose vocab has no ChatML tokens          | a base trained here needs `tokenize --curriculum-specials`; a downloaded one must already carry ChatML in its specials list |
-| `mask <path> has N tokens, corpus has M`                                                     | `.mask` and `.tokens` are from different `chat-corpus` runs  | rebuild both together                                                                                                       |
-| `mask supervises nothing`                                                                    | the template rendered no assistant turns                     | check the dataset actually has `assistant` roles                                                                            |
-| `no WebGPU: training needs Deno`                                                             | running under Node or Bun                                    | training needs Deno; Node and Bun have no GPU backend here                                                                  |
-| `GPU/CPU parity probe failed`                                                                | the backend disagrees with the reference at init             | a real bug; stop and report it, do not train through it                                                                     |
-| NaN loss partway into a run                                                                  | f16 overflow, or a learning rate above 0.01                  | keep compute f32; `--lr 0.01` is the proven ceiling, 0.02 diverged                                                          |
-| a loss far worse than the checkpoint deserves, on a model that still generates readable text | this engine and llama.cpp disagree about the forward pass    | score one file with both before blaming the corpus: `docs/optimization.md` lever 17                                         |
-| OOM at long context                                                                          | the activation pool, ~2.3 MB per token in flight (lever 3)   | add `--reclaim` (5.6x less peak memory, 23% slower, lever 3b), or lower `--seq-len` or `--batch`                            |
+| Message                                                                                      | Meaning                                                               | Fix                                                                                                                         |
+| -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `--resume config mismatch (hidden: built 512 vs checkpoint 640)`                             | your architecture flags differ from the checkpoint                    | run `inspect` and copy the flags it prints                                                                                  |
+| `no sibling tokenizer <prefix>.tokenizer.json`                                               | `pretrain` got a `.tokens` file with no tokenizer next to it          | keep the pair together, or re-run `tokenize`                                                                                |
+| `does not encode [...] atomically`                                                           | fine-tuning a base whose vocab has no ChatML tokens                   | a base trained here needs `tokenize --curriculum-specials`; a downloaded one must already carry ChatML in its specials list |
+| `mask <path> has N tokens, corpus has M`                                                     | `.mask` and `.tokens` are from different `chat-corpus` runs           | rebuild both together                                                                                                       |
+| `mask supervises nothing`                                                                    | the template rendered no assistant turns                              | check the dataset actually has `assistant` roles                                                                            |
+| `no WebGPU: training needs Deno`                                                             | running under Node or Bun                                             | training needs Deno; Node and Bun have no GPU backend here                                                                  |
+| `GPU/CPU parity probe failed`                                                                | the backend disagrees with the reference at init                      | a real bug; stop and report it, do not train through it                                                                     |
+| NaN loss partway into a run                                                                  | f16 overflow, or a learning rate above 0.01                           | keep compute f32; `--lr 0.01` is the proven ceiling, 0.02 diverged                                                          |
+| a loss far worse than the checkpoint deserves, on a model that still generates readable text | this engine and llama.cpp disagree about the forward pass             | score one file with both before blaming the corpus: `docs/optimization.md` lever 17                                         |
+| OOM at long context                                                                          | the activation pool, ~2.3 MB per token in flight (lever 3)            | add `--reclaim` (5.6x less peak memory, 23% slower, lever 3b), or lower `--seq-len` or `--batch`                            |
+| `GPU storage buffer of N MiB exceeds this device's limit`                                    | a `[seq-len, vocab]` logits buffer past `maxStorageBufferBindingSize` | during training, `--loss-chunk 8192` (lever 19); in `eval-loss`/`eval-choice`, lower `--seq-len` (#46)                      |
 
 ## Hardware reality
 

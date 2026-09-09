@@ -2,7 +2,8 @@
 // stream, compute next-token cross-entropy, backprop, optimizer step.
 // Optimizer-agnostic: pass an AdamW or Muon instance.
 
-import { backward, crossEntropy } from "../model/autograd.ts";
+import { backward } from "../model/autograd.ts";
+import { sequenceLoss } from "./loss.ts";
 import type { LanguageModel } from "../model/arch.ts";
 import type { Optimizer } from "./optimizer.ts";
 import { applyQKClip } from "./qk-clip.ts";
@@ -28,6 +29,16 @@ export interface TrainOpts {
    * (crossEntropy's ignore-index): this is assistant-only loss for chat models.
    */
   supervised?: TokenSource;
+  /**
+   * Vocab chunk width for the fused readout+cross-entropy path. 0 (the default)
+   * keeps the dense path: `forward` materializes [seqLen, vocab] logits, whose
+   * data, gradient and softmax scratch are three buffers of that size. A
+   * positive value streams the vocab in chunks of that width instead, so the
+   * widest live buffer is [seqLen, chunk] and backward recomputes the readout
+   * matmul. Numerically equivalent, and the only way past the storage-buffer
+   * binding limit at a large vocab (see agents.md invariant 7).
+   */
+  lossChunk?: number;
 }
 
 /** In place: set target to -1 (ignore-index) where the supervision mask is 0. */
@@ -58,8 +69,7 @@ export function trainLM(model: LanguageModel, opts: TrainOpts): { step: number; 
       const targetIds = tokens.window(start + 1, opts.seqLen);
       if (opts.supervised) maskWindow(targetIds, opts.supervised, start + 1);
 
-      const logits = model.forward(inputIds);
-      const loss = crossEntropy(logits, targetIds);
+      const loss = sequenceLoss(model, inputIds, targetIds, opts.lossChunk);
       backward(loss, 1 / opts.batchPerStep); // average grads over the batch
       lossSum += loss.data[0];
     }

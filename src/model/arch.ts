@@ -34,7 +34,8 @@ export interface ModelConfig {
 
 /**
  * What the trainer needs from a model. Any structure is fine behind it: the
- * training loop only ever calls these three.
+ * training loop only ever calls the three required members below, plus the
+ * optional ones when the architecture offers them.
  */
 export interface LanguageModel {
   readonly cfg: ModelConfig;
@@ -44,6 +45,15 @@ export interface LanguageModel {
   paramGroups(): { muon: Tensor[]; aux: Tensor[] };
   /** One token sequence to logits [T, vocabSize]. */
   forward(ids: number[]): Tensor;
+
+  /**
+   * Optional capability: stop one matmul short of the logits and hand back the
+   * normalized hidden state plus the readout weight, so a caller can fuse that
+   * matmul into a chunked loss and never materialize [T, vocabSize]. `forward`
+   * is then just this followed by `linear`. Leave it off and the trainer uses
+   * the dense path.
+   */
+  forwardToReadout?(ids: number[]): { hidden: Tensor; readout: Tensor };
 
   /**
    * Optional capability: architectures with QK-RMSNorm expose their per-layer

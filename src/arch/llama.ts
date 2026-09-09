@@ -179,7 +179,7 @@ export class LlamaModel implements LanguageModel {
     return { muon, aux };
   }
 
-  forward(ids: number[]): Tensor {
+  forwardToReadout(ids: number[]): { hidden: Tensor; readout: Tensor } {
     const c = this.cfg;
     const T = ids.length;
     let h = embedding(this.tokenEmbd, ids); // no input scale, unlike Gemma3
@@ -201,8 +201,15 @@ export class LlamaModel implements LanguageModel {
       h = add(h, linear(mul(g, u), L.down));
     }
 
-    const normed = rmsNorm(h, this.outputNorm, c.rmsEps);
-    return linear(normed, this.output ?? this.tokenEmbd);
+    return {
+      hidden: rmsNorm(h, this.outputNorm, c.rmsEps),
+      readout: this.output ?? this.tokenEmbd,
+    };
+  }
+
+  forward(ids: number[]): Tensor {
+    const { hidden, readout } = this.forwardToReadout(ids);
+    return linear(hidden, readout);
   }
 }
 

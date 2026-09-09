@@ -18,6 +18,7 @@ import {
   backward,
   crossEntropy,
   embedding,
+  fusedCrossEntropy,
   gelu,
   linear,
   mul,
@@ -241,6 +242,53 @@ async function main() {
     const logits = randTensor([T, V], rng);
     const targets = [2, 7, 2, 0];
     fdCheck("crossEntropy", [logits], () => crossEntropy(logits, targets));
+  }
+  {
+    // Fused readout + chunked cross-entropy. Both inputs are differentiated,
+    // and the chunk widths cover the three cases the vocab loop can hit: a
+    // ragged final chunk, an exact split, and a single chunk wider than the
+    // vocab. Row 1's target is -1 (ignored), so the ignore-index path is inside
+    // the checked graph rather than beside it.
+    const T = 4, H = 3, V = 9;
+    const targets = [2, -1, 5, 0];
+    for (const chunk of [4, 3, 20]) {
+      const hidden = randTensor([T, H], rng);
+      const w = randTensor([V, H], rng);
+      fdCheck(
+        `fusedCrossEntropy(chunk=${chunk})`,
+        [hidden, w],
+        () => fusedCrossEntropy(hidden, w, targets, chunk),
+      );
+    }
+  }
+  {
+    // Chunking must not change the answer: same inputs, dense vs fused, both
+    // directions. A gradcheck alone would pass on a self-consistent but wrong
+    // loss, so this pins the fused path to the dense one it replaces.
+    const T = 5, H = 4, V = 11;
+    const targets = [3, -1, 0, 10, 7];
+    const mk = () => {
+      const r = mulberry32(0x5eed);
+      return { h: randTensor([T, H], r), w: randTensor([V, H], r) };
+    };
+    const a = mk(), b = mk();
+    const dense = crossEntropy(linear(a.h, a.w), targets);
+    backwardFrom(dense, new Float32Array([1]));
+    const fused = fusedCrossEntropy(b.h, b.w, targets, 4);
+    backwardFrom(fused, new Float32Array([1]));
+    let worst = Math.abs(dense.data[0] - fused.data[0]);
+    for (let i = 0; i < a.h.grad.length; i++) {
+      worst = Math.max(worst, Math.abs(a.h.grad[i] - b.h.grad[i]));
+    }
+    for (let i = 0; i < a.w.grad.length; i++) {
+      worst = Math.max(worst, Math.abs(a.w.grad[i] - b.w.grad[i]));
+    }
+    const ok = worst <= 1e-5;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"fusedCE == dense".padEnd(24)}        loss+both grads  ` +
+        `maxAbs=${worst.toExponential(2)}`,
+    );
   }
   {
     // Soft-target CE (Phase B KL anchor). Three shapes in one graph: a

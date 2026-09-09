@@ -169,7 +169,7 @@ export class Gemma3Model implements LanguageModel {
     };
   }
 
-  forward(ids: number[]): Tensor {
+  forwardToReadout(ids: number[]): { hidden: Tensor; readout: Tensor } {
     const c = this.cfg;
     const T = ids.length;
     // The input scale is runtime-only; the tied readout below uses raw embeddings.
@@ -202,8 +202,15 @@ export class Gemma3Model implements LanguageModel {
       h = add(h, down);
     }
 
-    const normed = rmsNorm(h, this.outputNorm, c.rmsEps);
-    return linear(normed, this.output ?? this.tokenEmbd);
+    return {
+      hidden: rmsNorm(h, this.outputNorm, c.rmsEps),
+      readout: this.output ?? this.tokenEmbd,
+    };
+  }
+
+  forward(ids: number[]): Tensor {
+    const { hidden, readout } = this.forwardToReadout(ids);
+    return linear(hidden, readout);
   }
 }
 

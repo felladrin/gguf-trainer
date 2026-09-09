@@ -17,6 +17,7 @@ import {
   backward,
   crossEntropy,
   embedding,
+  fusedCrossEntropy,
   gelu,
   linear,
   mul,
@@ -146,6 +147,58 @@ async function profilerSmoke(gpu: WebGPUBackend) {
   }
   if (!ok) failures++;
   console.log(`  ${ok ? "ok " : "FAIL"} timestamp-query profiler (labels + times)`);
+}
+
+/**
+ * Fused readout + chunked cross-entropy, against the dense path it replaces
+ * (`crossEntropy(linear(...))`) rather than against its own CPU twin: the whole
+ * point of the op is that the two agree, and the dense side is already
+ * finite-difference-validated. Widths cover a ragged final chunk, an exact
+ * split and a single chunk wider than the vocab; the offset GEMM variants are
+ * only exercised when there is more than one chunk. Row 1 is ignore-index.
+ */
+async function fusedCeParity(gpu: WebGPUBackend) {
+  // The last shape is the one that exercises the offset GEMM the way a real run
+  // does. Below it every span sits inside a single 64x64 block with a K loop of
+  // one BK=16 step, so `blockRow`, `blockCol` and the K stride are all pinned at
+  // their first value and a wrong offset cannot show. At T=130, V=200, chunk=70
+  // there are three spans, NT spans 2 column blocks over 3 K-steps, NN runs 5
+  // K-steps so `(gk + off)` crosses BK boundaries, and TN reaches `blockRow=64`
+  // with a nonzero offset: the exact term whose parenthesization broke once.
+  for (
+    const [T, H, V, chunk] of [[4, 3, 9, 4], [8, 16, 40, 10], [6, 12, 32, 64], [130, 40, 200, 70]]
+  ) {
+    const targets = Array.from({ length: T }, (_, i) => (i === 1 ? -1 : (i * 7 + 3) % V));
+    const mk = () => {
+      const r = mulberry32(0xf00d);
+      return { h: randTensor([T, H], r), w: randTensor([V, H], r) };
+    };
+    const c = mk();
+    const cpuLoss = crossEntropy(linear(c.h, c.w), targets);
+    backward(cpuLoss, 1);
+
+    const g = mk();
+    gpu.install();
+    let ok = true;
+    try {
+      const loss = fusedCrossEntropy(g.h, g.w, targets, chunk);
+      backward(loss, 1);
+      await gpu.sync([loss]);
+      const dl = Math.abs(loss.data[0] - cpuLoss.data[0]);
+      if (dl > 1e-3 + 1e-3 * Math.abs(cpuLoss.data[0])) {
+        console.log(`    MISMATCH fusedCE loss: gpu=${loss.data[0]} cpu=${cpuLoss.data[0]}`);
+        ok = false;
+      }
+      ok = compare(`fusedCE.dHidden(chunk=${chunk})`, g.h.grad, c.h.grad, BWD) && ok;
+      ok = compare(`fusedCE.dReadout(chunk=${chunk})`, g.w.grad, c.w.grad, BWD) && ok;
+    } finally {
+      gpu.uninstall();
+    }
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} fused chunked CE vs dense (T=${T} V=${V} chunk=${chunk})`,
+    );
+  }
 }
 
 /**
@@ -383,7 +436,7 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
   const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
   const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
 
-  const run = async (reclaimTransients: boolean) => {
+  const run = async (reclaimTransients: boolean, lossChunk = 0) => {
     const model = new Gemma3Model(cfg, mulberry32(5));
     const g = model.paramGroups();
     const hist = await trainLMGpuResident(model, gpu, {
@@ -395,6 +448,7 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
       logEvery: 1,
       rng: mulberry32(7),
       reclaimTransients,
+      lossChunk,
     });
     return { hist, params: model.params() };
   };
@@ -419,6 +473,56 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
   console.log(
     `  ${ok ? "ok " : "FAIL"} reclaimTransients matches off ` +
       `(${steps} steps x ${batchPerStep} micro-batches)`,
+  );
+  // The fused loss holds its softmax statistics and chunk scratch as transients
+  // from forward until backward reads them, and `--reclaim` returns transients
+  // to the pool at every micro-batch boundary. That contract is a loop-level
+  // property the op-level parity case above cannot reach, so drive it through
+  // the same three-micro-batch loop: vocab 50 at chunk 16 gives four spans with
+  // nonzero offsets and a ragged tail, and Gemma3's tied readout makes the
+  // offset TN gemm accumulate into the same `tokenEmbd.grad` that `embedding`'s
+  // backward writes.
+  const chunkOff = await run(false, 16);
+  const chunkOn = await run(true, 16);
+  let cok = true;
+  for (let i = 0; i < off.hist.length; i++) {
+    for (const [tag, arm] of [["reclaim-off", chunkOff], ["reclaim-on", chunkOn]] as const) {
+      const dl = Math.abs(arm.hist[i].loss - off.hist[i].loss);
+      if (dl > 1e-3 + 1e-3 * Math.abs(off.hist[i].loss)) {
+        console.log(
+          `    MISMATCH chunked ${tag} loss@step${off.hist[i].step}: ` +
+            `${arm.hist[i].loss} vs dense ${off.hist[i].loss}`,
+        );
+        cok = false;
+      }
+    }
+  }
+  // The pair that actually isolates reclaim: same kernels, same span order, same
+  // dispatch order, only pool-recycling timing differs, so nothing reorders the
+  // f32 reduction and this must hold as tightly as the dense pair above. The
+  // comparisons against the dense baseline are the looser, separate claim that
+  // chunking preserves the math at loop scale.
+  for (let i = 0; i < chunkOff.hist.length; i++) {
+    const dl = Math.abs(chunkOn.hist[i].loss - chunkOff.hist[i].loss);
+    if (dl > 1e-4 + 1e-4 * Math.abs(chunkOff.hist[i].loss)) {
+      console.log(
+        `    MISMATCH chunked reclaim on/off loss@step${chunkOff.hist[i].step}: ` +
+          `on=${chunkOn.hist[i].loss} off=${chunkOff.hist[i].loss}`,
+      );
+      cok = false;
+    }
+  }
+  for (let i = 0; i < off.params.length; i++) {
+    cok =
+      compare(`chunkedReclaim.param${i}`, chunkOn.params[i].data, chunkOff.params[i].data, BWD) &&
+      cok;
+    cok = compare(`chunkedVsDense.param${i}`, chunkOff.params[i].data, off.params[i].data, BWD) &&
+      cok;
+  }
+  if (!cok) failures++;
+  console.log(
+    `  ${cok ? "ok " : "FAIL"} chunked loss across reclaim boundaries ` +
+      `(${steps} steps x ${batchPerStep} micro-batches, chunk 16 over vocab ${cfg.vocabSize})`,
   );
 }
 
@@ -530,6 +634,7 @@ async function main() {
   }
   await gpuMatmulFdCheck(gpu);
   await profilerSmoke(gpu);
+  await fusedCeParity(gpu);
   await flatOverflowGate(gpu);
   {
     // Row-per-workgroup 2-D fold: rmsNormHeads with rows = T*H past the cap.

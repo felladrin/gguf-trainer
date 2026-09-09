@@ -41,7 +41,10 @@ import {
   srcAttnOut,
   srcAttnProbs,
   srcCeBwd,
+  srcCeChunkGrad,
+  srcCeChunkStats,
   srcCeFwd,
+  srcCeLossFromStats,
   srcCeReduce,
   srcElementwise,
   srcEmbeddingBwd,
@@ -145,6 +148,9 @@ check(
 check("srcCeFwd", srcCeFwd(2048, 32768));
 check("srcCeBwd", srcCeBwd(2048, 32768));
 check("srcCeReduce", srcCeReduce(2048));
+check("srcCeChunkStats", srcCeChunkStats(2048, 8192, 8192));
+check("srcCeLossFromStats", srcCeLossFromStats(2048));
+check("srcCeChunkGrad", srcCeChunkGrad(2048, 8192, 8192));
 check("srcSoftCeFwd", srcSoftCeFwd(2048, 32768, 16));
 check("srcSoftCeBwdP", srcSoftCeBwdP(2048, 32768, 16));
 check("srcSoftCeBwdQ", srcSoftCeBwdQ(2048, 32768, 16));

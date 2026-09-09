@@ -33,6 +33,7 @@ import {
   f32lit,
   GEMM_BM,
   GEMM_BN,
+  grid2D,
   gridRows,
   MAX_WG,
   srcAttnBwdD,
@@ -45,7 +46,10 @@ import {
   srcAttnOut,
   srcAttnProbs,
   srcCeBwd,
+  srcCeChunkGrad,
+  srcCeChunkStats,
   srcCeFwd,
+  srcCeLossFromStats,
   srcCeReduce,
   srcElementwise,
   srcEmbeddingBwd,
@@ -186,8 +190,9 @@ export function guardBufferSize(bytes: number, maxBinding: number) {
     throw new Error(
       `GPU storage buffer of ${mb(bytes)} MiB exceeds this device's limit of ` +
         `${mb(maxBinding)} MiB (maxStorageBufferBindingSize). The likely cause is a ` +
-        `seqLen×vocab logits buffer: lower seqLen/--maxSeq, reduce the tokenizer ` +
-        `vocab, or shrink the model (hidden/layers).`,
+        `seqLen×vocab logits buffer, which --loss-chunk 8192 removes in training. ` +
+        `A vocab×hidden weight gradient survives that flag: lower seqLen/--maxSeq, ` +
+        `reduce the tokenizer vocab, or shrink the model (hidden/layers).`,
     );
   }
 }
@@ -874,6 +879,85 @@ export class WebGPUBackend implements OpsBackend {
     return out;
   }
 
+  /**
+   * Readout matmul fused into cross-entropy, streaming the vocab in chunks.
+   *
+   * The dense path keeps three [T, vocab] buffers live (the readout's data and
+   * grad from `linear`, plus `probs` in `crossEntropy`). At vocab 151936 one of
+   * them is 1.16 GiB at T=2048 and 2.32 GiB at T=4096, so the binding limit,
+   * not free memory, is what ends long-context training. Here the widest live
+   * buffer is [T, chunk] and backward recomputes each chunk's logits.
+   *
+   * The softmax statistics and the chunk scratch are transients held from
+   * forward until backward reads them, so backward must run before the next
+   * sync() or reclaimStepTransients(). That is the same contract crossEntropy
+   * already has for its probs/rowInv, and the training loops satisfy it by
+   * calling backward() immediately; this op just holds more across the boundary.
+   */
+  fusedCrossEntropy(hidden: Tensor, w: Tensor, targets: number[], chunk: number): Tensor {
+    this.beginForwardOp();
+    this.curLabel = "fusedCe";
+    const [T, H] = hidden.shape;
+    const [V, H2] = w.shape;
+    if (H !== H2) throw new Error(`fusedCrossEntropy dim mismatch ${H} vs ${H2}`);
+    if (chunk <= 0) throw new Error(`fusedCrossEntropy chunk must be positive, got ${chunk}`);
+    const eh = this.entryFor(hidden);
+    const ew = this.entryFor(w);
+    const tgtBuf = this.uploadU32(targets); // a target of -1 uploads as 0xffffffff (ignore)
+    let kept = 0;
+    for (const g of targets) if (g >= 0) kept++;
+    const divBuf = this.uploadF32([kept > 0 ? kept : 1]);
+
+    // Seeded by upload rather than by a clear: pooled buffers arrive dirty, and
+    // the running maximum has to start below every real logit. -3.0e38 matches
+    // the sentinel the chunk kernel rescales against.
+    const mxBuf = this.uploadF32(new Array(T).fill(-3.0e38));
+    const sumBuf = this.uploadF32(new Array(T).fill(0));
+    const tlBuf = this.uploadF32(new Array(T).fill(0));
+    const ltBuf = this.acquireTransient(T * 4);
+
+    // One scratch buffer, reused by every chunk in both directions. Sized for
+    // the widest chunk; a ragged last chunk simply uses less of it.
+    const chunkBuf = this.acquireTransient(T * Math.min(chunk, V) * 4);
+    const spans: { v0: number; vc: number }[] = [];
+    for (let v0 = 0; v0 < V; v0 += chunk) spans.push({ v0, vc: Math.min(chunk, V - v0) });
+
+    for (const { v0, vc } of spans) {
+      this.gemm("NT", false, T, vc, H, eh.data, ew.data, chunkBuf, v0);
+      this.dispatch(
+        srcCeChunkStats(T, vc, v0),
+        [chunkBuf, tgtBuf, mxBuf, sumBuf, tlBuf],
+        gridRows(T).x,
+        gridRows(T).y,
+      );
+    }
+    this.dispatch(srcCeLossFromStats(T), [mxBuf, sumBuf, tlBuf, tgtBuf, ltBuf], ceilDiv(T, 256));
+
+    const { t: loss, e: eo } = this.makeOut([1], [hidden, w]);
+    this.dispatch(srcCeReduce(T), [ltBuf, divBuf, eo.data], 1);
+
+    loss._backward = () => {
+      // backward(loss, seed) wrote the seed into the HOST grad array; push it to
+      // the device after the grad clears are flushed, as the dense path does.
+      this.ensureBackwardBegun();
+      this.curLabel = "fusedCe";
+      this.queue.writeBuffer(eo.grad, 0, loss.grad);
+      for (const { v0, vc } of spans) {
+        this.gemm("NT", false, T, vc, H, eh.data, ew.data, chunkBuf, v0);
+        const g = grid2D(T * vc);
+        this.dispatch(
+          srcCeChunkGrad(T, vc, v0),
+          [chunkBuf, tgtBuf, mxBuf, sumBuf, eo.grad, divBuf],
+          g.x,
+          g.y,
+        );
+        this.gemm("NN", true, T, H, vc, chunkBuf, ew.data, eh.grad, v0);
+        this.gemm("TN", true, vc, H, T, chunkBuf, eh.data, ew.grad, v0);
+      }
+    };
+    return loss;
+  }
+
   crossEntropy(logits: Tensor, targets: number[]): Tensor {
     this.beginForwardOp();
     this.curLabel = "crossEntropy";
@@ -1182,9 +1266,10 @@ export class WebGPUBackend implements OpsBackend {
     a: GpuBuffer,
     b: GpuBuffer,
     c: GpuBuffer,
+    off = 0,
   ) {
     this.dispatch(
-      srcGemm(kind, accum, M, N, K),
+      srcGemm(kind, accum, M, N, K, off),
       [a, b, c],
       ceilDiv(N, GEMM_BN),
       ceilDiv(M, GEMM_BM),

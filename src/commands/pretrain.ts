@@ -23,6 +23,7 @@
 import { readGGUF } from "../gguf/gguf.ts";
 import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";
 import { lossTrend } from "../loss-trend.ts";
+import { sequenceLoss } from "../train/loss.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
 import { crossEntropy, mulberry32 } from "../model/autograd.ts";
@@ -51,6 +52,16 @@ import { deserializeOptState, MuonGpu, serializeOptState } from "../backend/muon
 import { trainLMGpuResident } from "../backend/train-gpu.ts";
 import type { Command, Flag, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
+
+/**
+ * Span ceiling for `--loss-chunk`. Each vocab span bakes its own offset into the
+ * kernels it dispatches, so every span costs pipelines compiled before step 0.
+ * The ceiling exists only because the offset is baked rather than passed; see
+ * docs/optimization.md lever 19 for what would remove it. No width this refuses
+ * buys memory worth having: at vocab 32768 the floor is 328, and `[2048, 328]`
+ * is already 2.7 MB.
+ */
+const MAX_LOSS_SPANS = 100;
 
 const DOC_SEP = "<|endoftext|>"; // TinyStories and most raw dumps mark doc boundaries with this
 const VOCAB = 16384; // .txt-mode shared vocab (caps below this on a small sample)
@@ -219,6 +230,12 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const headDim = v.num("head-dim");
   const startStep = v.num("start-step");
   const quant = v.str("checkpoint-precision") as QuantName;
+  const lossChunk = v.num("loss-chunk");
+  if (!Number.isInteger(lossChunk) || lossChunk < 0) {
+    // A fractional width would reach WGSL as `const N: u32 = 8192.5u;` and fail
+    // as a shader-compile error rather than a usage error.
+    die(`--loss-chunk must be a whole number, 0 (dense) or positive, got ${lossChunk}`);
+  }
   const resumePath = v.opt("resume");
   const outPath = v.str("out");
   const name = v.opt("name") ?? (mode === "finetune" ? "finetune" : "pretrain-base");
@@ -324,15 +341,48 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     console.log(`Resumed weights from ${resumePath} (${g.tensors.length} tensors)`);
   }
 
+  // Every span bakes its offset into five WGSL sources (NT, stats, grad, NN, TN),
+  // so a small width compiles a pipeline per span per kernel before step 0 and
+  // presents as a hang. Checked before the parity probe below, which would
+  // otherwise pay that cost on the way to reporting it.
+  const lossSpans = lossChunk > 0 ? Math.ceil(cfg.vocabSize / lossChunk) : 0;
+  if (lossSpans > MAX_LOSS_SPANS) {
+    die(
+      `--loss-chunk ${lossChunk} splits a ${cfg.vocabSize}-token vocab into ${lossSpans} spans, ` +
+        `each compiling its own kernels before step 0. ` +
+        `Raise it to at least ${Math.ceil(cfg.vocabSize / MAX_LOSS_SPANS)}.`,
+    );
+  }
+  if (lossChunk > 0 && !model.forwardToReadout) {
+    // Silent degradation would be the worst outcome: the only reason to pass the
+    // flag is to get past the binding limit, and the dense fallback walks back
+    // into it with nothing to say why. Also before the probe, which would
+    // otherwise compare the dense path against itself and print a green line.
+    die(`--loss-chunk needs an architecture with forwardToReadout; ${arch.name} has none`);
+  }
+
   // Trust gate: GPU forward+loss must match the CPU reference at init.
   const probeIn = src.window(0, 16), probeTgt = src.window(1, 16);
   const cpuLoss = crossEntropy(model.forward(probeIn), probeTgt).data[0];
   gpu.install();
   let gpuLoss: number;
+  let fusedLoss: number | null = null;
   try {
     const l = crossEntropy(model.forward(probeIn), probeTgt);
-    await gpu.sync([l]);
+    // The op that runs every step is not the one checked above, so check it too:
+    // at 16 tokens the dense side still fits whatever the run's seq-len would
+    // have blown, and this exercises every FORWARD span offset at the real vocab
+    // before the run starts. Only forward: the probe never calls backward, so the
+    // grad, NN and TN sources first compile at step 0. Their offsets are covered
+    // by fusedCeParity's multi-block shape, not here. Both graphs are built
+    // before the single sync: sync stages
+    // back the grad of every touched external, and at probe time the optimizer
+    // does not exist yet to keep them on device, so syncing twice would read
+    // every parameter gradient twice.
+    const f = lossChunk > 0 ? sequenceLoss(model, probeIn, probeTgt, lossChunk) : null;
+    await gpu.sync(f ? [l, f] : [l]);
     gpuLoss = l.data[0];
+    if (f) fusedLoss = f.data[0];
   } finally {
     gpu.uninstall();
   }
@@ -343,6 +393,15 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     })`,
   );
   if (drift > 1e-3 + 1e-3 * Math.abs(cpuLoss)) die("GPU/CPU parity probe failed");
+  if (fusedLoss !== null) {
+    const fdrift = Math.abs(fusedLoss - gpuLoss);
+    console.log(
+      `Chunked-loss probe: dense ${gpuLoss.toFixed(4)} vs chunked ${fusedLoss.toFixed(4)} (|Δ|=${
+        fdrift.toExponential(1)
+      })`,
+    );
+    if (fdrift > 1e-3 + 1e-3 * Math.abs(gpuLoss)) die("chunked/dense loss probe failed");
+  }
 
   const groups = model.paramGroups();
   const opt = new MuonGpu(gpu, groups.muon, groups.aux, {
@@ -378,7 +437,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       Math.round(steps * 0.1)
     } / cooldown ${Math.round(steps * 0.2)} steps, quant ${quant}, reclaim ${
       flags.has("reclaim") ? "on" : "off"
-    }`,
+    }, loss ${lossChunk > 0 ? `chunked x${lossChunk} (${lossSpans} spans)` : "dense"}`,
   );
 
   // WSD decay-phase instruct injection (MiniCPM/Xmodel-2 trick): from the cooldown
@@ -464,6 +523,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     // boundary so batch>=2 fits at long context (e.g. Phase B seqLen 8192, where
     // it otherwise OOMs). Off unless asked; one GPU fence/micro-batch of overhead.
     reclaimTransients: flags.has("reclaim"),
+    lossChunk,
     logEvery: Math.max(1, Math.round(steps / 100)),
     rng: mulberry32(7 + startStep), // vary batches across resume segments
     checkpointEvery: ckptEvery,
@@ -672,6 +732,14 @@ const SHARED_FLAGS: Flag[] = [
     type: "boolean",
     describe:
       "free each micro-batch's activations at the micro-batch boundary: 5.6x less peak GPU memory for 23% less throughput (measured), and the way to fit batch>=2 at long context on a small GPU",
+  },
+  {
+    name: "loss-chunk",
+    type: "number",
+    placeholder: "N",
+    default: 0,
+    describe:
+      "stream the readout+cross-entropy in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way past the storage-buffer binding limit at a large vocab (0 = dense path)",
   },
 ];
 

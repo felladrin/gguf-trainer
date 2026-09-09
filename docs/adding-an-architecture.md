@@ -55,7 +55,27 @@ outside the arch file needs it:
 
 And the model you return from `build` implements `LanguageModel`: `params()`, `paramGroups()`,
 `forward(ids)`. Optionally `qkNorms()` if the architecture has QK-RMSNorm and should support
-MuonClip.
+MuonClip, and `forwardToReadout(ids)` if it should support `--loss-chunk`.
+
+`forwardToReadout` is the cheap one to add and worth adding: stop one matmul short of the logits
+and return `{ hidden, readout }` instead, then let `forward` be those two lines:
+
+```ts
+forwardToReadout(ids: number[]): { hidden: Tensor; readout: Tensor } {
+  // ...every layer, exactly as before...
+  return { hidden: rmsNorm(h, this.outputNorm, c.rmsEps), readout: this.output ?? this.tokenEmbd };
+}
+
+forward(ids: number[]): Tensor {
+  const { hidden, readout } = this.forwardToReadout(ids);
+  return linear(hidden, readout);
+}
+```
+
+Without it `pretrain --loss-chunk` refuses to start, naming the architecture: the dense path
+materializes `[seq-len, vocab]` logits and caps context at a large vocab (agents.md invariant 7),
+so falling back silently would walk into the abort the flag exists to avoid. Calling `trainLM`
+directly still falls back. All three shipped architectures implement it.
 
 ## The parts that are easy to get wrong
 
