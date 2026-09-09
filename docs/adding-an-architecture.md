@@ -72,8 +72,10 @@ forward(ids: number[]): Tensor {
 }
 ```
 
-Without it the trainer silently uses the dense path, which materializes `[seq-len, vocab]` logits
-and caps context at a large vocab (agents.md invariant 7). All three shipped architectures do this.
+Without it `pretrain --loss-chunk` refuses to start, naming the architecture: the dense path
+materializes `[seq-len, vocab]` logits and caps context at a large vocab (agents.md invariant 7),
+so falling back silently would walk into the abort the flag exists to avoid. Calling `trainLM`
+directly still falls back. All three shipped architectures implement it.
 
 ## The parts that are easy to get wrong
 

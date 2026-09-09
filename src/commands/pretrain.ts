@@ -25,12 +25,6 @@ import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";
 import { lossTrend } from "../loss-trend.ts";
 import { sequenceLoss } from "../train/loss.ts";
 
-/**
- * Pipeline-count ceiling for `--loss-chunk`. Each vocab span compiles five
- * offset-baked kernels, so this caps the pre-step compile cost at ~500
- * pipelines. A width small enough to exceed it saves no memory worth having.
- */
-const MAX_LOSS_SPANS = 100;
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
 import { crossEntropy, mulberry32 } from "../model/autograd.ts";
@@ -59,6 +53,16 @@ import { deserializeOptState, MuonGpu, serializeOptState } from "../backend/muon
 import { trainLMGpuResident } from "../backend/train-gpu.ts";
 import type { Command, Flag, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
+
+/**
+ * Span ceiling for `--loss-chunk`. Each vocab span bakes its own offset into the
+ * kernels it dispatches, so every span costs pipelines compiled before step 0.
+ * The ceiling exists only because the offset is baked rather than passed; see
+ * docs/optimization.md lever 19 for what would remove it. No width this refuses
+ * buys memory worth having: at vocab 32768 the floor is 328, and `[2048, 328]`
+ * is already 2.7 MB.
+ */
+const MAX_LOSS_SPANS = 100;
 
 const DOC_SEP = "<|endoftext|>"; // TinyStories and most raw dumps mark doc boundaries with this
 const VOCAB = 16384; // .txt-mode shared vocab (caps below this on a small sample)
@@ -338,6 +342,26 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     console.log(`Resumed weights from ${resumePath} (${g.tensors.length} tensors)`);
   }
 
+  // Every span bakes its offset into five WGSL sources (NT, stats, grad, NN, TN),
+  // so a small width compiles a pipeline per span per kernel before step 0 and
+  // presents as a hang. Checked before the parity probe below, which would
+  // otherwise pay that cost on the way to reporting it.
+  const lossSpans = lossChunk > 0 ? Math.ceil(cfg.vocabSize / lossChunk) : 0;
+  if (lossSpans > MAX_LOSS_SPANS) {
+    die(
+      `--loss-chunk ${lossChunk} splits a ${cfg.vocabSize}-token vocab into ${lossSpans} spans, ` +
+        `each compiling its own kernels before step 0. ` +
+        `Raise it to at least ${Math.ceil(cfg.vocabSize / MAX_LOSS_SPANS)}.`,
+    );
+  }
+  if (lossChunk > 0 && !model.forwardToReadout) {
+    // Silent degradation would be the worst outcome: the only reason to pass the
+    // flag is to get past the binding limit, and the dense fallback walks back
+    // into it with nothing to say why. Also before the probe, which would
+    // otherwise compare the dense path against itself and print a green line.
+    die(`--loss-chunk needs an architecture with forwardToReadout; ${arch.name} has none`);
+  }
+
   // Trust gate: GPU forward+loss must match the CPU reference at init.
   const probeIn = src.window(0, 16), probeTgt = src.window(1, 16);
   const cpuLoss = crossEntropy(model.forward(probeIn), probeTgt).data[0];
@@ -346,17 +370,17 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   let fusedLoss: number | null = null;
   try {
     const l = crossEntropy(model.forward(probeIn), probeTgt);
-    await gpu.sync([l]);
+    // The op that runs every step is not the one checked above, so check it too:
+    // at 16 tokens the dense side still fits whatever the run's seq-len would
+    // have blown, and this exercises every span offset at the real vocab before
+    // the run starts. Both graphs are built before the single sync: sync stages
+    // back the grad of every touched external, and at probe time the optimizer
+    // does not exist yet to keep them on device, so syncing twice would read
+    // every parameter gradient twice.
+    const f = lossChunk > 0 ? sequenceLoss(model, probeIn, probeTgt, lossChunk) : null;
+    await gpu.sync(f ? [l, f] : [l]);
     gpuLoss = l.data[0];
-    if (lossChunk > 0) {
-      // The op that runs every step is not the one checked above, so check it
-      // too: at 16 tokens the dense side still fits whatever the run's seq-len
-      // would have blown, and this exercises every span offset at the real
-      // vocab before the run starts.
-      const f = sequenceLoss(model, probeIn, probeTgt, lossChunk);
-      await gpu.sync([f]);
-      fusedLoss = f.data[0];
-    }
+    if (f) fusedLoss = f.data[0];
   } finally {
     gpu.uninstall();
   }
@@ -406,23 +430,6 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     minScale: 0.1,
   });
   const schedule = (localStep: number) => fullSchedule(startStep + localStep);
-  // Every span bakes its offset into five WGSL sources (NT, stats, grad, NN, TN),
-  // so a small width compiles thousands of pipelines before step 0 and presents
-  // as a hang. Report the count, and refuse the widths that are all cost.
-  const lossSpans = lossChunk > 0 ? Math.ceil(cfg.vocabSize / lossChunk) : 0;
-  if (lossSpans > MAX_LOSS_SPANS) {
-    die(
-      `--loss-chunk ${lossChunk} splits a ${cfg.vocabSize}-token vocab into ${lossSpans} spans, ` +
-        `each compiling 5 kernels (${lossSpans * 5} pipelines before step 0). ` +
-        `Raise it to at least ${Math.ceil(cfg.vocabSize / MAX_LOSS_SPANS)}.`,
-    );
-  }
-  if (lossChunk > 0 && !model.forwardToReadout) {
-    // Silent degradation would be the worst outcome: the only reason to pass the
-    // flag is to get past the binding limit, and the dense fallback walks back
-    // into it with nothing to say why.
-    die(`--loss-chunk needs an architecture with forwardToReadout; ${arch.name} has none`);
-  }
   console.log(
     `Schedule: muon lr ${muonLr}, aux lr ${auxLr}, WSD warmup ${
       Math.round(steps * 0.1)

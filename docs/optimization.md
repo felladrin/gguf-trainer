@@ -76,7 +76,8 @@ revisit if the vocab grows), `srcRmsNormBwdW`'s ~16x overfetch (~1% of the step)
 precompute, and sliding-window warmup (~2-3% of the run at T=2048, worse at T>=4096). Chunked online
 cross-entropy over the vocab axis is no longer deferred: it shipped as `--loss-chunk`, and it had to
 fuse the readout matmul rather than only chunk the loss, because the `[T,V]` logits and their
-gradient belong to that matmul and outweigh the softmax scratch 2:1 (lever 19). Two more stay open: 2D workgroup tiling for attention (a staged-forward
+gradient belong to that matmul and outweigh the softmax scratch 2:1 (lever 19). Two more stay open:
+2D workgroup tiling for attention (a staged-forward
 variant measured 17% SLOWER, `docs/notes/journal.md`), and cutting Newton-Schulz from five
 iterations to four, which needs an orthogonality-residual check to gate it.
 
@@ -511,7 +512,7 @@ here. The direction is what matters, and it agrees with SmolLM2: the useful rati
 sits orders of magnitude above Chinchilla, with an eventual point of diminishing returns. We are at
 the opposite end of that range by more than a factor of a thousand.
 
-### 19. Chunked fused cross-entropy: 3.7 GB and the 4K context wall, for no measurable throughput (2026-09-09)
+### 19. Chunked fused cross-entropy: 3.7 GB, and the 4K context wall (2026-09-09)
 
 Lever 3 named the per-micro-batch logits tensor as the largest single buffer and left chunking it as
 future work. Executed here, and the scoping in that note was one third of the problem: chunking the
@@ -552,6 +553,12 @@ Qwen3-0.6B-shaped models at 4K did not train at any amount of free memory. Confi
 --seq-len 4096            -> error: GPU storage buffer of 2374 MiB exceeds this device's limit of 2048 MiB
 --seq-len 4096 --loss-chunk 8192 -> trains, 74 tok/s, peak 30820 MB (pool 26325 + state 4495)
 ```
+
+`--loss-chunk` is capped at 100 spans because `voff` is baked into the kernel source, so each span
+costs its own pipelines. In the two CE kernels the offset is read in exactly two places, so a
+1-element u32 uniform would collapse 19 stats pipelines and 19 grad pipelines to 2 each and make
+the ceiling nearly free to raise. The GEMM offsets are the harder half, and their byte-identity
+property at `off = 0` is worth keeping, so this is the lever that removes the cap, not a defect.
 
 Not done here: `softCrossEntropy` (the Phase B KL anchor) still materializes `[T,V]` through the
 dense readout, so `--loss-chunk` does not apply to it. Chunking it means fusing the same readout

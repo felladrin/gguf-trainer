@@ -436,7 +436,7 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
   const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
   const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
 
-  const run = async (reclaimTransients: boolean) => {
+  const run = async (reclaimTransients: boolean, lossChunk = 0) => {
     const model = new Gemma3Model(cfg, mulberry32(5));
     const g = model.paramGroups();
     const hist = await trainLMGpuResident(model, gpu, {
@@ -448,6 +448,7 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
       logEvery: 1,
       rng: mulberry32(7),
       reclaimTransients,
+      lossChunk,
     });
     return { hist, params: model.params() };
   };
@@ -472,6 +473,38 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
   console.log(
     `  ${ok ? "ok " : "FAIL"} reclaimTransients matches off ` +
       `(${steps} steps x ${batchPerStep} micro-batches)`,
+  );
+  // The fused loss holds its softmax statistics and chunk scratch as transients
+  // from forward until backward reads them, and `--reclaim` returns transients
+  // to the pool at every micro-batch boundary. That contract is a loop-level
+  // property the op-level parity case above cannot reach, so drive it through
+  // the same three-micro-batch loop: vocab 50 at chunk 16 gives four spans with
+  // nonzero offsets and a ragged tail, and Gemma3's tied readout makes the
+  // offset TN gemm accumulate into the same `tokenEmbd.grad` that `embedding`'s
+  // backward writes.
+  const chunkOff = await run(false, 16);
+  const chunkOn = await run(true, 16);
+  let cok = true;
+  for (let i = 0; i < off.hist.length; i++) {
+    for (const [tag, arm] of [["reclaim-off", chunkOff], ["reclaim-on", chunkOn]] as const) {
+      const dl = Math.abs(arm.hist[i].loss - off.hist[i].loss);
+      if (dl > 1e-3 + 1e-3 * Math.abs(off.hist[i].loss)) {
+        console.log(
+          `    MISMATCH chunked ${tag} loss@step${off.hist[i].step}: ` +
+            `${arm.hist[i].loss} vs dense ${off.hist[i].loss}`,
+        );
+        cok = false;
+      }
+    }
+  }
+  for (let i = 0; i < off.params.length; i++) {
+    cok = compare(`chunkedReclaim.param${i}`, chunkOn.params[i].data, off.params[i].data, BWD) &&
+      cok;
+  }
+  if (!cok) failures++;
+  console.log(
+    `  ${cok ? "ok " : "FAIL"} chunked loss across reclaim boundaries ` +
+      `(${steps} steps x ${batchPerStep} micro-batches, chunk 16 over vocab ${cfg.vocabSize})`,
   );
 }
 

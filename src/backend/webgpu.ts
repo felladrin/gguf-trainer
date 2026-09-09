@@ -190,8 +190,9 @@ export function guardBufferSize(bytes: number, maxBinding: number) {
     throw new Error(
       `GPU storage buffer of ${mb(bytes)} MiB exceeds this device's limit of ` +
         `${mb(maxBinding)} MiB (maxStorageBufferBindingSize). The likely cause is a ` +
-        `seqLen×vocab logits buffer: lower seqLen/--maxSeq, reduce the tokenizer ` +
-        `vocab, or shrink the model (hidden/layers).`,
+        `seqLen×vocab logits buffer: in training, --loss-chunk 8192 removes it ` +
+        `entirely; otherwise lower seqLen/--maxSeq, reduce the tokenizer vocab, ` +
+        `or shrink the model (hidden/layers).`,
     );
   }
 }
