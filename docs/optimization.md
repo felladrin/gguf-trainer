@@ -1006,9 +1006,9 @@ The accepting cases carry an oracle computed in the test rather than a compariso
 losses, because both now draw their denominator from the same helper and would agree on a wrong
 count. Making the helper count ignored rows fails `-1 still means ignore`.
 
-Not covered here, and neighbours of the same mistake: the GPU `softCrossEntropy` still does not
-validate its teacher ids where the CPU one does (#61), and the refusal lands mid-run rather than at
-start-up (#64), which matters for `pretrain`, whose trust gate only reads the first 16 tokens.
+Not covered here: the refusal lands mid-run rather than at start-up (#64), which matters for
+`pretrain`, whose trust gate only reads the first 16 tokens. The two neighbouring gaps are closed:
+`embedding` by lever 29 and the GPU `softCrossEntropy`'s teacher ids by lever 30.
 `embedding`, the input-side twin, was #63 and is now lever 29.
 
 ### 27. `generate` paid lever 25's cost per token, 39% of its wall clock (2026-09-09)
@@ -1146,6 +1146,49 @@ table before the targets reach the loss. Scoring `smolrp.gguf` (vocab 49152) aga
 tokenized with the 151936-entry Qwen3 vocab now stops at `embedding: id 49751 at position 20`, where
 before this it ran on to `crossEntropy: target 49751 at position 19`. Same token, one position
 apart, because the targets are the inputs shifted by one.
+
+### 30. The GPU never checked its teacher ids, and both backends carried the same shape guards (2026-09-09)
+
+Filed as #61 while fixing #55. `softCrossEntropy` validated each teacher id against the vocab on the
+CPU and not at all on the GPU, so an id built against a different vocab reached the kernel and
+indexed whatever the bound buffer held. Same class as levers 26 and 29, and the same corpus mistake
+reaches it: the KL anchor's teacher file is built once over the SFT corpus, so a teacher file and a
+checkpoint can disagree exactly the way a `.tokens` file and a checkpoint can.
+
+The fix is a placement, not a fourth call. `assertTeacherRows` runs ABOVE the backend dispatch, the
+way lever 29's guard does and the way `fusedCrossEntropy`'s dimension, chunk and LoRA guards already
+did. Validating below the dispatch is what created this gap in the first place: every implementation
+then needs its own call, and one of them will be the one nobody remembers.
+
+Hoisting paid for itself twice over, because the `k >= 1` and `[T*k]` length guards were **duplicated
+verbatim** in the two backends. Both copies collapsed into the one call site, along with the CPU's
+per-element id check inside its inner loop.
+
+Three things the validator has to get right, each with its own case in `tests/gradcheck.ts`:
+
+- the ignore marker is exactly `-1` in a row's first slot, not any negative. Loosening it to `< 0`
+  skips the row unchecked, and `uploadU32` turns `-2` into a huge id the GPU scores while the CPU
+  drops the row, which is precisely the input this guard exists to catch. Same rule, same reason, as
+  `keptRowsInVocab`.
+- an ignored row's remaining ids are never read, so junk there must be accepted.
+- inside a kept row all `k` ids are checked, including the slots a short row pads at probability 0.
+  Only the FORWARDS skip a pad, both on `q == 0`. Both backwards index by its id unconditionally,
+  and the GPU's is a non-atomic read-modify-write (`DLOG[i] = DLOG[i] - scale * TQ[...]`), so an
+  out-of-range pad id lands in another row and can lose that row's real update. That is the race
+  the one-thread-per-row design exists to prevent, which makes this check load-bearing rather than
+  contract-keeping. The consequence for whoever writes a teacher file: pad short rows with an
+  in-range id, never with `-1`.
+
+One instance of the shape this lever argues against is still in the tree, pre-existing and left
+alone: `crossEntropy` dispatches above its own `keptRowsInVocab` call, so that guard lives in each
+backend. All four call sites are present today, so there is no live gap, but it is the next place
+one could open.
+
+Nine mutations, each applied alone. Removing the id check fails eight cases and the GPU arm. Moving
+the call below the dispatch passes every CPU case and fails only the GPU arm, which is the whole
+point of that arm. Loosening the marker to `< 0`, skipping zero-probability slots, dropping the
+probability-length clause, checking only the first slot, only the first row, checking ignored rows,
+and dropping the `k` guard each fail their own cases and nothing else.
 
 ## Quality levers
 
@@ -1352,7 +1395,7 @@ response tokens); an online teacher forward adds roughly a third of a step (forw
 attention-bound), affordable at this scale.
 
 **The op shipped (2026-08-04): `softCrossEntropy(logits, teacherIds, teacherProbs, k)`.** Sparse
-teacher, `[T*k]` ids + probs per row; a row is ignored when its first id is negative, the same
+teacher, `[T*k]` ids + probs per row; a row is ignored when its first id is exactly -1, the same
 convention `crossEntropy` uses, so assistant-only masking carries over unchanged. The teacher mass
 need not be normalized: with top-k truncation it sums to `S <= 1` and the exact gradient is
 `S*p - q`, which is the documented `(p - q)` when `S = 1`. The reported value is a cross-entropy in
