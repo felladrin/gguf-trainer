@@ -1161,20 +1161,28 @@ did. Validating below the dispatch is what created this gap in the first place: 
 then needs its own call, and one of them will be the one nobody remembers.
 
 Hoisting paid for itself twice over, because the `k >= 1` and `[T*k]` length guards were **duplicated
-verbatim** in the two backends. Both copies are gone, along with the CPU's per-element id check
-inside its inner loop, and the diff removes more lines than it adds.
+verbatim** in the two backends. Both copies collapsed into the one call site, along with the CPU's
+per-element id check inside its inner loop.
 
-Two things the validator has to get right, and each has its own case in `tests/gradcheck.ts`:
+Three things the validator has to get right, each with its own case in `tests/gradcheck.ts`:
 
-- the ignore marker is the FIRST id of a row, and the rest of that row is never read, so junk there
-  must be accepted. Checking ignored rows fails `an ignored row's other ids are not checked`.
-- inside a kept row every id is read, including the in-range zero-probability entries a row shorter
-  than `k` pads with, so all `k` are checked. Checking only slot 0 fails four cases.
+- the ignore marker is exactly `-1` in a row's first slot, not any negative. Loosening it to `< 0`
+  skips the row unchecked, and `uploadU32` turns `-2` into a huge id the GPU scores while the CPU
+  drops the row, which is precisely the input this guard exists to catch. Same rule, same reason, as
+  `keptRowsInVocab`.
+- an ignored row's remaining ids are never read, so junk there must be accepted.
+- inside a kept row all `k` ids are checked, including the slots a short row pads at probability 0.
+  That is **stricter than the kernels need**: neither forward reads a pad, both skipping on
+  `q == 0`, and both backwards multiply it by zero. It is deliberate. The documented contract is
+  that a pad carries an in-range id, and a validator at a trust boundary should enforce the contract
+  rather than the minimum the kernels happen to survive. The consequence for whoever writes a
+  teacher file: pad short rows with an in-range id, never with `-1`.
 
-Six mutations, each applied alone: removing the id check fails five cases and the GPU arm; moving
+Nine mutations, each applied alone. Removing the id check fails eight cases and the GPU arm. Moving
 the call below the dispatch passes every CPU case and fails only the GPU arm, which is the whole
-point of that arm; checking only the first slot, only the first row, checking ignored rows, and
-dropping the `k` guard each fail their own.
+point of that arm. Loosening the marker to `< 0`, skipping zero-probability slots, dropping the
+probability-length clause, checking only the first slot, only the first row, checking ignored rows,
+and dropping the `k` guard each fail their own cases and nothing else.
 
 ## Quality levers
 

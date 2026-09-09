@@ -698,10 +698,20 @@ export function attention(
  * and was #61: `teacherIds` reached the kernel unvalidated, so an id built
  * against a different vocab indexed whatever the bound buffer held.
  *
- * A row whose FIRST id is negative is the ignore marker and its remaining ids
- * are never read, so they are not checked. Inside a kept row every id is read,
- * including the in-range zero-probability entries a row shorter than k pads
- * with, so all k are.
+ * A row whose first id is exactly `-1` is ignored, and its remaining ids are
+ * never read, so they are not checked. `-1` and not any negative, for the reason
+ * `keptRowsInVocab` gives: `uploadU32` maps `-1` to `0xffffffff`, the marker the
+ * kernels test for, while `-2` becomes a huge id and `-0.5` becomes 0. Skipping
+ * the row on `< 0` would leave exactly the inputs this exists to catch
+ * unchecked, with the CPU dropping the row and the GPU scoring it.
+ *
+ * Inside a kept row all k ids must be in range, including the slots a row
+ * shorter than k pads at probability 0. Neither forward reads a pad, both
+ * skipping on `q == 0`, and both backwards multiply it by 0. So this is stricter
+ * than the kernels currently need, on purpose: the documented contract is that a
+ * pad carries an in-range id, and a validator at a trust boundary should enforce
+ * the contract rather than the minimum the kernels happen to survive. A teacher
+ * file must pad short rows with an in-range id, not with `-1`.
  */
 export function assertTeacherRows(
   teacherIds: number[],
@@ -718,14 +728,15 @@ export function assertTeacherRows(
     );
   }
   for (let t = 0; t < T; t++) {
-    if (teacherIds[t * k] < 0) continue; // ignored row: nothing below is read
+    if (teacherIds[t * k] === -1) continue; // the marker; nothing below it is read
     for (let j = 0; j < k; j++) {
       const id = teacherIds[t * k + j];
       if (!Number.isInteger(id) || id < 0 || id >= V) {
         throw new Error(
           `softCrossEntropy: teacher id ${id} at slot ${j} of row ${t} is not an ` +
-            `integer in [0,${V}). A teacher file built against a different vocab ` +
-            `than the checkpoint is the usual cause.`,
+            `integer in [0,${V}). Only -1 in the first slot marks an ignored row. ` +
+            `A teacher file built against a different vocab than the checkpoint is ` +
+            `the usual cause.`,
         );
       }
     }

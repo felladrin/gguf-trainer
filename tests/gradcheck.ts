@@ -392,6 +392,22 @@ async function main() {
         "a teacher array of the wrong length",
         refuses([0, 1, 2, 3], /teacher arrays must be \[T\*k\]=6/),
       ],
+      [
+        "a probability array of the wrong length",
+        refuses([0, 1, 2, 3, 4, 5], /teacher arrays must be \[T\*k\]=6/, k, [0.5, 0.5]),
+      ],
+      // Neither forward reads a pad slot, both skipping on q == 0, so nothing
+      // would break today. The contract says a pad carries an in-range id, and
+      // relaxing the validator to skip zero-probability slots passes every other
+      // case here.
+      [
+        "an out-of-range id at a zero-probability pad",
+        refuses([0, V, 0, 1, 2, 3], /at slot 1 of row 0/, k, [0.6, 0.0, 0.7, 0.3, 0.5, 0.5]),
+      ],
+      // -1 is the marker, not "any negative": uploadU32 turns -2 into a huge id
+      // the GPU scores while the CPU drops the row.
+      ["a -2 in the first slot", refuses([-2, 1, 0, 1, 2, 3], /at slot 0 of row 0/)],
+      ["a -0.5 in the first slot", refuses([-0.5, 1, 0, 1, 2, 3], /at slot 0 of row 0/)],
       // The ignore marker is the FIRST id of a row, and the rest of that row is
       // never read, so junk there must not be refused: masked positions are
       // written that way.
