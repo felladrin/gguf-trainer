@@ -511,6 +511,10 @@ export function rmsNormHeads(
 
 /** Embedding lookup: weight:[V,d], ids:number[T] -> [T,d]. */
 export function embedding(weight: Tensor, ids: number[]): Tensor {
+  // Before the id check, which reads a vocab size out of this shape: a 1-D table
+  // makes that V*d, and a 3-D one passes the right V while the row stride
+  // reads the wrong rows in silence.
+  assertMatrix(weight, "weight", "embedding");
   assertIdsInTable(ids, weight.shape[0], "embedding");
   if (opsBackend) return opsBackend.embedding(weight, ids);
   const [, d] = weight.shape;
@@ -779,6 +783,22 @@ export function assertIdsInTable(ids: number[], V: number, where: string): void 
 }
 
 /**
+ * A loss input has to be the matrix its callers assume.
+ *
+ * The three losses read `const [T, V] = logits.shape` and then compare every id
+ * against `V`. Hand one a 1-D tensor and `V` is `undefined`, so `id >= V` is
+ * false for every id: the range guards below turn themselves off on exactly the
+ * malformed input they exist to catch, and the loop then indexes past the
+ * buffer. Checked above the backend dispatch, so neither implementation can be
+ * the one that skips it.
+ */
+export function assertMatrix(t: Tensor, name: string, where: string): void {
+  if (t.shape.length !== 2) {
+    throw new Error(`${where}: ${name} must be 2-D, got [${t.shape.join(", ")}]`);
+  }
+}
+
+/**
  * Count the rows a loss will keep, refusing any target that is not an ignore
  * marker or a row of the vocab.
  *
@@ -827,6 +847,7 @@ export function keptRowsInVocab(targets: number[], T: number, V: number, where: 
 
 /** Softmax cross-entropy over logits:[T,V] vs integer targets:[T]. Returns scalar. */
 export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
+  assertMatrix(logits, "logits", "crossEntropy");
   if (opsBackend) return opsBackend.crossEntropy(logits, targets);
   const [T, V] = logits.shape;
   const loss = Tensor.zeros([1]);
@@ -897,6 +918,8 @@ export function fusedCrossEntropy(
 ): Tensor {
   // Validated ABOVE the backend dispatch, or these run on the CPU reference only
   // and every real run installs the GPU backend first.
+  assertMatrix(hidden, "hidden", "fusedCrossEntropy");
+  assertMatrix(w, "w", "fusedCrossEntropy");
   const [T, H] = hidden.shape;
   const [V, H2] = w.shape;
   if (H !== H2) throw new Error(`fusedCrossEntropy dim mismatch ${H} vs ${H2}`);
@@ -1001,6 +1024,7 @@ export function softCrossEntropy(
   teacherProbs: number[],
   k: number,
 ): Tensor {
+  assertMatrix(logits, "logits", "softCrossEntropy");
   const [T, V] = logits.shape;
   assertTeacherRows(teacherIds, teacherProbs, T, k, V);
   if (opsBackend) return opsBackend.softCrossEntropy(logits, teacherIds, teacherProbs, k);

@@ -1854,10 +1854,10 @@ async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
  * in-bounds read of the next row, measured returning exactly the CPU's wrong
  * value.
  *
- * The embedding arm is here for the opposite reason. Its guard sits ABOVE the
- * dispatch, so no backend can skip it, and what this pins is that placement:
- * move the call below and the CPU cases in gradcheck still pass while this
- * fails.
+ * The embedding, softCE and rank arms are here for the opposite reason. Their
+ * guards sit ABOVE the dispatch, so no backend can skip them, and what these
+ * pin is that placement: move a call below and the CPU cases in gradcheck still
+ * pass while this fails.
  */
 async function targetRangeGate(gpu: WebGPUBackend) {
   const T = 3, H = 4, V = 6;
@@ -1895,12 +1895,22 @@ async function targetRangeGate(gpu: WebGPUBackend) {
       () => softCrossEntropy(logits, [0, V, 1], [0.5, 0.5, 1], 1),
       /^softCrossEntropy: teacher id \d+ at slot \d+ of row \d+ /,
     );
-    const ok = dense && fused && embed && soft && scores;
+    // Rank, checked above the dispatch for all three losses: a 1-D logits makes
+    // V undefined, so every id-range guard silently accepts. The target array is
+    // T*V long on purpose, so the kept-row count check passes and the rank guard
+    // is what has to fire.
+    const flat = randTensor([T * V], mulberry32(53));
+    const flatTargets = Array.from({ length: T * V }, (_, i) => (i === 0 ? 999 : 0));
+    const rank = refused(
+      () => crossEntropy(flat, flatTargets),
+      /^crossEntropy: logits must be 2-D/,
+    );
+    const ok = dense && fused && embed && soft && rank && scores;
     if (!ok) failures++;
     console.log(
-      `  ${ok ? "ok " : "FAIL"} GPU refuses an index outside its table ` +
+      `  ${ok ? "ok " : "FAIL"} GPU refuses malformed loss inputs ` +
         `(dense ${dense}, fused ${fused}, embedding ${embed}, softCE ${soft}, ` +
-        `V-1 scores ${good.data[0].toFixed(4)})`,
+        `rank ${rank}, V-1 scores ${good.data[0].toFixed(4)})`,
     );
   } finally {
     // The legal arm above recorded work; draining here keeps the gate
