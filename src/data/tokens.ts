@@ -49,12 +49,62 @@ export function memTokenSource(data: ArrayLike<number>): TokenSource {
   return {
     length: data.length,
     window(start, len) {
+      // The same bounds check diskTokenSource has always had. Without it a
+      // window past the end returned `undefined` for every token past it, which
+      // the losses now refuse as "not an integer", by an odd route.
+      if (start < 0 || start + len > data.length) {
+        throw new Error(`window [${start},${start + len}) out of range 0..${data.length}`);
+      }
       const out = new Array<number>(len);
       for (let i = 0; i < len; i++) out[i] = data[start + i];
       return out;
     },
     close() {},
   };
+}
+
+/** Tokens per read in the corpus scan below: 8 MB of number[] at a time. */
+const SCAN_CHUNK = 1 << 20;
+
+/**
+ * Refuse a corpus that does not fit the checkpoint's vocab, at the point the
+ * source opens rather than on whichever window happens to contain the id.
+ *
+ * The losses and the embedding refuse an out-of-range id themselves (levers 26,
+ * 29 and 30), but they do it mid-run. `pretrain`'s trust gate only reads the
+ * first 16 tokens, so a `.tokens` file built with the wrong tokenizer passes it
+ * and the run can be tens of thousands of steps in before some later window
+ * happens to hold a high id. Everything written up to that point trained on
+ * whatever the guards were catching.
+ *
+ * One sequential pass over a file the run is about to read thousands of times,
+ * measured at 310M tokens/s on this machine, so a FineWeb-scale 10B-token corpus
+ * costs about 32 seconds once. `chunk` exists so the chunking itself is
+ * testable at a size a test can build.
+ */
+export function assertCorpusFitsVocab(
+  src: TokenSource,
+  vocabSize: number,
+  path: string,
+  chunk = SCAN_CHUNK,
+): void {
+  if (!Number.isInteger(chunk) || chunk < 1) {
+    throw new Error(`scan chunk must be >= 1, got ${chunk}`);
+  }
+  for (let start = 0; start < src.length; start += chunk) {
+    const len = Math.min(chunk, src.length - start);
+    const w = src.window(start, len);
+    for (let i = 0; i < len; i++) {
+      const id = w[i];
+      if (!Number.isInteger(id) || id < 0 || id >= vocabSize) {
+        throw new Error(
+          `${path}: token ${id} at position ${start + i} is outside [0,${vocabSize}). ` +
+            `The corpus was tokenized with a different vocab than the checkpoint; ` +
+            `retokenize it with the checkpoint's own tokenizer.`,
+        );
+      }
+    }
+  }
 }
 
 /** number[] -> memTokenSource; an existing TokenSource passes through. Lets the

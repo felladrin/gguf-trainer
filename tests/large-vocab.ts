@@ -8,7 +8,12 @@
 // The on-disk round-trip at both widths is covered by gradcheck.ts; this file is
 // about picking the width and about what goes wrong when it is picked wrong.
 // Run:  deno run tests/large-vocab.ts
-import { idArrayFor, tokenBytes } from "../src/data/tokens.ts";
+import {
+  assertCorpusFitsVocab,
+  idArrayFor,
+  memTokenSource,
+  tokenBytes,
+} from "../src/data/tokens.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { encodeCorpus } from "../src/commands/pretrain.ts";
 import { GGUFWriter, readGGUF } from "../src/gguf/gguf.ts";
@@ -17,6 +22,17 @@ import { CHATML_SPECIALS } from "../src/data/chat.ts";
 
 function ok(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
+}
+
+function throws(fn: () => unknown, needle: string, msg: string): void {
+  try {
+    fn();
+  } catch (e) {
+    const m = String((e as Error).message);
+    if (!m.includes(needle)) throw new Error(`${msg}: threw "${m}", expected "${needle}"`);
+    return;
+  }
+  throw new Error(`${msg}: did not throw`);
 }
 
 // The threshold, including both sides of the boundary.
@@ -125,6 +141,70 @@ ok(
   // The verdict inspect prints, and the condition chat-corpus enforces.
   const atomic = CHATML_SPECIALS.filter((x) => t.specials?.includes(x));
   ok(atomic.length === CHATML_SPECIALS.length, "so this vocab can drive chat-corpus");
+}
+
+// The corpus preflight. The losses and the embedding refuse an out-of-range id
+// themselves, but they do it on whichever window happens to hold it, and
+// pretrain's trust gate only reads the first 16 tokens: a .tokens file built
+// against a different vocab passes that and the run can be tens of thousands of
+// steps in before some later window trips a guard.
+{
+  const V = 100;
+  const clean = memTokenSource(Array.from({ length: 4096 }, (_, i) => i % V));
+  assertCorpusFitsVocab(clean, V, "clean");
+
+  const at = (pos: number, id: number) => {
+    const a = Array.from({ length: 4096 }, (_, i) => i % V);
+    a[pos] = id;
+    return memTokenSource(a);
+  };
+  // Positions chosen to straddle the scan's chunking: first, last, and one past
+  // a chunk boundary if the chunk size ever drops below the corpus length.
+  for (
+    const [pos, id, why] of [
+      [0, V, "the first token"],
+      [4095, V, "the last token"],
+      [2000, V * 10, "a middle token, far out of range"],
+      [7, -1, "a negative id"],
+      [9, 1.5, "a non-integer id"],
+    ] as [number, number, string][]
+  ) {
+    throws(
+      () => assertCorpusFitsVocab(at(pos, id), V, "corpus.tokens"),
+      `token ${id} at position ${pos} is outside [0,${V})`,
+      `${why} is refused, and named by position`,
+    );
+  }
+  // V-1 is a legal id and must not be refused; V is the boundary.
+  assertCorpusFitsVocab(at(50, V - 1), V, "clean");
+
+  // The chunking, at a size a test can build. Without a chunk argument the
+  // whole 4096-token corpus fits in one 1M-token read and a scan that stopped
+  // after the first chunk would pass everything above.
+  for (const pos of [0, 63, 64, 65, 4095]) {
+    throws(
+      () => assertCorpusFitsVocab(at(pos, V), V, "corpus.tokens", 64),
+      `at position ${pos} is outside`,
+      `a bad id at ${pos} is found with a 64-token chunk`,
+    );
+  }
+  assertCorpusFitsVocab(clean, V, "clean", 64);
+  assertCorpusFitsVocab(clean, V, "clean", 4096);
+  assertCorpusFitsVocab(clean, V, "clean", 9999);
+  throws(
+    () => assertCorpusFitsVocab(clean, V, "clean", 0),
+    "chunk must be >= 1",
+    "a non-positive chunk is refused rather than looping forever",
+  );
+
+  // memTokenSource had no bounds check, so a window past the end returned
+  // `undefined` per token, which the losses now refuse by an odd route.
+  throws(
+    () => memTokenSource([1, 2, 3]).window(2, 3),
+    "out of range",
+    "a window past the end is refused rather than padded with undefined",
+  );
+  throws(() => memTokenSource([1, 2, 3]).window(-1, 2), "out of range", "a negative start too");
 }
 
 console.log("large-vocab: all checks passed");

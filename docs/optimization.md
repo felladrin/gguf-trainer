@@ -1401,6 +1401,45 @@ like a tightening: `bytes.length < need` cannot become `!==`, since the writer p
 to the file's alignment and the reader slices each one to the next tensor's offset, so `t.data`
 legitimately carries that padding.
 
+### 34. The corpus/vocab mismatch is caught when the file opens, not on the window that hits it (2026-09-09)
+
+Filed as #64 while fixing #55. Levers 26, 29 and 30 made an out-of-range id an explicit error
+instead of a silently wrong loss, which is the right outcome, but they raise it on whichever window
+happens to contain the id. For eval that is fine, a run being minutes. For `pretrain` it is not: the
+trust gate reads only the first 16 tokens, so a `.tokens` file built with the wrong tokenizer passes
+it and the run can be tens of thousands of steps in before some later window holds a high id.
+Everything written up to that point trained on whatever the guards were catching.
+
+`assertCorpusFitsVocab` walks the source once when it opens, and `pretrain` calls it before the trust
+gate rather than after.
+
+**It costs almost nothing.** Measured at **310M tokens/s** on this machine, so the 17.4M-token
+`lambrp.tokens` scans in 0.06 s and a FineWeb-scale 10B-token corpus would cost about 32 seconds,
+once, against a run of hours. End to end on `eval-loss --windows 4` over that corpus the difference
+is inside the noise, 17.97 s against 17.89 s.
+
+The mismatched pair from lever 26 now stops in 5.9 s instead of after loading a model and running a
+forward:
+
+```
+data/lambrp-hold.tokens: token 52897 at position 36 is outside [0,49152). The corpus was
+tokenized with a different vocab than the checkpoint; retokenize it with the checkpoint's
+own tokenizer.
+```
+
+It catches a width mismatch too, for free: a 2-byte file read as 4-byte yields ids in the hundreds of
+millions, and one of this repo's own corpora reports `token 205291510 at position 0` when read
+against the wrong vocab.
+
+`memTokenSource.window` also gained the bounds check `diskTokenSource` always had. Without it a
+window past the end returned `undefined` per token, which the losses refuse as "not an integer" by an
+odd route.
+
+Nine mutations in `tests/large-vocab.ts`. Two are worth naming: the scan stopping after its first
+chunk is caught only because the chunk size is a parameter, which is why it is one, and the chunk
+guard's removal does not fail the suite, it **hangs** it, since `start += 0` never advances. A
+hanging gate is worse than a failing one, which is the argument for the guard.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

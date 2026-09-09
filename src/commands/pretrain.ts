@@ -42,7 +42,13 @@ import type { TokenizerData } from "../tokenizer/bpe.ts";
 import { CURRICULUM_SPECIALS } from "../data/chat.ts";
 import { llamaRunScript } from "../export/export-gguf.ts";
 import { wsdSchedule } from "../train/schedule.ts";
-import { diskTokenSource, idArrayFor, tokenBytes, writeTokenFile } from "../data/tokens.ts";
+import {
+  assertCorpusFitsVocab,
+  diskTokenSource,
+  idArrayFor,
+  tokenBytes,
+  writeTokenFile,
+} from "../data/tokens.ts";
 import type { IdArray } from "../data/tokens.ts";
 import type { TokenSource } from "../data/tokens.ts";
 import { parseQuantList } from "../gguf/quantize.ts";
@@ -376,6 +382,12 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   // actually build rather than a different one.
   setCheckpointing(flags.has("recompute"));
 
+  // Before the trust gate, which only reads the first 16 tokens: a .tokens file
+  // built against a different vocab passes that and the run gets tens of
+  // thousands of steps in before some later window happens to hold a high id.
+  // One sequential pass over a file this run is about to read thousands of times.
+  assertCorpusFitsVocab(src, cfg.vocabSize, inputPath);
+
   // Trust gate: GPU forward+loss must match the CPU reference at init.
   const probeIn = src.window(0, 16), probeTgt = src.window(1, 16);
   const cpuLoss = crossEntropy(model.forward(probeIn), probeTgt).data[0];
@@ -489,6 +501,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const injectFrom = flags.get("injectFrom") ? Number(flags.get("injectFrom")) : cooldownStart;
   if (injectPath) {
     injectSource = await diskTokenSource(injectPath, tokenBytes(tok.vocabSize));
+    assertCorpusFitsVocab(injectSource, cfg.vocabSize, injectPath);
     console.log(
       `Inject: ${injectPath} (${(injectSource.length / 1e6).toFixed(1)}M tokens), ` +
         `frac ${injectFrac} from step ${injectFrom}`,

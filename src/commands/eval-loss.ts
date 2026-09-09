@@ -31,7 +31,7 @@ import {
   lossChunkValueError,
   sequenceLoss,
 } from "../train/loss.ts";
-import { diskTokenSource, tokenBytes } from "../data/tokens.ts";
+import { assertCorpusFitsVocab, diskTokenSource, tokenBytes } from "../data/tokens.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
 import { initWebGPU } from "../backend/webgpu.ts";
@@ -64,6 +64,9 @@ async function run(v: Values) {
   if (badForModel) die(badForModel);
 
   const src = await diskTokenSource(tokensPath, tokenBytes(cfg.vocabSize));
+  // Up front, not on whichever window happens to hold the bad id: the whole
+  // score is meaningless if the corpus and the checkpoint disagree.
+  assertCorpusFitsVocab(src, cfg.vocabSize, tokensPath);
   // Held-out region: the last `holdout` fraction of the stream. maxStart leaves
   // room for the input window plus its +1-shifted target.
   const regionStart = Math.floor(src.length * (1 - holdout));
