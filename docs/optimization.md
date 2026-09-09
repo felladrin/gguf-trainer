@@ -930,6 +930,45 @@ applies to LoRA training as much as to eval.
 Under `--cpu` this is a no-op: `Tensor`'s constructor allocates a gradient array for every tensor
 regardless, so there is nothing for a freeze to skip. Both arms measured 3.1600 there, as expected.
 
+### 26. A target outside the vocab read the next row's logits instead of stopping (2026-09-09)
+
+Found while reviewing #54 and filed as #55. `crossEntropy` never checked that a target indexes a
+real logit row:
+
+```ts
+total += Math.log(sum) + maxL - logits.data[b + targets[t]];
+```
+
+With `targets[t] >= V` that lands in the NEXT row's logits, so the loss comes back finite and
+plausible; only on the last row does it read past the array and give NaN. `fusedCrossEntropy` fails
+differently and more quietly: an out-of-range target falls inside no vocab span, so `tgtLogit` stays
+at 0 and the row's loss is simply wrong. `softCrossEntropy` had the check already, one line below
+the one that needed it, so the two were inconsistent and the one without it was on every training
+path.
+
+The reachable case is a corpus tokenized with a different vocab than the checkpoint, which
+`agents.md` invariant 1 exists to prevent. Scoring a foreign base against the wrong `.tokens` file
+reaches it too, and that is how it looks from the outside: `smolrp.gguf` (vocab 49152) scored
+against a corpus tokenized with the 151936-entry Qwen3 vocab.
+
+|                        | before                  | after                                                            |
+| ---------------------- | ----------------------- | ---------------------------------------------------------------- |
+| `eval-loss --cpu`      | `val loss NaN  ppl NaN` | `crossEntropy: target 49751 at position 19 is outside [0,49152)` |
+| `eval-loss` on the GPU | `val loss NaN  ppl NaN` | the same message                                                 |
+
+`keptRowsInVocab` now does the range check and returns the kept count, so it replaces the counting
+loop each of the four losses already ran and costs no extra pass. All four call it: the CPU and GPU
+`crossEntropy` and the CPU and GPU `fusedCrossEntropy`.
+
+The GPU was safer by accident, never by design. `srcCeFwd` indexes a buffer bound with a fixed size,
+so WGSL's robust buffer access clamps or discards an out-of-range read rather than crossing into a
+neighbouring row. It produced no wrong neighbour and no error either, which is why the check runs on
+the host before the dispatch, and why `targetRangeGate` in `tests/gpu-parity.ts` pins both device
+call sites separately: reverting either one alone fails it.
+
+Not covered: the GPU `softCrossEntropy` still does not validate its teacher ids, where the CPU one
+does. That is the same inconsistency mirrored, and it is #61.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

@@ -353,6 +353,56 @@ async function main() {
     );
   }
   {
+    // A target outside the vocab. On the CPU `logits.data[t * V + target]` lands
+    // in the NEXT row, so the loss comes back finite and plausible instead of
+    // stopping; only the last row reads past the array and gives NaN. Both
+    // losses refuse it now, with the same message the GPU backend uses, so the
+    // two paths cannot diverge on it either.
+    const T = 3, H = 4, V = 6;
+    const hid = randTensor([T, H], rng);
+    const w = randTensor([V, H], rng);
+    const logits = linear(hid, w);
+    const refuses = (targets: number[]) => {
+      let dense = false, fused = false;
+      try {
+        crossEntropy(logits, targets);
+      } catch {
+        dense = true;
+      }
+      try {
+        // Widths that put the bad target inside a span, past every span, and in
+        // one single span: the chunked path never matches an out-of-range
+        // target, so it would leave tgtLogit at 0 and be wrong, not NaN.
+        for (const chunk of [2, 4, V]) fusedCrossEntropy(hid, w, targets, chunk);
+      } catch {
+        fused = true;
+      }
+      return dense && fused;
+    };
+    const accepts = (targets: number[]) => {
+      const d = crossEntropy(logits, targets).data[0];
+      const f = fusedCrossEntropy(hid, w, targets, 2).data[0];
+      return Number.isFinite(d) && Math.abs(d - f) < 1e-4;
+    };
+
+    const cases: [string, boolean][] = [
+      ["target == V", refuses([0, V, 1])],
+      ["target far past V", refuses([0, 1, 999])],
+      ["target on the last row", refuses([0, 1, V])],
+      ["a non-integer target", refuses([0, 1.5, 1])],
+      ["V-1 still scores", accepts([0, V - 1, 1])],
+      ["-1 still means ignore", accepts([0, -1, 1])],
+      ["every row ignored", accepts([-1, -1, -1])],
+    ];
+    const bad = cases.filter(([, ok]) => !ok).map(([name]) => name);
+    const ok = bad.length === 0;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"target vocab range".padEnd(24)}        ` +
+        `V=${V}, ${cases.length} cases${bad.length ? `, failed: ${bad.join(", ")}` : ""}`,
+    );
+  }
+  {
     // The identity eval-choice depends on: it reads the mean over kept rows and
     // multiplies by that count to recover a summed NLL. That only survives the
     // chunked path if both denominators are the same count, so pin it on the

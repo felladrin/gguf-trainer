@@ -25,7 +25,7 @@
 // batch micro-steps happens by `+=` into a gradient buffer that is zeroed
 // once per step, matching the CPU semantics.
 
-import { setOpsBackend, Tensor } from "../model/autograd.ts";
+import { keptRowsInVocab, setOpsBackend, Tensor } from "../model/autograd.ts";
 import type { OpsBackend } from "../model/autograd.ts";
 import {
   bindF32,
@@ -1056,8 +1056,7 @@ export class WebGPUBackend implements OpsBackend {
     const eh = this.entryFor(hidden);
     const ew = this.entryFor(w);
     const tgtBuf = this.uploadU32(targets); // a target of -1 uploads as 0xffffffff (ignore)
-    let kept = 0;
-    for (const g of targets) if (g >= 0) kept++;
+    const kept = keptRowsInVocab(targets, V, "fusedCrossEntropy");
     const divBuf = this.uploadF32([kept > 0 ? kept : 1]);
 
     // Seeded by upload rather than by a clear: pooled buffers arrive dirty, and
@@ -1116,8 +1115,10 @@ export class WebGPUBackend implements OpsBackend {
     const [T, V] = logits.shape;
     const el = this.entryFor(logits);
     const tgtBuf = this.uploadU32(targets); // a target of -1 uploads as 0xffffffff (ignore)
-    let kept = 0;
-    for (const g of targets) if (g >= 0) kept++;
+    // WGSL's robust buffer access would clamp or discard an out-of-range target
+    // rather than read a neighbouring row, so the GPU never produced the CPU's
+    // symptom. It also never produced an error: same check, same message.
+    const kept = keptRowsInVocab(targets, V, "crossEntropy");
     const divBuf = this.uploadF32([kept > 0 ? kept : 1]); // mean over kept rows (== T unmasked)
     // probs holds unnormalized exp(z-max); rowInv holds each row's 1/Σ, which
     // the backward applies (srcCeFwd).

@@ -671,6 +671,7 @@ async function main() {
   await gpuMatmulFdCheck(gpu);
   await profilerSmoke(gpu);
   await aliasedBinaryOpParity(gpu);
+  await targetRangeGate(gpu);
   await fusedCeParity(gpu);
   await recomputeModelParity(gpu);
   await loraModelParity(gpu);
@@ -1629,6 +1630,46 @@ async function loraModelParity(gpu: WebGPUBackend) {
  * All of those are properties of the current kernels that a future change could
  * break, which is what this is here for.
  */
+/**
+ * The vocab-range refusal on the device. WGSL's robust buffer access means an
+ * out-of-range target never produced the CPU's symptom here, so the GPU could
+ * not be relied on to notice: the check runs on the host, before the dispatch,
+ * and this pins that both GPU losses actually call it.
+ */
+async function targetRangeGate(gpu: WebGPUBackend) {
+  const T = 3, H = 4, V = 6;
+  const hid = randTensor([T, H], mulberry32(31));
+  const w = randTensor([V, H], mulberry32(37));
+  gpu.install();
+  try {
+    const refused = (fn: () => unknown) => {
+      try {
+        fn();
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    // The legal arm first, and read back: on the device `loss.data` holds zeros
+    // until sync, so checking it before would pass on an unwritten buffer.
+    const good = crossEntropy(linear(hid, w), [0, V - 1, 1]);
+    await gpu.sync([good]);
+    const scores = Number.isFinite(good.data[0]) && good.data[0] > 0;
+
+    const logits = linear(hid, w);
+    const dense = refused(() => crossEntropy(logits, [0, V, 1]));
+    const fused = refused(() => fusedCrossEntropy(hid, w, [0, V, 1], 2));
+    const ok = dense && fused && scores;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} GPU refuses a target outside the vocab ` +
+        `(dense ${dense}, fused ${fused}, V-1 scores ${good.data[0].toFixed(4)})`,
+    );
+  } finally {
+    gpu.uninstall();
+  }
+}
+
 async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
   for (const n of [1, 6, 257, 5000]) {
     const t = randTensor([n], mulberry32(4));

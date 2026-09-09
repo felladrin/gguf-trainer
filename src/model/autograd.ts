@@ -687,6 +687,35 @@ export function attention(
   return out;
 }
 
+/**
+ * Count the rows a loss will keep, refusing any target that is not a row of the
+ * vocab. A target < 0 is the ignore marker; anything else has to index a real
+ * logit row, because `logits.data[t * V + target]` with `target >= V` reads the
+ * NEXT row's logits (or past the end of the array on the last row, which gives
+ * `undefined` and a NaN loss). Either way the run continues on a plausible
+ * number instead of stopping.
+ *
+ * The usual way to get here is a corpus tokenized with a different vocab than
+ * the checkpoint, which `agents.md` invariant 1 exists to prevent: the tokenizer
+ * freezes at step one. Scoring a foreign base against the wrong `.tokens` file
+ * reaches it too.
+ */
+export function keptRowsInVocab(targets: number[], V: number, where: string): number {
+  let kept = 0;
+  for (let t = 0; t < targets.length; t++) {
+    const g = targets[t];
+    if (g < 0) continue;
+    if (!Number.isInteger(g) || g >= V) {
+      throw new Error(
+        `${where}: target ${g} at position ${t} is outside [0,${V}). ` +
+          `A corpus tokenized with a different vocab than the checkpoint is the usual cause.`,
+      );
+    }
+    kept++;
+  }
+  return kept;
+}
+
 /** Softmax cross-entropy over logits:[T,V] vs integer targets:[T]. Returns scalar. */
 export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
   if (opsBackend) return opsBackend.crossEntropy(logits, targets);
@@ -698,7 +727,7 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
   // the mean is over kept rows only. With no ignored rows this is the plain
   // full-sequence mean (kept === T), so existing callers are unchanged.
   let total = 0;
-  let kept = 0;
+  const kept = keptRowsInVocab(targets, V, "crossEntropy");
   for (let t = 0; t < T; t++) {
     const b = t * V;
     let maxL = -Infinity;
@@ -719,7 +748,6 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
       // 27.63. The GPU kernel and `fusedCrossEntropy` were already computing it
       // this way, so the CPU reference was the odd one out.
       total += Math.log(sum) + maxL - logits.data[b + targets[t]];
-      kept++;
     }
   }
   const denom = kept > 0 ? kept : 1;
@@ -777,6 +805,10 @@ export function fusedCrossEntropy(
     );
   }
   if (opsBackend) return opsBackend.fusedCrossEntropy(hidden, w, targets, chunk);
+  // Before the chunk loops, not after: an out-of-range target never falls inside
+  // any span, so `tgtLogit` would stay 0 and the loss would be quietly wrong
+  // rather than NaN.
+  const kept = keptRowsInVocab(targets, V, "fusedCrossEntropy");
   const loss = Tensor.zeros([1]);
 
   // Online softmax over the chunked vocab: a chunk whose maximum beats the
@@ -808,11 +840,9 @@ export function fusedCrossEntropy(
   }
 
   let total = 0;
-  let kept = 0;
   for (let t = 0; t < T; t++) {
     if (targets[t] < 0) continue; // ignored position: no loss, no gradient
     total += Math.log(rowSum[t]) + rowMax[t] - tgtLogit[t];
-    kept++;
   }
   const denom = kept > 0 ? kept : 1;
   loss.data[0] = total / denom;
