@@ -1802,7 +1802,8 @@ async function forwardOnlyClearGate() {
       if (/graph built before a sync/.test((e as Error).message)) return false;
       throw e;
     } finally {
-      gpu.uninstall();
+      // destroy() uninstalls, so an aborted arm cannot leave a dead backend
+      // installed for the gates after it.
       gpu.destroy();
     }
   })();
@@ -1826,8 +1827,13 @@ async function forwardOnlyClearGate() {
         return m.params().map((p) => Float32Array.from(p.grad));
       };
       const first = await step();
+      const stagedBytes = gpu.lastSyncReadbackBytes;
       // The trust gate's shape: a forward, a sync, no backward.
       await gpu.sync([sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0)]);
+      // Against step 1's own figure, so the arm does not have to assert which
+      // parameters the forward touches. Without it, `held` below would pass just
+      // as well if this sync had staged nothing at all.
+      const staged = gpu.lastSyncReadbackBytes === stagedBytes;
       // The semantic this change moves: that sync no longer zeroes the
       // accumulators before staging them, so the host grads still hold the last
       // backward's rather than zeros. Nothing reads them, but pin it: going back
@@ -1843,7 +1849,7 @@ async function forwardOnlyClearGate() {
           n++;
         }
       }
-      return held && n > 0 && worst < 1e-4;
+      return staged && held && n > 0 && worst < 1e-4;
     } finally {
       gpu.destroy();
     }

@@ -522,9 +522,11 @@ export class WebGPUBackend implements OpsBackend {
    * synced): parameter gradient accumulators are acquirePersistent buffers, NOT
    * transients, so they are never in `this.transients` and this cannot touch
    * them; grads keep accumulating across micro-batches exactly as before. We
-   * leave `touchedExternals`, `gradNeedsClear`, and `pendingClears` untouched
-   * (pendingClears is already empty at a micro-batch boundary: ensureBackwardBegun
-   * flushed it), so the deferred grad-clear timing and CPU/GPU parity are
+   * leave `touchedExternals`, `gradNeedsClear`, `pendingClears` and the two flags
+   * beside it untouched (pendingClears is already empty at a micro-batch
+   * boundary: ensureBackwardBegun flushed it, which also leaves
+   * pendingGraphClears false, and droppedClearsForGraph would already have
+   * thrown), so the deferred grad-clear timing and CPU/GPU parity are
    * unchanged. Buffers are returned to the pool only after onSubmittedWorkDone
    * proves the GPU finished the recorded work, so no in-flight pass still reads
    * them. `keep` names tensors whose DATA buffer must survive to the end-of-step
@@ -1476,7 +1478,8 @@ export class WebGPUBackend implements OpsBackend {
       gradNeedsClear: false,
     };
     // Gradients accumulate with +=, so the (possibly recycled) buffer must be
-    // zeroed before this graph's backward pass runs.
+    // zeroed before this graph's backward pass runs, if one runs at all: sync()
+    // drops the queue when none began.
     this.pendingClears.push(e.grad);
     this.pendingGraphClears = true;
     this.entries.set(t, e);
