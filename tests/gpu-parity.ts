@@ -1895,12 +1895,16 @@ async function targetRangeGate(gpu: WebGPUBackend) {
       () => softCrossEntropy(logits, [0, V, 1], [0.5, 0.5, 1], 1),
       /^softCrossEntropy: teacher id \d+ at slot \d+ of row \d+ /,
     );
-    const ok = dense && fused && embed && soft && scores;
+    // Rank, which is checked above the dispatch for all three losses: a 1-D
+    // logits makes V undefined, so every id-range guard silently accepts.
+    const flat = randTensor([T * V], mulberry32(53));
+    const rank = refused(() => crossEntropy(flat, [0, 1, 2]), /^crossEntropy: logits must be 2-D/);
+    const ok = dense && fused && embed && soft && rank && scores;
     if (!ok) failures++;
     console.log(
       `  ${ok ? "ok " : "FAIL"} GPU refuses an index outside its table ` +
         `(dense ${dense}, fused ${fused}, embedding ${embed}, softCE ${soft}, ` +
-        `V-1 scores ${good.data[0].toFixed(4)})`,
+        `rank ${rank}, V-1 scores ${good.data[0].toFixed(4)})`,
     );
   } finally {
     // The legal arm above recorded work; draining here keeps the gate

@@ -353,6 +353,74 @@ async function main() {
     );
   }
   {
+    // A loss input that is not the matrix its caller assumes. `const [T, V] =
+    // logits.shape` on a 1-D tensor leaves V undefined, so every `id >= V` is
+    // false and the range guards silently accept everything, then index past the
+    // buffer. The guard that turns itself off on malformed input is worse than
+    // no guard, so this is checked before the ids are.
+    const V = 6, H = 4;
+    const r = mulberry32(0x2b1f);
+    const flat = randTensor([V * H], r);
+    const cube = new Tensor(new Float32Array(2 * 3 * 4), [2, 3, 4], true);
+    const mat = randTensor([3, V], r);
+    const hid = randTensor([3, H], r);
+    const w = randTensor([V, H], r);
+    const message = (fn: () => unknown): string => {
+      try {
+        fn();
+        return "";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    };
+    const cases: [string, boolean][] = [
+      [
+        "crossEntropy refuses 1-D logits",
+        /^crossEntropy: logits must be 2-D, got \[24\]/.test(
+          message(() => crossEntropy(flat, [0, 1, 2])),
+        ),
+      ],
+      [
+        "crossEntropy refuses 3-D logits",
+        /^crossEntropy: logits must be 2-D, got \[2, 3, 4\]/.test(
+          message(() => crossEntropy(cube, [0, 1])),
+        ),
+      ],
+      [
+        "softCrossEntropy refuses 1-D logits",
+        /^softCrossEntropy: logits must be 2-D/.test(
+          message(() => softCrossEntropy(flat, [0], [1], 1)),
+        ),
+      ],
+      [
+        "fusedCrossEntropy refuses 1-D hidden",
+        /^fusedCrossEntropy: hidden must be 2-D/.test(
+          message(() => fusedCrossEntropy(flat, w, [0], 2)),
+        ),
+      ],
+      [
+        "fusedCrossEntropy refuses 1-D w",
+        /^fusedCrossEntropy: w must be 2-D/.test(
+          message(() => fusedCrossEntropy(hid, flat, [0, 1, 2], 2)),
+        ),
+      ],
+      // The bad shape has to be refused BEFORE the id range is read from it, or
+      // the id guard is the thing reporting and V is already undefined.
+      [
+        "the shape is checked before the ids",
+        /must be 2-D/.test(message(() => crossEntropy(flat, [0, 1, 999]))),
+      ],
+      ["a 2-D logits still scores", Number.isFinite(crossEntropy(mat, [0, 1, 2]).data[0])],
+    ];
+    const bad = cases.filter(([, ok]) => !ok).map(([name]) => name);
+    const ok = bad.length === 0;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"loss input rank".padEnd(24)}        ` +
+        `${cases.length} cases${bad.length ? `, failed: ${bad.join(", ")}` : ""}`,
+    );
+  }
+  {
     // Teacher ids outside the vocab. The CPU checked these inside its per-row
     // loop and the GPU did not check them at all, which is #61 and the omission
     // a below-dispatch guard invites. Hoisting it also let both copies of the

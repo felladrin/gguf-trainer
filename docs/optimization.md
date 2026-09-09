@@ -1182,13 +1182,35 @@ Three things the validator has to get right, each with its own case in `tests/gr
 One instance of the shape this lever argues against is still in the tree, pre-existing and left
 alone: `crossEntropy` dispatches above its own `keptRowsInVocab` call, so that guard lives in each
 backend. All four call sites are present today, so there is no live gap, but it is the next place
-one could open.
+one could open. Its rank check is above the dispatch, though: lever 31.
 
 Nine mutations, each applied alone. Removing the id check fails eight cases and the GPU arm. Moving
 the call below the dispatch passes every CPU case and fails only the GPU arm, which is the whole
 point of that arm. Loosening the marker to `< 0`, skipping zero-probability slots, dropping the
 probability-length clause, checking only the first slot, only the first row, checking ignored rows,
 and dropping the `k` guard each fail their own cases and nothing else.
+
+### 31. A guard that switched itself off on the input it was there to catch (2026-09-09)
+
+Filed as #71 while reviewing lever 30. All three losses read `const [T, V] = logits.shape` and then
+compare every id against `V`. Hand one a 1-D tensor and `V` is `undefined`, so `id >= V` is false for
+every id: `keptRowsInVocab` and `assertTeacherRows` accept everything, and the loop then indexes past
+the buffer. The range guards levers 26, 29 and 30 added turn themselves off on exactly the malformed
+input they exist to catch.
+
+`assertMatrix` refuses a `logits` that is not 2-D, and a `hidden` or `w` in `fusedCrossEntropy` the
+same. It runs above the backend dispatch and before the id checks, in that order, because a guard
+reporting on a shape it has already destructured is reporting nonsense.
+
+Unreachable today: every producer builds logits from `linear(hidden, w)` or `forwardToReadout` with a
+2-D weight. It is a hole in a trust boundary rather than a live bug, which is why it is worth naming:
+the failure mode is silent acceptance, so nothing downstream would have complained.
+
+Seven cases in `tests/gradcheck.ts` and an arm on `targetRangeGate`. Dropping any one of the four
+calls fails only that loss's cases; loosening the rank test to `>= 1` fails all six refusals, since
+the point is the exact rank and not merely "has a shape"; and moving the `crossEntropy` call below
+the dispatch passes every CPU case and fails only the GPU arm, which is by now the recognisable
+signature of that mistake.
 
 ## Quality levers
 
