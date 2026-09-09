@@ -774,10 +774,19 @@ rows of the readme's own base-model table could not be exported at all: Qwen3-0.
 and TinyLlama_v1.1 (4.10 GiB). Nothing had hit it because every model taken end to end here is
 smaller: LittleLamb-293M exports at 1.09 GiB.
 
-The regression test is `tests/large-file-write.ts`. Its cheap half checks the span arithmetic and a
-real multi-chunk round trip; the >2 GiB case is behind `GGUF_TRAINER_BIG_IO=1` because it needs
-~2.2 GB of RAM and disk. Note the failure mode: a regression runs away rather than failing an
-assertion, so run that case under `ulimit -f`.
+Every large writer in the tree goes through `writeFileBytes`, so one change covers all of them. The
+optimizer sidecar would have hit this before the weights did: it is 1504 MB for a 293M model, so a
+0.6B run's sidecar is ~3 GB. `chat-corpus` reaches it too, through `writeTokenFile`, past ~537M
+tokens.
+
+The regression test is `tests/large-file-write.ts`. Its cheap half checks the span arithmetic and
+byte-exact round trips at chunk sizes small enough to cross several spans in milliseconds, which is
+the part an edit is likely to break; a 5000-byte write at the production 1 GiB chunk is one span and
+would exercise none of it. The real 4.10 GiB write is behind `GGUF_TRAINER_BIG_IO=1` (~4.6 GB of RAM
+and disk) and runs in a child process under `ulimit -f`, because a regression there does not fail an
+assertion, it runs away: bounded, it dies on SIGXFSZ and the parent reports an ordinary FAIL. What
+no test here can reach is the partial-write drain, since `writeSync` never returns short for a
+regular file.
 
 ## Quality levers
 

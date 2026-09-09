@@ -10,18 +10,20 @@
 //   - the span arithmetic, exhaustively and for free: this is where a future
 //     edit is most likely to reintroduce an over-long call
 //   - a real multi-chunk round trip through the file system, at a size small
-//     enough to run everywhere
-//   - the genuine >2^31 write, only under GGUF_TRAINER_BIG_IO=1, because it
-//     needs ~2.2 GB of RAM and disk and CI runners should not pay for it
+//     enough to run everywhere. Note what this cannot reach: `writeSync` never
+//     returns short for a regular file, so the partial-write drain is exercised
+//     by no test here. The span tiling is what real I/O can check, and it is
+//     also the part an edit is likely to break.
+//   - the genuine large write, only under GGUF_TRAINER_BIG_IO=1, because it
+//     needs ~4.6 GB of RAM and disk and CI runners should not pay for it
 //
-// A regression does NOT surface as a clean assertion failure in that last case:
-// the write runs away, so the process either fills the disk or dies on a file
-// size limit. Bound it. Verified both ways under `ulimit -f 6000000`: with the
-// chunking removed the run is killed mid-write, and with it in place the file
-// is exactly 2147487744 bytes.
+// A regression in that last case does NOT surface as a clean assertion failure:
+// the write runs away. So it runs in a child process under `ulimit -f`, which
+// turns a runaway into a killed child and an ordinary FAIL line instead of a
+// full disk. No `ulimit` needed from the caller.
 //
 // Run:  deno run -A tests/large-file-write.ts
-//       (ulimit -f 6000000; GGUF_TRAINER_BIG_IO=1 deno run -A tests/large-file-write.ts)
+//       GGUF_TRAINER_BIG_IO=1 deno run -A tests/large-file-write.ts
 
 import { readFileBytes, WRITE_CHUNK_BYTES, writeFileBytes, writeSpans } from "../src/io.ts";
 
@@ -95,50 +97,110 @@ check(
 // 2. A real round trip that crosses several chunk boundaries. Small enough to
 //    run anywhere; the point is that the drain loop reassembles the file byte
 //    for byte, including a ragged final span.
+// The chunk argument must actually reach writeSpans. Without this, an edit that
+// drops it leaves every round trip below passing on a single span, which is the
+// shape the bug had in the first place.
 {
-  const n = 5000;
+  const path = tmpPath();
+  let threw = false;
+  try {
+    await writeFileBytes(path, new Uint8Array(8), 0);
+  } catch {
+    threw = true;
+  } finally {
+    fs.rmSync(path, { force: true });
+  }
+  check("writeFileBytes passes its chunk through to writeSpans", threw);
+}
+
+// A 5000-byte write at the default 1 GiB chunk is ONE span, so it would never
+// execute the loop, the `off + done` arithmetic or a ragged tail. Driving the
+// chunk size down is what makes the real code path reachable in milliseconds.
+for (
+  const [n, chunk] of [[1, 1], [7, 4], [64, 64], [4096, 512], [5000, 512]] as [number, number][]
+) {
   const data = new Uint8Array(n);
   for (let i = 0; i < n; i++) data[i] = (i * 31 + 7) & 0xff;
   const path = tmpPath();
   try {
-    // Exercised through the public function, so the default chunk applies; the
-    // multi-chunk path is covered by driving writeSpans directly above and by
-    // the opt-in case below.
-    await writeFileBytes(path, data);
+    await writeFileBytes(path, data, chunk);
     const got = await readFileBytes(path);
     let same = got.length === n;
     for (let i = 0; same && i < n; i++) if (got[i] !== data[i]) same = false;
-    check("round trip is byte-exact", same, `${got.length} bytes back`);
+    check(
+      `round trip byte-exact across ${Math.ceil(n / chunk)} span(s) (${n} bytes, chunk ${chunk})`,
+      same,
+      `${got.length} bytes back`,
+    );
   } finally {
     fs.rmSync(path, { force: true });
   }
 }
 
-// 3. The defect itself. Opt-in: ~2.2 GB of RAM and disk.
-if (envVar("GGUF_TRAINER_BIG_IO") === "1") {
-  const n = 2 ** 31 + 4096; // just past the boundary writeFileSync mishandles
+// 3. The defect itself. Opt-in: ~4.6 GB of RAM and disk.
+//
+// Run inside a child process under `ulimit -f`, because a regression here does
+// not fail an assertion: the write runs away, and unbounded it fills the disk.
+// The child dies on SIGXFSZ instead and the parent reports an ordinary FAIL.
+// `--big-child` is the child re-entering this file to do the write itself.
+// Past 2^31 and 2^32, and above TinyLlama_v1.1's 4.40e9-byte f32 export, which
+// is the largest thing the readme's base-model table can ask this repo to write.
+const BIG_BYTES = 4_400_000_000 + 4096;
+
+async function bigWrite(): Promise<void> {
   const path = tmpPath();
   try {
-    const data = new Uint8Array(n);
+    const data = new Uint8Array(BIG_BYTES);
     data[0] = 1;
-    data[n - 1] = 2;
+    data[BIG_BYTES - 1] = 2;
     await writeFileBytes(path, data);
     const size = fs.statSync(path).size;
     check(
-      `a ${(n / 2 ** 30).toFixed(2)} GiB write produces exactly that many bytes`,
-      size === n,
+      `a ${(BIG_BYTES / 2 ** 30).toFixed(2)} GiB write produces exactly that many bytes`,
+      size === BIG_BYTES,
       `${size}`,
     );
     const got = await readFileBytes(path);
     check(
       "and reads back with its edges intact",
-      got.length === n && got[0] === 1 && got[n - 1] === 2,
+      got.length === BIG_BYTES && got[0] === 1 && got[BIG_BYTES - 1] === 2,
     );
   } finally {
     fs.rmSync(path, { force: true });
   }
+}
+
+// deno-lint-ignore no-explicit-any
+const argv: string[] = (globalThis as any).Deno?.args ??
+  // deno-lint-ignore no-explicit-any
+  ((globalThis as any).process?.argv ?? []).slice(2);
+
+if (argv.includes("--big-child")) {
+  await bigWrite();
+} else if (envVar("GGUF_TRAINER_BIG_IO") === "1") {
+  const { spawnSync } = await import("node:child_process");
+  // deno-lint-ignore no-explicit-any
+  const g = globalThis as any;
+  const self = new URL(import.meta.url).pathname;
+  const cmd = g.Deno
+    ? `${g.Deno.execPath()} run -A ${self} --big-child`
+    : `${g.process.execPath} --experimental-strip-types ${self} --big-child`;
+  // A cap a few GB above the target: enough for the real write, far below a
+  // runaway. Exceeding it kills the child rather than the disk.
+  const r = spawnSync("sh", ["-c", `ulimit -f 12000000; exec ${cmd}`], { stdio: "inherit" });
+  // A killed child never reaches its own `finally`, so it leaves a multi-GB temp
+  // file behind. Sweep them here: that is the failing path, and the point of
+  // this wrapper is that a regression costs no disk.
+  for (const f of fs.readdirSync(os.tmpdir())) {
+    if (f.startsWith("gguf-trainer-io-")) fs.rmSync(`${os.tmpdir()}/${f}`, { force: true });
+  }
+  check(
+    "the >2 GiB case completed inside its file-size limit",
+    r.status === 0,
+    r.status === null ? `killed by ${r.signal}` : `exit ${r.status}`,
+  );
 } else {
-  console.log("  ..  >2 GiB case skipped (set GGUF_TRAINER_BIG_IO=1 to run it)");
+  console.log("  ..  large-write case skipped (set GGUF_TRAINER_BIG_IO=1 to run it)");
 }
 
 console.log(

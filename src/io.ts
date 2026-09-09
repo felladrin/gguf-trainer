@@ -8,8 +8,8 @@
  * bytes on Deno 2.9.1: instead of failing it writes without bound, and a 2.39 GB
  * export grew past 1 TB and filled the disk before anything noticed. Reads are
  * unaffected; `readFileSync` returns a >2 GiB file correctly. 1 GiB leaves the
- * boundary a wide margin and costs three write calls on the largest checkpoint
- * this trainer produces.
+ * boundary a wide margin: three write calls on a 2.22 GiB Qwen3-0.6B export,
+ * five on a 4.10 GiB TinyLlama one.
  *
  * This is not hypothetical for the models in the readme's own table: an f32
  * GGUF passes 2^31 bytes at ~537M parameters, so Qwen3-0.6B-Base (2.22 GiB) and
@@ -34,14 +34,28 @@ export function writeSpans(
   return spans;
 }
 
-export async function writeFileBytes(path: string, data: Uint8Array): Promise<void> {
+/**
+ * `chunk` exists so a test can drive the span loop without writing gigabytes;
+ * production callers leave it alone. Without it the loop is unreachable below
+ * 1 GiB, which is every input the default test suite can afford to build.
+ */
+export async function writeFileBytes(
+  path: string,
+  data: Uint8Array,
+  chunk: number = WRITE_CHUNK_BYTES,
+): Promise<void> {
   const fs = await import("node:fs");
   const fd = fs.openSync(path, "w");
   try {
-    for (const { off, len } of writeSpans(data.length)) {
-      // writeSync may satisfy only part of a request, so drain each span.
+    for (const { off, len } of writeSpans(data.length, chunk)) {
+      // writeSync may satisfy only part of a request, so drain each span. A
+      // non-positive return would otherwise spin here forever, silently.
       let done = 0;
-      while (done < len) done += fs.writeSync(fd, data, off + done, len - done);
+      while (done < len) {
+        const n = fs.writeSync(fd, data, off + done, len - done);
+        if (n <= 0) throw new Error(`short write at ${off + done}: writeSync returned ${n}`);
+        done += n;
+      }
     }
   } finally {
     fs.closeSync(fd);
