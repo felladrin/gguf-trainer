@@ -625,6 +625,51 @@ with step count (10.9 -> 10.9 MB healthy, 14.4 -> 20.8 MB with the `sync()` drai
 reclaim on it must not grow with micro-batch count (7.6 -> 7.6 MB healthy, 10.0 -> 12.2 MB with the
 `reclaimStepTransients` drain gone). Each deletion was verified to fail its own arm.
 
+### 21. LoRA: the optimizer state goes 71x, the throughput goes the wrong way (2026-09-09)
+
+`--lora-rank N` freezes every matrix in the Muon group and trains rank-N adapters beside them.
+Attached in `src/train/lora.ts` off `paramGroups().muon`, which is already exactly the set of 2-D
+hidden projections, and registered with `linear` rather than with the architectures: nothing in
+`src/arch/` knows adapters exist, and a new architecture gets them for free.
+
+Measured on qwen3 293M (vocab 151936), `--seq-len 1024 --batch 1 --reclaim --loss-chunk 8192
+--recompute`, 3 steps, same seed:
+
+| mode             | throughput | peak GPU (pool + state) | trainable     |
+| ---------------- | ---------- | ----------------------- | ------------- |
+| full             | 43 tok/s   | 12838 MB (8343 + 4495)  | 293.3M        |
+| `--lora-rank 16` | 30 tok/s   | 7884 MB (7821 + 63)     | 7.90M (2.69%) |
+
+**Optimizer state is the whole story: 4495 MB to 63 MB, 71x.** That term is `16 B/param` for Muon
+matrices and `8 B/param` for aux (lever 19's arithmetic), so it is the one cost that scales purely
+with the trainable count, and the one that dominates at any model worth adapting. The pool moves
+much less: frozen bases give up their gradient buffers (1173 MB) but the adapters add two small
+GEMMs and their activations per projection, netting 522 MB.
+
+**Throughput drops 30%, and that is the honest cost.** 196 projections become 196 x 3 matmuls plus
+an add and a scale, so a forward records several hundred extra dispatches, and lever 1c's
+host-bound step is exactly where that hurts. LoRA here buys memory, not speed. If the adapters
+were fused into the base GEMM the picture would change, and that is not done.
+
+Three design choices worth recording, because each had an alternative:
+
+**Adapters go on AdamW, not Muon.** Muon orthogonalizes the update matrix through Newton-Schulz,
+and running that on `A` and `B` separately is not orthogonalizing `B*A`. It is a different
+algorithm with no evidence behind it at these shapes, so the conservative optimizer wins until
+someone measures the other one. This is why `LoraHandle.groups.muon` is empty.
+
+**Merged into the base on every export.** `agents.md` says a checkpoint is already a file
+llama.cpp can load, and invariant 2 gates resume on an exact architecture match with no field for
+adapter-ness. Writing adapter tensors would break both. `exportGGUF` folds `B*A*scale` in, writes
+310 ordinary tensors, and folds it back out, so training continues from where it was. The f32
+round-trip drift is 1.5e-8 worst case, measured, against training noise of a different order.
+
+**`B` starts at zero.** The adapted model is exactly the checkpoint at step 0, so a resume does not
+jump. Verified: an adapted forward and the base forward agree to the digit before the first step.
+
+`--lora-rank` requires `--resume`. Adapters on a frozen random init are learning against noise, and
+the CLI refuses rather than letting the run discover that overnight.
+
 ## Correctness / robustness
 
 ### 5. Checkpoint optimizer state (medium, real gap): DONE

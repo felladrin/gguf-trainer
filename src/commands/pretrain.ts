@@ -24,6 +24,7 @@ import { readGGUF } from "../gguf/gguf.ts";
 import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";
 import { lossTrend } from "../loss-trend.ts";
 import { sequenceLoss } from "../train/loss.ts";
+import { applyLora } from "../train/lora.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
 import { crossEntropy, mulberry32, setCheckpointing } from "../model/autograd.ts";
@@ -230,6 +231,11 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const headDim = v.num("head-dim");
   const startStep = v.num("start-step");
   const quant = v.str("checkpoint-precision") as QuantName;
+  const loraRank = v.num("lora-rank");
+  const loraAlpha = v.num("lora-alpha");
+  if (!Number.isInteger(loraRank) || loraRank < 0) {
+    die(`--lora-rank must be a whole number, 0 (full fine-tune) or positive, got ${loraRank}`);
+  }
   const lossChunk = v.num("loss-chunk");
   if (!Number.isInteger(lossChunk) || lossChunk < 0) {
     // A fractional width would reach WGSL as `const N: u32 = 8192.5u;` and fail
@@ -362,6 +368,18 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     die(`--loss-chunk needs an architecture with forwardToReadout; ${arch.name} has none`);
   }
 
+  if (loraRank > 0 && !resumePath) {
+    die("--lora-rank needs --resume: adapters on a frozen random init learn against noise");
+  }
+  const lora = loraRank > 0 ? applyLora(model, loraRank, loraAlpha, mulberry32(4321)) : null;
+  if (lora) {
+    const total = arch.paramCount(cfg);
+    console.log(
+      `LoRA: rank ${loraRank}, alpha ${loraAlpha} over ${lora.adapted} projections, ` +
+        `${(lora.trainable / 1e6).toFixed(2)}M trainable of ${(total / 1e6).toFixed(1)}M ` +
+        `(${(100 * lora.trainable / total).toFixed(2)}%), merged into the weights on export`,
+    );
+  }
   // Set before the probe, so the trust gate exercises the graph the run will
   // actually build rather than a different one.
   setCheckpointing(flags.has("recompute"));
@@ -415,7 +433,12 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     if (fdrift > 1e-3 + 1e-3 * Math.abs(gpuLoss)) die("chunked/dense loss probe failed");
   }
 
-  const groups = model.paramGroups();
+  // Adapters attach after the resume has loaded the base weights, so `B = 0`
+  // makes the adapted model exactly the checkpoint at step 0, and BEFORE the
+  // trust gate: the probe should exercise the graph the run will build, and the
+  // freeze has to be in place before any forward materializes the weights on
+  // device, or entryFor allocates a full-size gradient buffer for each one.
+  const groups = lora ? lora.groups : model.paramGroups();
   const opt = new MuonGpu(gpu, groups.muon, groups.aux, {
     lr: muonLr,
     momentum: 0.95,
@@ -451,7 +474,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       flags.has("reclaim") ? "on" : "off"
     }, loss ${lossChunk > 0 ? `chunked x${lossChunk} (${lossSpans} spans)` : "dense"}, recompute ${
       flags.has("recompute") ? "on" : "off"
-    }`,
+    }, ${loraRank > 0 ? `lora r${loraRank} a${loraAlpha}` : "full fine-tune"}`,
   );
 
   // WSD decay-phase instruct injection (MiniCPM/Xmodel-2 trick): from the cooldown
@@ -482,7 +505,12 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     : undefined;
   if (chatTemplate) console.log(`Chat template: ${templatePath} (embedded in every export)`);
   const exportGGUF = async (): Promise<Uint8Array> => {
+    // Fold the adapters in, write an ordinary dense checkpoint, fold them back
+    // out. Every checkpoint this run writes loads in llama.cpp with no adapter
+    // file beside it, and the run keeps training from where it was.
+    lora?.merge();
     const b = arch.exportGGUF(model, tok.export(), cfg, { quant, name, chatTemplate });
+    lora?.unmerge();
     await writeFileBytes(`${outPath}.tmp`, b);
     const fs = await import("node:fs");
     fs.renameSync(`${outPath}.tmp`, outPath);
@@ -749,6 +777,21 @@ const SHARED_FLAGS: Flag[] = [
     type: "boolean",
     describe:
       "free each micro-batch's activations at the micro-batch boundary: 5.6x less peak GPU memory for 23% less throughput (measured), and the way to fit batch>=2 at long context on a small GPU",
+  },
+  {
+    name: "lora-rank",
+    type: "number",
+    placeholder: "N",
+    default: 0,
+    describe:
+      "train rank-N LoRA adapters on the hidden projections and freeze the base weights, instead of full fine-tuning (0 = full). Adapters are merged into the weights on export, so the GGUF stays an ordinary dense checkpoint",
+  },
+  {
+    name: "lora-alpha",
+    type: "number",
+    placeholder: "A",
+    default: 16,
+    describe: "LoRA scaling numerator; the update is (alpha/rank) * B*A",
   },
   {
     name: "recompute",

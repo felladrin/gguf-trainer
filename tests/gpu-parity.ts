@@ -34,6 +34,7 @@ import {
 } from "../src/model/autograd.ts";
 import { gemma3Config, Gemma3Model } from "../src/arch/gemma3.ts";
 import { getArch } from "../src/model/registry.ts";
+import { applyLora, clearLora } from "../src/train/lora.ts";
 import type { Gemma3Config } from "../src/arch/gemma3.ts";
 import { Muon, newtonSchulz } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
@@ -670,6 +671,7 @@ async function main() {
   await profilerSmoke(gpu);
   await fusedCeParity(gpu);
   await recomputeModelParity(gpu);
+  await loraModelParity(gpu);
   await recomputeMemoryGate();
   await flatOverflowGate(gpu);
   {
@@ -1379,6 +1381,84 @@ async function recomputeMemoryGate() {
       `(${mb(s2)}->${mb(s6)} MB, reclaim off), flat in micro-batches ` +
       `(${mb(b2)}->${mb(b4)} MB, reclaim on), under dense (${mb(dense)} MB)`,
   );
+}
+
+/**
+ * LoRA end to end on the device, over a whole model, against the CPU reference
+ * running the same adapters. Reaches three things the CPU gradcheck cannot: the
+ * adapted `linear` composing correctly through every architecture's projections,
+ * the frozen-base path where the backend skips the dW gemm and binds a shared
+ * stub for the gradient, and merge/unmerge round-tripping f32 weights.
+ */
+async function loraModelParity(gpu: WebGPUBackend) {
+  for (const name of ["gemma3", "llama", "qwen3"]) {
+    const arch = getArch(name)!;
+    // deno-lint-ignore no-explicit-any
+    const cfg = arch.tinyConfig(23) as any;
+    const ids = [3, 9, 1, 14, 7, 2], targets = [9, 1, 14, 7, 2, 5];
+
+    const cpu = arch.build(cfg, mulberry32(5));
+    const hc = applyLora(cpu, 4, 8, mulberry32(99));
+    // Move B off zero, or every adapter contributes nothing and this proves little.
+    for (const t of hc.groups.aux) for (let i = 0; i < t.data.length; i++) t.data[i] += 0.05;
+    const cpuLoss = crossEntropy(cpu.forward(ids), targets);
+    backward(cpuLoss, 1);
+    const cpuGrads = hc.groups.aux.map((p) => p.grad.slice());
+    const frozenBases = cpu.paramGroups().muon;
+    clearLora();
+
+    const model = arch.build(cfg, mulberry32(5));
+    const h = applyLora(model, 4, 8, mulberry32(99));
+    for (const t of h.groups.aux) for (let i = 0; i < t.data.length; i++) t.data[i] += 0.05;
+    gpu.install();
+    let ok = true;
+    try {
+      const loss = crossEntropy(model.forward(ids), targets);
+      backward(loss, 1);
+      await gpu.sync([loss]);
+      const dl = Math.abs(loss.data[0] - cpuLoss.data[0]);
+      if (dl > 1e-3 + 1e-3 * Math.abs(cpuLoss.data[0])) {
+        console.log(`    MISMATCH ${name} lora loss: ${loss.data[0]} vs ${cpuLoss.data[0]}`);
+        ok = false;
+      }
+      for (let i = 0; i < cpuGrads.length; i++) {
+        ok = compare(`lora.${name}.dAdapter${i}`, h.groups.aux[i].grad, cpuGrads[i], BWD) && ok;
+      }
+    } finally {
+      gpu.uninstall();
+    }
+
+    // The freeze: a frozen base must come back from the device with no gradient.
+    let frozen = 0;
+    for (const w of frozenBases) for (const g of w.grad) frozen = Math.max(frozen, Math.abs(g));
+    if (frozen !== 0) {
+      console.log(`    MISMATCH ${name} frozen base gradient ${frozen}`);
+      ok = false;
+    }
+
+    // merge/unmerge must return the weights bit-close to where they started.
+    const snapshot = model.paramGroups().muon.map((w) => w.data.slice());
+    h.merge();
+    h.unmerge();
+    let drift = 0;
+    const bases = model.paramGroups().muon;
+    for (let i = 0; i < bases.length; i++) {
+      for (let j = 0; j < snapshot[i].length; j++) {
+        drift = Math.max(drift, Math.abs(bases[i].data[j] - snapshot[i][j]));
+      }
+    }
+    if (drift > 1e-5) {
+      console.log(`    MISMATCH ${name} merge/unmerge drift ${drift}`);
+      ok = false;
+    }
+    clearLora();
+
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${name} lora vs CPU (${h.adapted} adapters, ` +
+        `frozen grad ${frozen}, merge drift ${drift.toExponential(1)})`,
+    );
+  }
 }
 
 async function syncFenceGate(gpu: WebGPUBackend) {

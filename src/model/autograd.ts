@@ -269,7 +269,42 @@ export function setOpsBackend(b: OpsBackend | null) {
 // ---------------------------------------------------------------------------
 
 /** y = x · Wᵀ, where x:[T,in], W:[out,in] -> y:[T,out]. (Linear, no bias.) */
+/**
+ * A LoRA adapter for one frozen weight: `W + (alpha/rank) * B*A`, with
+ * `A: [rank, in]` and `B: [out, rank]`.
+ */
+export interface LoraAdapter {
+  a: Tensor;
+  b: Tensor;
+  scale: number;
+}
+
+let loraAdapters: Map<Tensor, LoraAdapter> = new Map();
+
+/**
+ * Route `linear` through low-rank adapters for the listed weights.
+ *
+ * Registering here rather than in the architectures is what keeps adapters
+ * arch-agnostic: `linear` is the one call every projection already goes
+ * through, so nothing in `src/arch/` changes and a new architecture gets LoRA
+ * without knowing it exists. Pass an empty map to go back to full fine-tuning.
+ */
+export function setLoraAdapters(m: Map<Tensor, LoraAdapter>) {
+  loraAdapters = m;
+}
+
+/** y = x · Wᵀ, plus the low-rank update when `w` carries an adapter. */
 export function linear(x: Tensor, w: Tensor): Tensor {
+  if (loraAdapters.size > 0) {
+    const ad = loraAdapters.get(w);
+    // B·A·x rather than (B·A)·x: the point of the factorization is never
+    // materializing the [out, in] product.
+    if (ad) return add(linearRaw(x, w), scale(linearRaw(linearRaw(x, ad.a), ad.b), ad.scale));
+  }
+  return linearRaw(x, w);
+}
+
+function linearRaw(x: Tensor, w: Tensor): Tensor {
   if (opsBackend) return opsBackend.linear(x, w);
   const [T, inDim] = x.shape;
   const [outDim, inDim2] = w.shape;
@@ -285,6 +320,7 @@ export function linear(x: Tensor, w: Tensor): Tensor {
     }
   }
   out._prev = [x, w];
+  const wantsDW = w.requiresGrad; // a frozen LoRA base accumulates nothing
   out._backward = () => {
     for (let t = 0; t < T; t++) {
       for (let o = 0; o < outDim; o++) {
@@ -292,9 +328,13 @@ export function linear(x: Tensor, w: Tensor): Tensor {
         if (g === 0) continue;
         const xb = t * inDim;
         const wb = o * inDim;
-        for (let i = 0; i < inDim; i++) {
-          x.grad[xb + i] += g * w.data[wb + i];
-          w.grad[wb + i] += g * x.data[xb + i];
+        if (wantsDW) {
+          for (let i = 0; i < inDim; i++) {
+            x.grad[xb + i] += g * w.data[wb + i];
+            w.grad[wb + i] += g * x.data[xb + i];
+          }
+        } else {
+          for (let i = 0; i < inDim; i++) x.grad[xb + i] += g * w.data[wb + i];
         }
       }
     }
