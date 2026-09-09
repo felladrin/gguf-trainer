@@ -758,9 +758,12 @@ async function main() {
     // suite was blind to: the CPU used to clamp such a row at -log(1e-12) = 27.63
     // while the GPU computed it exactly, and every existing case produces losses
     // of 2 to 10, nowhere near the clamp. Both sides now agree at the true value.
+    // This pins MAGNITUDE, not precision: `compare`'s budget at a loss of 76.5 is
+    // 0.153, while the clamp it guards sits 48.87 away. Its gradient half is
+    // degenerate too (the probabilities are 1 and ~1e-40, so dInput is +-0.5 and
+    // zeros on both sides), so do not count this as gradient coverage.
     const V = 4;
     const logits = new Tensor(Float32Array.from([90, 0, 0, -3, 60, 1, 0, 0]), [2, V], true);
-    logits.requiresGrad = true;
     const targets = [3, 2];
     await opCase(
       gpu,

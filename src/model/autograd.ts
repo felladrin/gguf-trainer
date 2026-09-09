@@ -893,9 +893,10 @@ export function softCrossEntropy(
       if (id < 0 || id >= V) throw new Error(`softCrossEntropy: teacher id ${id} out of [0,${V})`);
       const q = teacherProbs[t * k + j];
       // A row shorter than k pads with an in-range id at probability 0 (see the
-      // docstring). `0 * finite` was harmless, but the expansion below can reach
-      // `0 * Infinity` on a non-finite logit, so skip the pad rather than turn a
-      // dead model's loss into NaN.
+      // docstring). The one input this saves is a -Infinity logit sitting at a
+      // pad slot, where the expansion below reaches `0 * Infinity`; a NaN or
+      // +Infinity logit already poisons `sum` upstream, guard or no guard. The
+      // GPU kernel skips the same way, so the two cannot diverge here.
       if (q === 0) continue;
       // Σ q·(log(Σ exp(z-m)) + m - z_id), the same expansion the GPU kernel
       // uses and for the same reason: reading a normalized probability back

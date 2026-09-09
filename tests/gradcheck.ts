@@ -313,8 +313,13 @@ async function main() {
     // dropped `q` factor or a mis-grouped `mass * log(s)` cannot hide either.
     // `exact` is the closed form, an oracle independent of the logsumexp the
     // implementations evaluate.
+    // Gap 1 is not decoration. From gap 30 up, `log(Σ exp(z-m))` underflows to
+    // exactly 0 on both sides, so those rows only exercise `m - z_target`, and
+    // even gap 10 is worth 9.3056e-5 against a 1e-4 threshold. Deleting the
+    // `log(sum)` term this fix ADDED would pass on gaps 10 to 90 alone. At gap 1
+    // it is worth 0.5619, which nothing can hide.
     let worst = 0;
-    for (const gap of [10, 30, 60, 90]) {
+    for (const gap of [1, 10, 30, 60, 90]) {
       const row = [gap, 0, 0, -3];
       const logits = new Tensor(Float32Array.from(row), [1, row.length], true);
       const exact = Math.log(Math.exp(gap) + 2 + Math.exp(-3)) - -3;
@@ -326,7 +331,7 @@ async function main() {
     if (!ok) failures++;
     console.log(
       `  ${ok ? "ok " : "FAIL"} ${"CE exact at big gaps".padEnd(24)}        ` +
-        `hard and soft, gaps to 90  maxAbs=${worst.toExponential(2)}`,
+        `hard and soft, max-to-target gaps to 93  maxAbs=${worst.toExponential(2)}`,
     );
   }
   {
