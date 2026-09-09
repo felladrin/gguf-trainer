@@ -807,6 +807,51 @@ removes the temp directory the killed child could not. What
 no test here can reach is the partial-write drain, since `writeSync` never returns short for a
 regular file.
 
+### 23. The CPU cross-entropy clamped every confident-wrong loss at 27.63 (2026-09-09)
+
+Found while trying to reproduce issue #48, which turned out not to be a bug: `add(t, t)` and
+`mul(t, t)` bind one buffer to two `read_write` slots, and that is explicitly legal. WebGPU's
+compatible-usage-list rule grants a "usage scope storage exception": multiple `storage` usages of
+one buffer in a usage scope are allowed even though they are writable. The arithmetic is defined
+too, because these kernels run one invocation per element, so both writes come from the same thread
+to the same address in program order. Measured at four sizes on both ops, maxdiff 0.00e+0, and
+`aliasedBinaryOpParity` now pins it.
+
+The reproduction that first seemed to confirm #48 was the harness, not the code: `backward()` seeds
+only the host scalar, so a non-scalar output leaves the device gradient unseeded and both sides
+compare zeros. `seedGradFromHost` is what the parity harness uses for exactly that.
+
+The real find was elsewhere. Both CPU losses computed the row's loss by reading a
+normalized probability back and adding an epsilon, `-log(p_target + 1e-12)`. Once the target falls
+about 88 logits behind the row maximum, `p_target` underflows f32 to zero and the epsilon takes
+over, so the reported loss saturates at `-log(1e-12) = 27.63` no matter how wrong the prediction
+is. Measured on a single row before the change:
+
+| gap from the row maximum to the target logit | reported  | exact     |
+| -------------------------------------------- | --------- | --------- |
+| 10                                           | 10.000136 | 10.000136 |
+| 30                                           | 27.541569 | 30        |
+| 60                                           | 27.631021 | 60        |
+| 90                                           | 27.631021 | 90        |
+
+Both GPU kernels already used the numerically stable form (`srcCeFwd` computes
+`log(s) - (z_target - m)`, and `srcSoftCeFwd`'s comment says it is "expanded so no probability is
+ever read back"), and `fusedCrossEntropy` from lever 19 was written that way too. So the two dense
+CPU losses were the only ones that clamped, and the chunked path this repo added was strictly more
+accurate than the dense one it replaced.
+
+`crossEntropy` and `softCrossEntropy` now use `log(Σ exp(z - m)) + m - z_target`. Gradients were
+never affected: the backward uses the normalized probabilities, where underflow to zero is the
+correct limit.
+
+**What it was hiding.** The CPU reference is the correctness oracle for the GPU kernels, so a
+divergence that only shows at extreme logits is exactly the kind that survives a parity suite: the
+suite's shapes produce losses of 2 to 10, nowhere near the clamp. It has a case now,
+`crossEntropy (target far behind)`, and restoring the clamp fails it at gpu 76.5
+against cpu 27.63. It also capped `eval-loss --cpu`
+at a perplexity of `e^27.63` for a badly mismatched model or tokenizer, which reads as a plausible
+number rather than a saturated one.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

@@ -669,6 +669,7 @@ async function main() {
   }
   await gpuMatmulFdCheck(gpu);
   await profilerSmoke(gpu);
+  await aliasedBinaryOpParity(gpu);
   await fusedCeParity(gpu);
   await recomputeModelParity(gpu);
   await loraModelParity(gpu);
@@ -751,6 +752,47 @@ async function main() {
     const logits = randTensor([T, V], rng);
     const targets = [2, 7, 2, 0, 16];
     await opCase(gpu, "crossEntropy", [logits], () => crossEntropy(logits, targets));
+  }
+  {
+    // A target ~90 logits behind the maximum. This is the shape lever 23 says the
+    // suite was blind to: the CPU used to clamp such a row at -log(1e-12) = 27.63
+    // while the GPU computed it exactly, and every existing case produces losses
+    // of 2 to 10, nowhere near the clamp. Both sides now agree at the true value.
+    // This pins MAGNITUDE, not precision: `compare`'s budget at a loss of 76.5 is
+    // 0.153, while the clamp it guards sits 48.87 away. Its gradient half is
+    // degenerate too: the target probabilities are 4.1e-41 and 8.8e-27, so dInput
+    // is +-0.5 and zeros on both sides. Do not count this as gradient coverage.
+    const V = 4;
+    const logits = new Tensor(Float32Array.from([90, 0, 0, -3, 60, 1, 0, 0]), [2, V], true);
+    const targets = [3, 2];
+    await opCase(
+      gpu,
+      "crossEntropy (target far behind)",
+      [logits],
+      () => crossEntropy(logits, targets),
+    );
+  }
+  {
+    // A KEPT row that pads. Every other zero-weight teacher entry in this suite
+    // sits in an IGNORED row, where both implementations return before the loop,
+    // so the zero-weight skip on either side was never executed by anything.
+    // Finite rather than -Infinity on purpose: this kernel seeds its running
+    // maximum with -3.0e38 rather than -inf precisely to avoid depending on
+    // infinity semantics on the device. The limit that follows is worth stating:
+    // for a finite pad the skip is behaviour-preserving, so removing it does NOT
+    // fail this case. What this pins is that the two implementations agree on a
+    // padded row at all; the skip's actual purpose is pinned on the CPU side, in
+    // `softCE skips a zero pad` in tests/gradcheck.ts.
+    const V = 5, K = 3;
+    const logits = randTensor([2, V], mulberry32(77));
+    const ids = [3, 0, 2, 1, 4, 0];
+    const probs = [0.7, 0.3, 0.0, 0.5, 0.5, 0.0];
+    await opCase(
+      gpu,
+      "softCrossEntropy (zero-weight pad)",
+      [logits],
+      () => softCrossEntropy(logits, ids, probs, K),
+    );
   }
   {
     // Ignore-index (-1) = assistant-only loss masking: masked rows contribute
@@ -1490,6 +1532,41 @@ async function loraModelParity(gpu: WebGPUBackend) {
       `  ${ok ? "ok " : "FAIL"} ${name} lora + recompute vs CPU (${h.adapted} adapters, ` +
         `stub ${stubDirty}, merge drift ${drift.toExponential(1)})`,
     );
+  }
+}
+
+/**
+ * Element-wise ops given the SAME tensor twice.
+ *
+ * Issue #48 predicted that `add(t, t)` loses one of its two gradient
+ * accumulations on the GPU, because the backward binds one buffer to two
+ * `read_write` slots and does two read-modify-writes. It does not, and both
+ * halves of why are worth pinning rather than rediscovering.
+ *
+ * The binding is legal. WebGPU's compatible-usage-list rule grants an explicit
+ * "usage scope storage exception": multiple `storage` usages of one buffer in a
+ * usage scope are allowed *even though they are writable*. So this is not a
+ * validation error waiting to fire on a stricter backend.
+ *
+ * The arithmetic is defined too. These kernels run one invocation per element,
+ * so both writes come from the same thread to the same address in program
+ * order. There is no cross-thread race for the exception to expose.
+ *
+ * What the exception does NOT cover is a mixed list. Binding one buffer as
+ * `read` and as `read_write` in the same dispatch is neither all-read-only nor
+ * all-`storage`, and would be a real validation error. Nothing in this tree does
+ * that: `mul`'s backward aliases `AB`/`BB` (both `read`) and `DA`/`DB` (both
+ * `storage`), never one of each.
+ *
+ * All of those are properties of the current kernels that a future change could
+ * break, which is what this is here for.
+ */
+async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
+  for (const n of [1, 6, 257, 5000]) {
+    const t = randTensor([n], mulberry32(4));
+    await opCase(gpu, `add(t, t) [n=${n}]`, [t], () => add(t, t));
+    const u = randTensor([n], mulberry32(9));
+    await opCase(gpu, `mul(t, t) [n=${n}]`, [u], () => mul(u, u));
   }
 }
 

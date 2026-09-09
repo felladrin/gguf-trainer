@@ -301,6 +301,58 @@ async function main() {
     );
   }
   {
+    // The loss must stay exact when the target is far behind the maximum. Both
+    // CPU losses used to read a normalized probability back and add 1e-12 to it,
+    // which clamped every worse prediction at -log(1e-12) = 27.63: a 30-logit
+    // gap reported 27.54 and a 90-logit gap still reported 27.63. Both GPU
+    // kernels already used the logsumexp form, so this was a silent CPU/GPU
+    // divergence that only appeared once a model was badly wrong.
+    // The target logit is -3, not 0: with a zero target the `- z_target` term
+    // contributes nothing and deleting it entirely would still pass. The soft
+    // case uses a truncated teacher mass (q = 0.6) for the same reason, so a
+    // dropped `q` factor or a mis-grouped `mass * log(s)` cannot hide either.
+    // `exact` is the closed form, an oracle independent of the logsumexp the
+    // implementations evaluate.
+    // Gap 1 is not decoration. `log(Σ exp(z-m))` shrinks out of the comparison as
+    // the gap grows: in the f64 this reference computes with it is 1.9184e-13 at
+    // gap 30 and exactly 0 from about gap 37, and even gap 10 is worth only
+    // 9.3056e-5 against a 1e-4 threshold. So deleting the `log(sum)` term this
+    // fix ADDED would pass on gaps 10 to 90 alone, with 7% to spare. At gap 1 it
+    // is worth 0.5619, which nothing can hide.
+    let worst = 0;
+    for (const gap of [1, 10, 30, 60, 90]) {
+      const row = [gap, 0, 0, -3];
+      const logits = new Tensor(Float32Array.from(row), [1, row.length], true);
+      const exact = Math.log(Math.exp(gap) + 2 + Math.exp(-3)) - -3;
+      worst = Math.max(worst, Math.abs(crossEntropy(logits, [3]).data[0] - exact));
+      const q = 0.6;
+      worst = Math.max(worst, Math.abs(softCrossEntropy(logits, [3], [q], 1).data[0] - q * exact));
+    }
+    const ok = worst < 1e-4;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"CE exact at big gaps".padEnd(24)}        ` +
+        `hard and soft, max-to-target gaps to 93  maxAbs=${worst.toExponential(2)}`,
+    );
+  }
+  {
+    // A KEPT row that pads. Every zero-weight teacher entry elsewhere in the
+    // suite sits in an ignored row, where both implementations return before the
+    // loop, so the zero-weight skip itself was never executed by anything. The
+    // pad's id points at a -Infinity logit, which is the one input the skip
+    // saves: without it the expansion evaluates 0 * Infinity and the whole loss
+    // goes NaN.
+    const V = 5;
+    const logits = new Tensor(Float32Array.from([1, 0, -Infinity, 2, 0]), [1, V], true);
+    const l = softCrossEntropy(logits, [3, 0, 2], [0.7, 0.3, 0.0], 3).data[0];
+    const ok = Number.isFinite(l);
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"softCE skips a zero pad".padEnd(24)}        ` +
+        `kept row, -Infinity at the pad id  loss=${l}`,
+    );
+  }
+  {
     // The identity eval-choice depends on: it reads the mean over kept rows and
     // multiplies by that count to recover a summed NLL. That only survives the
     // chunked path if both denominators are the same count, so pin it on the

@@ -1049,8 +1049,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     var mass = 0.0;
     for (var j = 0u; j < K; j++) {
       let q = TQ[t * K + j];
-      acc = acc - q * (LOG[base + TID[t * K + j]] - m);
-      mass = mass + q;
+      // A row shorter than K pads with a zero-weight id. Skipping it keeps
+      // 0 * -inf from turning the row into NaN, and matches the CPU reference.
+      if (q != 0.0) {
+        acc = acc - q * (LOG[base + TID[t * K + j]] - m);
+        mass = mass + q;
+      }
     }
     LT[t] = acc + mass * log(s);
     SMASS[t] = mass;
