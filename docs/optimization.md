@@ -1077,6 +1077,11 @@ where every parameter is frozen, and LoRA training, where the base weights are f
 run. On a 310-tensor checkpoint at `--windows 16` that is 4650 no-op commands: the first window
 does not queue them, because `entryFor` starts `gradNeedsClear` at `requiresGrad`.
 
+**Lever 32 has since subsumed the eval half of this.** A forward-only window issues no clears at
+all now, frozen or not, so those 4650 are gone whether or not this landed. What remains here is the
+LoRA and finetune half, where the window does run a backward and a frozen base weight's stub would
+still be re-armed, and that is the configuration `frozenClearGate` measures.
+
 `e.gradNeedsClear = e.grad !== this.frozenStub` is the whole fix, and which side of that predicate
 it sits on is the interesting part. `t.requiresGrad` is the obvious spelling and it is wrong in one
 ordering: freeze a parameter mid-window, after that window's `entryFor` and before its `sync()`, and
@@ -1270,11 +1275,23 @@ when probed. Both are the size of the noise. What the change buys is a command s
 one without issues 0, and the two losses are bit-equal. Removing the guard or inverting it makes the
 forward-only arm issue all 139.
 
-**It also invalidated a gate written three levers ago.** `frozenClearGate` compared clear counts
-across two forward-only windows, which now issue none at all, so it went red on a correct change. It
-runs a backward now, since a parameter's clear is only observable in a window that has one. Worth
-noting as the failure mode of counting gates: they pin a number that a later, unrelated improvement
-is entitled to move.
+**It also invalidated a gate written four levers ago, and half of that lever's justification.**
+`frozenClearGate` compared clear counts across two forward-only windows, which now issue none at
+all, so it went red on a correct change. It runs a backward now, since a parameter's clear is only
+observable in a window that has one. Lever 28's headline saving, 4650 no-op commands per eval run,
+is likewise gone whether or not lever 28 had landed: what it still buys is the LoRA and finetune
+case, and that entry now says so. Worth noting as the failure mode of counting gates and of the
+levers that quote them: both pin a number a later, unrelated improvement is entitled to move.
+
+The drain in `sync()` is a safety net rather than a live path, measured by deleting it: every clear
+today is issued by `ensureBackwardBegun`, and no count moves. It covers clears queued after a
+backward began, which is where a second backward over one graph would need them.
+
+**The price is an invariant that used to be forgiving.** Dropping a clear is safe only while no
+backward runs over a graph built before a sync. That ordering was previously wasteful but survivable,
+since the buffers went back to the pool zeroed; now they go back dirty, so the same mistake would
+accumulate into pool garbage and report a believable number. `ensureBackwardBegun` throws on it, and
+the gate has an arm that builds a graph, syncs it, asks for a backward and expects the refusal.
 
 ## Quality levers
 

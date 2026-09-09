@@ -319,6 +319,9 @@ export class WebGPUBackend implements OpsBackend {
   private gradKeptOnDevice = new WeakSet<Tensor>();
   private transients: { buf: GpuBuffer; size: number }[] = [];
   private pendingClears: GpuBuffer[] = [];
+  // Set when a sync() discarded queued clears because no backward had begun.
+  // Cleared by the next forward op, i.e. by the next graph.
+  private droppedClearsForGraph = false;
   /**
    * Buffers released by endRegion, reusable ONLY by makeOut.
    *
@@ -407,11 +410,17 @@ export class WebGPUBackend implements OpsBackend {
     // buffers return to the pool at the end of this sync, so a clear held over
     // would land on whatever reacquires them. The invariant that makes it safe
     // is the same one recycling already needs, that no backward may begin for a
-    // graph built before this sync; ensureBackwardBegun drains the queue itself
-    // when one does.
+    // graph built before this sync, and ensureBackwardBegun throws if one tries.
+    //
+    // The drain itself is a safety net rather than a live path: measured by
+    // deleting it, every clear today is issued by ensureBackwardBegun and no
+    // count moves. It covers clears queued AFTER a backward began, which is
+    // where a second backward over one graph would need them.
     if (this.backwardBegun) {
       for (const b of this.pendingClears) this.enc.clearBuffer(b);
       this.gradClearsIssued += this.pendingClears.length;
+    } else if (this.pendingClears.length > 0) {
+      this.droppedClearsForGraph = true;
     }
     this.pendingClears = [];
 
@@ -1250,6 +1259,7 @@ export class WebGPUBackend implements OpsBackend {
    */
   private beginForwardOp() {
     this.backwardBegun = false;
+    this.droppedClearsForGraph = false;
     if (this.deviceError) throw new Error(this.deviceError);
   }
 
@@ -1260,6 +1270,18 @@ export class WebGPUBackend implements OpsBackend {
    */
   private ensureBackwardBegun() {
     if (this.backwardBegun) return;
+    // The invariant recycling already needed, made loud. Before the clears were
+    // conditional this ordering was wrong but survivable: the buffers went back
+    // to the pool zeroed. Now they go back dirty, so a backward over a graph
+    // built before a sync would accumulate into whatever reacquired them and
+    // report a believable number.
+    if (this.droppedClearsForGraph) {
+      throw new Error(
+        "backward over a graph built before a sync(): that sync recycled the graph's " +
+          "gradient buffers and discarded their clears, so this backward would " +
+          "accumulate into pool garbage",
+      );
+    }
     this.backwardBegun = true;
     this.endPass();
     if (this.pendingClears.length > 0) {

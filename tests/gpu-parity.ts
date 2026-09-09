@@ -1670,11 +1670,12 @@ async function frozenClearGate() {
       // params().length stands in for "externals this forward touches", which
       // holds because this forward touches every parameter. A parameter a future
       // forward skipped would move the count for a reason unrelated to freezing.
-      // With a backward, because a forward-only window issues no clears at all
-      // since lever 32: the drain is skipped when nothing ran backward. A
-      // parameter's clear is only observable in a window that has one.
       const window = async () => {
         const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+        // With a backward, since lever 32: a forward-only window issues no
+        // clears at all, so a parameter's is only observable in a window that
+        // runs one. That is LoRA and finetune, which is where lever 28 still
+        // pays.
         backward(loss, 1);
         await gpu.sync([loss]);
         return loss.data[0];
@@ -1691,9 +1692,8 @@ async function frozenClearGate() {
   const cold = await arm(true);
 
   // Exactly one clear per parameter goes away, and nothing else does. The rest
-  // of the count is the per-window intermediates, which makeOut queues
-  // unconditionally at creation; those are a separate waste in a forward-only
-  // run and are #67, not this.
+  // of the count is the intermediates, which a backward genuinely accumulates
+  // into.
   const savedTheParams = hot.second - cold.second === hot.params;
   // Weak on its own, since the intermediates alone satisfy it: what it catches
   // is makeOut's queue disappearing, which would make the assertion above pass
@@ -1722,9 +1722,13 @@ async function frozenClearGate() {
  * dirty. Eval, `generate` and the trust gate never run one, so every one of
  * those clears was zeroing a buffer nobody would read.
  *
- * The counting arms are the whole test: this is not a speed fix, and a probe
- * measured it at 26.53 s against 26.69 s on `eval-loss --windows 16`, inside the
- * run-to-run spread. What it buys is a command stream that says what it means.
+ * The counting arms are most of the test: this is not a speed fix, measuring
+ * 26.62 s against 26.69 s on `eval-loss --windows 16`, inside the run-to-run
+ * spread. What it buys is a command stream that says what it means.
+ *
+ * The last arm is the price. Dropping a clear is safe only while no backward
+ * runs over a graph built before a sync, and that ordering used to be merely
+ * wasteful, so it would now have been silently wrong.
  */
 async function forwardOnlyClearGate() {
   const cfg = gemma3Config(64, 64, 4, 256, 16);
@@ -1747,20 +1751,48 @@ async function forwardOnlyClearGate() {
   const bwd = await arm(true);
   const fwd = await arm(false);
 
+  // The ordering the drop makes unsafe, and which now throws instead of
+  // accumulating into pool garbage: build a graph, sync it, then ask for a
+  // backward over it. Nothing in the tree does this; the guard exists because
+  // before this change the same ordering was merely wasteful, so it would have
+  // become silently wrong rather than loudly so.
+  const refusesLateBackward = await (async () => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    try {
+      gpu.install();
+      gpu.uploadParams(m.params());
+      const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+      await gpu.sync([loss]);
+      try {
+        backward(loss, 1);
+        await gpu.sync([]);
+        return false;
+      } catch (e) {
+        return /graph built before a sync/.test((e as Error).message);
+      }
+    } finally {
+      gpu.destroy();
+    }
+  })();
+
   // 1. A window with a backward still zeroes every buffer that backward will
   //    accumulate into. Losing this is a correctness bug, not a tidiness one.
   const stillClears = bwd.clears > 0;
   // 2. A forward-only window issues none.
   const noneWithoutBackward = fwd.clears === 0;
-  // 3. And the loss is identical, which is the claim that the skipped clears
-  //    were doing nothing.
+  // 3. And the loss is identical. Weak on its own, since the loss is a forward
+  //    quantity and clears only ever touch gradient buffers, which makeOut
+  //    acquires separately from data. What carries the claim that nothing was
+  //    lost is the rest of this suite's gradient comparisons staying green.
   const same = bwd.loss === fwd.loss;
 
-  const ok = stillClears && noneWithoutBackward && same;
+  const ok = stillClears && noneWithoutBackward && same && refusesLateBackward;
   if (!ok) failures++;
   console.log(
     `  ${ok ? "ok " : "FAIL"} forward-only clears: ${bwd.clears} issued with a backward, ` +
-      `${fwd.clears} without, loss ${bwd.loss.toFixed(6)} both`,
+      `${fwd.clears} without, loss ${bwd.loss.toFixed(6)} both, ` +
+      `late backward refused ${refusesLateBackward}`,
   );
 }
 
