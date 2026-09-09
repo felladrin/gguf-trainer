@@ -22,7 +22,12 @@
 
 import { readFileBytes } from "../io.ts";
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
-import { lossChunkModelError, lossChunkValueError, sequenceLoss } from "../train/loss.ts";
+import {
+  freezeForScoring,
+  lossChunkModelError,
+  lossChunkValueError,
+  sequenceLoss,
+} from "../train/loss.ts";
 import type { LanguageModel } from "../model/arch.ts";
 import type { BPETokenizer } from "../tokenizer/bpe.ts";
 import { initWebGPU } from "../backend/webgpu.ts";
@@ -300,6 +305,9 @@ async function run(v: Values) {
   const badChunk = lossChunkValueError(lossChunk);
   if (badChunk) die(badChunk);
   const { model, tokenizer: tok, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
+  // Scoring never runs backward, and a gradient buffer per parameter would be
+  // allocated once and staged back to the host on every scored choice.
+  freezeForScoring(model);
   const badForModel = lossChunkModelError(lossChunk, cfg.vocabSize, cfg.arch, model);
   if (badForModel) die(badForModel);
 

@@ -21,6 +21,31 @@ import type { LanguageModel } from "../model/arch.ts";
 export const MAX_LOSS_SPANS = 100;
 
 /**
+ * Freeze every parameter for a forward-only run.
+ *
+ * Nothing in eval calls backward, but the backend gives each external tensor a
+ * persistent gradient accumulator on first use and `sync()` stages every one of
+ * them back to the host afterwards, so each scored window copies a whole model
+ * of zeros nobody reads: ~1.17 GB per window on a 293M f32 checkpoint, times 64
+ * windows for an `eval-loss` default and times one per choice per item for
+ * `eval-choice`. A frozen external shares one small stub instead (`entryFor` in
+ * src/backend/webgpu.ts), so this drops the allocation as well as the copy.
+ *
+ * Call it before `uploadParams`: `entryFor` sizes the buffer on first use, and a
+ * parameter frozen after that keeps the accumulator it already has.
+ *
+ * One-way, and deliberately without a thaw. Training a model that has been
+ * through this needs both `requiresGrad = true` again AND a fresh backend:
+ * `entryFor` has already handed each parameter the 256-byte stub, and `sync()`
+ * would then stage `t.size * 4` bytes out of it, which is a device validation
+ * error rather than a wrong number. No caller evals and trains the same model
+ * in one process today.
+ */
+export function freezeForScoring(model: LanguageModel): void {
+  for (const p of model.params()) p.requiresGrad = false;
+}
+
+/**
  * Everything `--loss-chunk` has to be checked for, in one place because three
  * commands take the flag and a fourth will forget half of it otherwise.
  *

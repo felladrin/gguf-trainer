@@ -890,6 +890,46 @@ measured 0-shot, where the longest of these four prompts is a few hundred tokens
 either a foreign base with a short declared context or a large `--shots`: `--shots 10` against a
 512-context checkpoint reaches it.
 
+### 25. Eval copied a whole model of gradients back per window, 15% of its wall clock (2026-09-09)
+
+Found while reviewing #51 and filed as #53. `entryFor` gives every external tensor a persistent
+gradient accumulator on first use, and `sync()` stages the gradient of every touched external back
+to the host afterwards. Both eval commands forward over every parameter, and neither ever calls
+backward, so each scored window allocated a full model of gradient buffers, never wrote them, and
+copied them to the host anyway. On a 293M f32 checkpoint that is 1.17 GB per window, and
+`eval-loss` defaults to 64 of them.
+
+The lever already existed, from LoRA: a frozen external shares one small stub instead of a
+full-size accumulator (lever 21), and `sync()` skips a gradient it is not keeping. So the fix is to
+freeze the parameters before the first `entryFor` call, which `freezeForScoring` does in one line
+per command. Ordering is load-bearing: `entryFor` sizes the buffer on first use, so freezing after
+`uploadParams` stops the copies but keeps the allocation.
+
+Measured on `littlelamb-base.f32.gguf` (293M f32), `eval-loss --windows 16 --seq-len 512`, three
+runs each on the Strix Halo APU:
+
+|        | wall clock            | val loss |
+| ------ | --------------------- | -------- |
+| before | 30.75, 30.64, 30.64 s | 3.4202   |
+| after  | 26.23, 26.12, 26.07 s | 3.4202   |
+
+Median 30.64 s to 26.12 s, **14.8% faster**, with 18.8 GB of copies removed and the score unchanged
+to four decimals. That is a floor rather than the whole win: it was measured with #60 still in
+place, so every window still issued one redundant `clearBuffer` per frozen parameter. The device
+pool also drops by the size of the model, which is what `evalFreezeGate` in `tests/gpu-parity.ts`
+pins: it measures `lastSyncReadbackBytes` and `residentBytes().pool` on a frozen and an unfrozen arm
+and requires the two losses to be bit-equal. Making `freezeForScoring` a no-op leaves the readback
+at the full model; moving it after `uploadParams` drops the readback but not the pool, and the pool
+assertion is what pins the ordering.
+
+`generate` has the same defect and pays it per token rather than per window: 40.1% of its wall
+clock on the same checkpoint. It is #58, deliberately not fixed here. Freezing also leaves `sync()`
+re-queueing the shared stub for clearing once per frozen parameter per window, which is #60 and
+applies to LoRA training as much as to eval.
+
+Under `--cpu` this is a no-op: `Tensor`'s constructor allocates a gradient array for every tensor
+regardless, so there is nothing for a freeze to skip. Both arms measured 3.1600 there, as expected.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
