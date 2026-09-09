@@ -809,7 +809,19 @@ regular file.
 
 ### 23. The CPU cross-entropy clamped every confident-wrong loss at 27.63 (2026-09-09)
 
-Found while trying to reproduce issue #48. Both CPU losses computed the row's loss by reading a
+Found while trying to reproduce issue #48, which turned out not to be a bug: `add(t, t)` and
+`mul(t, t)` bind one buffer to two `read_write` slots, and that is explicitly legal. WebGPU's
+compatible-usage-list rule grants a "usage scope storage exception": multiple `storage` usages of
+one buffer in a usage scope are allowed even though they are writable. The arithmetic is defined
+too, because these kernels run one invocation per element, so both writes come from the same thread
+to the same address in program order. Measured at four sizes on both ops, maxdiff 0.00e+0, and
+`aliasedBinaryOpParity` now pins it.
+
+The reproduction that first seemed to confirm #48 was the harness, not the code: `backward()` seeds
+only the host scalar, so a non-scalar output leaves the device gradient unseeded and both sides
+compare zeros. `seedGradFromHost` is what the parity harness uses for exactly that.
+
+The real find was elsewhere. Both CPU losses computed the row's loss by reading a
 normalized probability back and adding an epsilon, `-log(p_target + 1e-12)`. Once the target falls
 about 88 logits behind the row maximum, `p_target` underflows f32 to zero and the epsilon takes
 over, so the reported loss saturates at `-log(1e-12) = 27.63` no matter how wrong the prediction
@@ -834,7 +846,8 @@ correct limit.
 
 **What it was hiding.** The CPU reference is the correctness oracle for the GPU kernels, so a
 divergence that only shows at extreme logits is exactly the kind that survives a parity suite: the
-suite's shapes produce losses of 2 to 10, nowhere near the clamp. It also capped `eval-loss --cpu`
+suite's shapes produce losses of 2 to 10, nowhere near the clamp. It has a case now
+(`crossEntropy (target far behind)`), and restoring the clamp fails it at gpu 76.5 against cpu 27.63. It also capped `eval-loss --cpu`
 at a perplexity of `e^27.63` for a badly mismatched model or tokenizer, which reads as a plausible
 number rather than a saturated one.
 

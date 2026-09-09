@@ -307,15 +307,20 @@ async function main() {
     // gap reported 27.54 and a 90-logit gap still reported 27.63. Both GPU
     // kernels already used the logsumexp form, so this was a silent CPU/GPU
     // divergence that only appeared once a model was badly wrong.
+    // The target logit is -3, not 0: with a zero target the `- z_target` term
+    // contributes nothing and deleting it entirely would still pass. The soft
+    // case uses a truncated teacher mass (q = 0.6) for the same reason, so a
+    // dropped `q` factor or a mis-grouped `mass * log(s)` cannot hide either.
+    // `exact` is the closed form, an oracle independent of the logsumexp the
+    // implementations evaluate.
     let worst = 0;
     for (const gap of [10, 30, 60, 90]) {
-      const V = 4;
-      const logits = new Tensor(Float32Array.from([gap, 0, 0, 0]), [1, V], true);
-      let sum = 0;
-      for (const z of [gap, 0, 0, 0]) sum += Math.exp(z - gap);
-      const exact = Math.log(sum) + gap; // z_target is 0
+      const row = [gap, 0, 0, -3];
+      const logits = new Tensor(Float32Array.from(row), [1, row.length], true);
+      const exact = Math.log(Math.exp(gap) + 2 + Math.exp(-3)) - -3;
       worst = Math.max(worst, Math.abs(crossEntropy(logits, [3]).data[0] - exact));
-      worst = Math.max(worst, Math.abs(softCrossEntropy(logits, [3], [1], 1).data[0] - exact));
+      const q = 0.6;
+      worst = Math.max(worst, Math.abs(softCrossEntropy(logits, [3], [q], 1).data[0] - q * exact));
     }
     const ok = worst < 1e-4;
     if (!ok) failures++;

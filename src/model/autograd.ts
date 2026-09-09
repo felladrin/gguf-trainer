@@ -892,6 +892,11 @@ export function softCrossEntropy(
       const id = teacherIds[t * k + j];
       if (id < 0 || id >= V) throw new Error(`softCrossEntropy: teacher id ${id} out of [0,${V})`);
       const q = teacherProbs[t * k + j];
+      // A row shorter than k pads with an in-range id at probability 0 (see the
+      // docstring). `0 * finite` was harmless, but the expansion below can reach
+      // `0 * Infinity` on a non-finite logit, so skip the pad rather than turn a
+      // dead model's loss into NaN.
+      if (q === 0) continue;
       // Σ q·(log(Σ exp(z-m)) + m - z_id), the same expansion the GPU kernel
       // uses and for the same reason: reading a normalized probability back
       // clamps every confident-wrong teacher term at -log(1e-12) = 27.63.

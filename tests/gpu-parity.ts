@@ -754,6 +754,22 @@ async function main() {
     await opCase(gpu, "crossEntropy", [logits], () => crossEntropy(logits, targets));
   }
   {
+    // A target ~90 logits behind the maximum. This is the shape lever 23 says the
+    // suite was blind to: the CPU used to clamp such a row at -log(1e-12) = 27.63
+    // while the GPU computed it exactly, and every existing case produces losses
+    // of 2 to 10, nowhere near the clamp. Both sides now agree at the true value.
+    const V = 4;
+    const logits = new Tensor(Float32Array.from([90, 0, 0, -3, 60, 1, 0, 0]), [2, V], true);
+    logits.requiresGrad = true;
+    const targets = [3, 2];
+    await opCase(
+      gpu,
+      "crossEntropy (target far behind)",
+      [logits],
+      () => crossEntropy(logits, targets),
+    );
+  }
+  {
     // Ignore-index (-1) = assistant-only loss masking: masked rows contribute
     // no loss and no gradient; the mean is over kept rows. GPU must match CPU.
     const T = 8, V = 17;
@@ -1495,55 +1511,31 @@ async function loraModelParity(gpu: WebGPUBackend) {
 }
 
 /**
- * Element-wise ops given the SAME tensor twice. Issue #48 predicted that
- * `add(t, t)` would lose one of its two gradient accumulations on the GPU,
- * because the backward binds one buffer to two read_write slots and does two
- * read-modify-writes. It does not, and the reason is worth pinning rather than
- * rediscovering: these kernels run one invocation per element, so both writes
- * come from the same thread to the same address in program order. There is no
- * cross-thread race to lose.
+ * Element-wise ops given the SAME tensor twice.
  *
- * That makes this a property the current kernels satisfy by construction and a
- * future one could break, which is exactly what a test is for. A hand-rolled
- * gradient seed is required: `backward` only seeds a scalar, so a non-scalar
- * output needs `seedGradFromHost` or both sides silently compare zeros.
+ * Issue #48 predicted that `add(t, t)` loses one of its two gradient
+ * accumulations on the GPU, because the backward binds one buffer to two
+ * `read_write` slots and does two read-modify-writes. It does not, and both
+ * halves of why are worth pinning rather than rediscovering.
+ *
+ * The binding is legal. WebGPU's compatible-usage-list rule grants an explicit
+ * "usage scope storage exception": multiple `storage` usages of one buffer in a
+ * usage scope are allowed *even though they are writable*. So this is not a
+ * validation error waiting to fire on a stricter backend.
+ *
+ * The arithmetic is defined too. These kernels run one invocation per element,
+ * so both writes come from the same thread to the same address in program
+ * order. There is no cross-thread race for the exception to expose.
+ *
+ * Both of those are properties of the current kernels that a future change
+ * could break, which is what this is here for.
  */
 async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
-  const cases: [string, (t: Tensor) => Tensor][] = [
-    ["add(t, t)", (t) => add(t, t)],
-    ["mul(t, t)", (t) => mul(t, t)],
-  ];
-  for (const [name, fwd] of cases) {
-    let ok = true;
-    for (const n of [1, 6, 257, 5000]) {
-      const rng = mulberry32(4);
-      const t = randTensor([n], rng);
-      const seed = new Float32Array(n);
-      const sr = mulberry32(7);
-      for (let i = 0; i < n; i++) seed[i] = sr() * 2 - 1;
-
-      const cpuOut = fwd(t);
-      cpuOut.grad.set(seed);
-      cpuOut._backward();
-      const cpuGrad = t.grad.slice();
-      const cpuData = cpuOut.data.slice();
-
-      t.zeroGrad();
-      gpu.install();
-      try {
-        const g = fwd(t);
-        g.grad.set(seed);
-        gpu.seedGradFromHost(g);
-        g._backward();
-        await gpu.sync([g]);
-        ok = compare(`${name}.out[n=${n}]`, g.data, cpuData, FWD) && ok;
-        ok = compare(`${name}.dInput[n=${n}]`, t.grad, cpuGrad, BWD) && ok;
-      } finally {
-        gpu.uninstall();
-      }
-    }
-    if (!ok) failures++;
-    console.log(`  ${ok ? "ok " : "FAIL"} ${name} accumulates both gradients (4 sizes)`);
+  for (const n of [1, 6, 257, 5000]) {
+    const t = randTensor([n], mulberry32(4));
+    await opCase(gpu, `add(t, t) [n=${n}]`, [t], () => add(t, t));
+    const u = randTensor([n], mulberry32(9));
+    await opCase(gpu, `mul(t, t) [n=${n}]`, [u], () => mul(u, u));
   }
 }
 
