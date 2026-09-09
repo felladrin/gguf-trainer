@@ -362,10 +362,10 @@ async function main() {
     // SILENT and three already threw something unhelpful:
     //
     //   crossEntropy [24]        -> NaN
-    //   crossEntropy [2,3,4]     -> 1.0986, i.e. log(3) out of a 24-float buffer
+    //   crossEntropy [2,3,4]     -> 0.8006, scored as T=2, V=3
     //   softCrossEntropy [24]    -> NaN
     //   fusedCrossEntropy pair   -> 3.1781, i.e. log(24)
-    //   embedding [2,3,4]        -> 0
+    //   embedding [2,3,4]        -> a row read with stride shape[1]=3
     //   fusedCrossEntropy hidden -> "dim mismatch undefined vs 4"
     //   fusedCrossEntropy w      -> "dim mismatch 4 vs undefined"
     //   embedding [24]           -> "data length 0 != shape 2,"
@@ -374,7 +374,9 @@ async function main() {
     const V = 6, H = 4;
     const r = mulberry32(0x2b1f);
     const flat = randTensor([V * H], r); // 24 floats, shape [24]
-    const cube = new Tensor(new Float32Array(2 * 3 * 4), [2, 3, 4], true);
+    // Filled, not zeroed: a zero buffer would score log(V) whatever the shape,
+    // so it could not show that a 3-D input is read with the wrong extents.
+    const cube = randTensor([2, 3, 4], r);
     const mat = randTensor([3, V], r);
     const hid = randTensor([3, H], r);
     const w = randTensor([V, H], r);
@@ -402,7 +404,8 @@ async function main() {
           message(() => crossEntropy(flat, longTargets)),
         ),
       ],
-      // T=2, V=3 out of a 24-float buffer, returning a plausible log(3).
+      // Destructured to T=2, V=3, so it scores two rows of three out of a
+      // 24-float buffer and returns a plausible 0.8006.
       [
         "crossEntropy refuses 3-D logits",
         /^crossEntropy: logits must be 2-D, got \[2, 3, 4\]/.test(
@@ -437,7 +440,9 @@ async function main() {
         ),
       ],
       // embedding reads shape[0], so a 1-D table yields V*d and accepts ids past
-      // the real vocab; a 3-D one passes the right V and reads the wrong rows.
+      // the real vocab; a 3-D one takes V from shape[0] and the row stride from
+      // shape[1], so the id passes and the row read is whatever those extents
+      // land on.
       [
         "embedding refuses a 1-D table",
         /^embedding: weight must be 2-D/.test(message(() => embedding(flat, [0, 1]))),

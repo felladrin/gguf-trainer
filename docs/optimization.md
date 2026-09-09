@@ -1215,18 +1215,20 @@ rather than a live bug, which is why it is worth naming: the failure mode is sil
 **Measured with the guard disabled, five of the eight refusals were silent and three already threw
 something unhelpful.** The test block records both lists, because the deliverable differs:
 
-| input                                    | before                                                                       |
-| ---------------------------------------- | ---------------------------------------------------------------------------- |
-| `crossEntropy` on `[24]`                 | NaN                                                                          |
-| `crossEntropy` on `[2,3,4]`              | 1.0986, i.e. `log(3)` read out of a 24-float buffer                          |
-| `softCrossEntropy` on `[24]`             | NaN                                                                          |
-| `fusedCrossEntropy` on a 1-D pair        | 3.1781, i.e. `log(24)`, since `undefined !== undefined` passes the dim check |
-| `embedding` on `[2,3,4]`                 | a row of zeros, the right V with the wrong stride                            |
-| `fusedCrossEntropy` on a 1-D hidden or w | `dim mismatch undefined vs 4`                                                |
-| `embedding` on `[24]`                    | `data length 0 != shape 2,`                                                  |
+| input                               | before                                                                       |
+| ----------------------------------- | ---------------------------------------------------------------------------- |
+| `crossEntropy` on `[24]`            | NaN                                                                          |
+| `crossEntropy` on `[2,3,4]`         | 0.8006, scored as `T=2, V=3` out of a 24-float buffer                        |
+| `softCrossEntropy` on `[24]`        | NaN                                                                          |
+| `fusedCrossEntropy` on a 1-D pair   | 3.1781, i.e. `log(24)`, since `undefined !== undefined` passes the dim check |
+| `embedding` on `[2,3,4]`            | a row read with V from `shape[0]` and the stride from `shape[1]`             |
+| `fusedCrossEntropy` on a 1-D hidden | `dim mismatch undefined vs 4`                                                |
+| `fusedCrossEntropy` on a 1-D w      | `dim mismatch 4 vs undefined`                                                |
+| `embedding` on `[24]`               | `data length 0 != shape 2,`                                                  |
 
 Ten cases in `tests/gradcheck.ts` and an arm on `targetRangeGate`. Dropping any one of the five calls
-fails only that op's cases; loosening the rank test to `>= 1` fails all eight refusals, since the
+fails that op's cases, and for `crossEntropy` the GPU arm as well, since that is the only rank guard
+the gate exercises; loosening the rank test to `>= 1` fails all eight refusals, since the
 point is the exact rank and not merely "has a shape"; and moving the `crossEntropy` call below the
 dispatch passes every CPU case and fails only the GPU arm, which is by now the recognisable signature
 of that mistake.
