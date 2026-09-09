@@ -1584,6 +1584,9 @@ async function frozenClearGate() {
       if (freeze) freezeForScoring(m);
       gpu.install();
       gpu.uploadParams(m.params());
+      // params().length stands in for "externals this forward touches", which
+      // holds because this forward touches every parameter. A parameter a future
+      // forward skipped would move the count for a reason unrelated to freezing.
       const window = async () => {
         const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
         await gpu.sync([loss]);
@@ -1605,8 +1608,11 @@ async function frozenClearGate() {
   // unconditionally at creation; those are a separate waste in a forward-only
   // run and are #67, not this.
   const savedTheParams = hot.second - cold.second === hot.params;
-  // A trainable parameter must still get its accumulator zeroed every window.
-  // Dropping that would break gradient accumulation, not just tidiness.
+  // Weak on its own, since the intermediates alone satisfy it: what it catches
+  // is makeOut's queue disappearing, which would make the assertion above pass
+  // for the wrong reason. That a TRAINABLE accumulator still gets zeroed is
+  // proved elsewhere, by the 16 parity checks that fail if the re-arm is dropped
+  // rather than narrowed.
   const stillClears = hot.second > hot.params;
   // And the loss does not move, which is the claim that the removed clears were
   // doing nothing in the first place.

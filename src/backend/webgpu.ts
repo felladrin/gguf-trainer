@@ -416,6 +416,12 @@ export class WebGPUBackend implements OpsBackend {
       // 256-byte stub and nothing ever writes to it, so re-arming this queued
       // one no-op clearBuffer per frozen parameter per window: a few hundred of
       // them on a 293M model, on every eval window and every LoRA step.
+      //
+      // The one behaviour this drops: a parameter frozen AFTER it was given a
+      // full-size accumulator keeps its stale gradients, because nothing clears
+      // them again. Thawing it on this same backend would then accumulate on top
+      // of them, silently. freezeForScoring says so; a thaw wants a fresh
+      // backend.
       e.gradNeedsClear = t.requiresGrad;
     }
     this.lastSyncReadbackBytes = stagings.reduce((a, s) => a + s.dst.length * 4, 0);

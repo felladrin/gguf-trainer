@@ -1078,6 +1078,14 @@ Two reasons it is still worth having: the command stream now says what it means,
 it, because freezing `pretrain`'s end-of-run sample stops the copies while leaving the clears, and
 there the re-queued buffer is a full-size accumulator rather than the stub.
 
+**What it costs, and it is a documentation debt rather than a bug.** A parameter frozen after it was
+given a full-size accumulator now keeps its stale gradients, because nothing clears them again.
+`freezeForScoring` promised the thaw hazard was "a device validation error rather than a wrong
+number"; that promise now holds only for the stub path, i.e. when the freeze came before the first
+`entryFor`. Freeze a model that has already trained, thaw it on the same backend, and the next
+backward accumulates on top of pre-freeze gradients, silently. Unreachable today, and it is exactly
+#66's shape, so both the helper's docstring and the `sync()` comment now say it out loud.
+
 Waste has no symptom in a number, so `frozenClearGate` in `tests/gpu-parity.ts` counts instead:
 `gradClearsIssued` is a cumulative counter and the gate takes a delta around the second window,
 which is the one that matters, since `entryFor` starts `gradNeedsClear` at `requiresGrad` and a
