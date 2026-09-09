@@ -25,7 +25,12 @@
 import { readFileBytes } from "../io.ts";
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
 import { mulberry32 } from "../model/autograd.ts";
-import { lossChunkModelError, lossChunkValueError, sequenceLoss } from "../train/loss.ts";
+import {
+  freezeForScoring,
+  lossChunkModelError,
+  lossChunkValueError,
+  sequenceLoss,
+} from "../train/loss.ts";
 import { diskTokenSource, tokenBytes } from "../data/tokens.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -51,6 +56,9 @@ async function run(v: Values) {
   if (badChunk) die(badChunk);
 
   const { model, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
+  // Scoring never runs backward, and a gradient buffer per parameter would be
+  // allocated and staged back to the host on every window.
+  freezeForScoring(model);
   if (seqLen > cfg.maxSeq) die(`--seqLen ${seqLen} exceeds model ctx ${cfg.maxSeq}`);
   const badForModel = lossChunkModelError(lossChunk, cfg.vocabSize, cfg.arch, model);
   if (badForModel) die(badForModel);
