@@ -26,7 +26,7 @@ import { lossTrend } from "../loss-trend.ts";
 import { sequenceLoss } from "../train/loss.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
-import { crossEntropy, mulberry32 } from "../model/autograd.ts";
+import { crossEntropy, mulberry32, setCheckpointing } from "../model/autograd.ts";
 import type { Architecture, LanguageModel } from "../model/arch.ts";
 import {
   archFromGGUF,
@@ -262,7 +262,8 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
         mask: maskPath,
         template: templatePath,
       })[k],
-    has: (k: string): boolean => ({ reclaim: v.bool("reclaim"), coldOpt })[k] ?? false,
+    has: (k: string): boolean =>
+      ({ reclaim: v.bool("reclaim"), recompute: v.bool("recompute"), coldOpt })[k] ?? false,
   };
   const exportQuants = flags.get("exportQuants")
     ? (() => {
@@ -361,6 +362,10 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     die(`--loss-chunk needs an architecture with forwardToReadout; ${arch.name} has none`);
   }
 
+  // Set before the probe, so the trust gate exercises the graph the run will
+  // actually build rather than a different one.
+  setCheckpointing(flags.has("recompute"));
+
   // Trust gate: GPU forward+loss must match the CPU reference at init.
   const probeIn = src.window(0, 16), probeTgt = src.window(1, 16);
   const cpuLoss = crossEntropy(model.forward(probeIn), probeTgt).data[0];
@@ -393,6 +398,13 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     })`,
   );
   if (drift > 1e-3 + 1e-3 * Math.abs(cpuLoss)) die("GPU/CPU parity probe failed");
+  if (flags.has("recompute") && gpu.regionCount() === 0) {
+    // Matches how --loss-chunk refuses an architecture without forwardToReadout:
+    // the flag would otherwise print "recompute on" and change nothing.
+    die(
+      `--recompute needs an architecture whose forward calls checkpoint(); ${arch.name} does not`,
+    );
+  }
   if (fusedLoss !== null) {
     const fdrift = Math.abs(fusedLoss - gpuLoss);
     console.log(
@@ -437,7 +449,9 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       Math.round(steps * 0.1)
     } / cooldown ${Math.round(steps * 0.2)} steps, quant ${quant}, reclaim ${
       flags.has("reclaim") ? "on" : "off"
-    }, loss ${lossChunk > 0 ? `chunked x${lossChunk} (${lossSpans} spans)` : "dense"}`,
+    }, loss ${lossChunk > 0 ? `chunked x${lossChunk} (${lossSpans} spans)` : "dense"}, recompute ${
+      flags.has("recompute") ? "on" : "off"
+    }`,
   );
 
   // WSD decay-phase instruct injection (MiniCPM/Xmodel-2 trick): from the cooldown
@@ -563,6 +577,9 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   });
   src.close();
   injectSource?.close();
+  // Training is over, and the sample below is inference: no backward, so a
+  // recompute boundary per layer per token buys nothing and costs a submit.
+  setCheckpointing(false);
   {
     const el = (Date.now() - t0) / 1000;
     const localSteps = steps - startStep;
@@ -732,6 +749,12 @@ const SHARED_FLAGS: Flag[] = [
     type: "boolean",
     describe:
       "free each micro-batch's activations at the micro-batch boundary: 5.6x less peak GPU memory for 23% less throughput (measured), and the way to fit batch>=2 at long context on a small GPU",
+  },
+  {
+    name: "recompute",
+    type: "boolean",
+    describe:
+      "recompute each layer's activations in backward instead of keeping them: much less activation memory for one extra forward pass (gradient checkpointing; named --recompute because a checkpoint here is a saved GGUF)",
   },
   {
     name: "loss-chunk",

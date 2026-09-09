@@ -23,6 +23,7 @@
 import {
   add,
   attention,
+  checkpoint,
   embedding,
   gelu,
   linear,
@@ -176,30 +177,37 @@ export class Gemma3Model implements LanguageModel {
     let h = scale(embedding(this.tokenEmbd, ids), Math.sqrt(c.hiddenSize));
 
     for (let il = 0; il < this.layers.length; il++) {
-      const L = this.layers[il];
-      const global = isGlobalLayer(c, il);
-      const window = global ? 0 : c.slidingWindow;
-      const ropeB = global ? c.ropeBase : c.ropeBaseLocal;
+      // hIn, not h: the closure runs again in backward, long after the loop
+      // variable has moved on to the last layer's output.
+      const hIn = h;
+      h = checkpoint([hIn], () => {
+        let h = hIn;
+        const L = this.layers[il];
+        const global = isGlobalLayer(c, il);
+        const window = global ? 0 : c.slidingWindow;
+        const ropeB = global ? c.ropeBase : c.ropeBaseLocal;
 
-      const n1 = rmsNorm(h, L.attnNorm, c.rmsEps);
-      let q = linear(n1, L.qProj);
-      let k = linear(n1, L.kProj);
-      const v = linear(n1, L.vProj);
-      q = rmsNormHeads(q, L.qNorm, T, c.nHeads, c.headDim, c.rmsEps);
-      k = rmsNormHeads(k, L.kNorm, T, c.nKVHeads, c.headDim, c.rmsEps);
-      q = rope(q, T, c.nHeads, c.headDim, ropeB);
-      k = rope(k, T, c.nKVHeads, c.headDim, ropeB);
-      const a = attention(q, k, v, T, c.nHeads, c.nKVHeads, c.headDim, window);
-      let attnOut = linear(a, L.oProj);
-      attnOut = rmsNorm(attnOut, L.postAttnNorm, c.rmsEps);
-      h = add(h, attnOut);
+        const n1 = rmsNorm(h, L.attnNorm, c.rmsEps);
+        let q = linear(n1, L.qProj);
+        let k = linear(n1, L.kProj);
+        const v = linear(n1, L.vProj);
+        q = rmsNormHeads(q, L.qNorm, T, c.nHeads, c.headDim, c.rmsEps);
+        k = rmsNormHeads(k, L.kNorm, T, c.nKVHeads, c.headDim, c.rmsEps);
+        q = rope(q, T, c.nHeads, c.headDim, ropeB);
+        k = rope(k, T, c.nKVHeads, c.headDim, ropeB);
+        const a = attention(q, k, v, T, c.nHeads, c.nKVHeads, c.headDim, window);
+        let attnOut = linear(a, L.oProj);
+        attnOut = rmsNorm(attnOut, L.postAttnNorm, c.rmsEps);
+        h = add(h, attnOut);
 
-      const n2 = rmsNorm(h, L.ffnNorm, c.rmsEps);
-      const g = gelu(linear(n2, L.gate));
-      const u = linear(n2, L.up);
-      let down = linear(mul(g, u), L.down);
-      down = rmsNorm(down, L.postFfnNorm, c.rmsEps);
-      h = add(h, down);
+        const n2 = rmsNorm(h, L.ffnNorm, c.rmsEps);
+        const g = gelu(linear(n2, L.gate));
+        const u = linear(n2, L.up);
+        let down = linear(mul(g, u), L.down);
+        down = rmsNorm(down, L.postFfnNorm, c.rmsEps);
+        h = add(h, down);
+        return h;
+      });
     }
 
     return {

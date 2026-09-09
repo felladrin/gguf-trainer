@@ -229,12 +229,17 @@ class BufferPool {
     return this.allocated;
   }
 
+  /** The bucket a request of `bytes` lands in; see acquire for the rounding. */
+  bucketSize(bytes: number): number {
+    return Math.max(256, Math.ceil(bytes / 256) * 256);
+  }
+
   acquire(bytes: number): { buf: GpuBuffer; size: number } {
     // The 256-byte rounding is load-bearing beyond pooling: bind groups pass no
     // offset or size, so a pooled buffer is always bound whole, and the flash
     // attention kernels bind these same buffers as array<vec4<f32>>, which needs
     // the bound size to be a multiple of 16. Do not round this down.
-    const size = Math.max(256, Math.ceil(bytes / 256) * 256);
+    const size = this.bucketSize(bytes);
     const list = this.free.get(size);
     if (list && list.length > 0) return { buf: list.pop()!, size };
     guardBufferSize(size, this.maxBinding);
@@ -306,6 +311,20 @@ export class WebGPUBackend implements OpsBackend {
   private gradKeptOnDevice = new WeakSet<Tensor>();
   private transients: { buf: GpuBuffer; size: number }[] = [];
   private pendingClears: GpuBuffer[] = [];
+  /**
+   * Buffers released by endRegion, reusable ONLY by makeOut.
+   *
+   * Deliberately not returned to the pool, though after endRegion's submit that
+   * would also be correct. The pool feeds `entryFor`, `uploadU32` and
+   * `uploadF32`, whose `queue.writeBuffer` calls carry a comment justifying
+   * themselves by the buffer having been "free in the pool until this call".
+   * Recycling mid-graph buffers through the pool would not break them, but it
+   * would make every one of those call sites depend on the submit happening,
+   * which is a thing a future change can quietly remove. A private list only
+   * `makeOut` draws from needs no such argument at any of them.
+   */
+  private regionFree: { buf: GpuBuffer; size: number }[] = [];
+  private regionsOpened = 0;
   private enc: GpuCommandEncoder | null = null;
   private pass: GpuComputePass | null = null;
   private backwardBegun = false;
@@ -408,6 +427,13 @@ export class WebGPUBackend implements OpsBackend {
     // every transient buffer is idle and safe to recycle.
     for (const tr of this.transients) this.pool.release(tr.size, tr.buf);
     this.transients = [];
+    // Region buffers left unclaimed by a recompute are not in `transients`, so
+    // only an explicit drain returns them to the pool. This is the one that runs
+    // with --reclaim off; reclaimStepTransients has the same drain for the
+    // micro-batch boundary. Without both, they strand and the next step
+    // allocates fresh ones on top.
+    for (const tr of this.regionFree) this.pool.release(tr.size, tr.buf);
+    this.regionFree = [];
     this.touchedExternals.clear();
     this.backwardBegun = false;
 
@@ -450,7 +476,125 @@ export class WebGPUBackend implements OpsBackend {
       else this.pool.release(tr.size, tr.buf);
     }
     this.transients = retained;
+    // Same reasoning as in sync(): onSubmittedWorkDone above proves the GPU is
+    // done, so anything the micro-batch's recompute regions left behind can go
+    // back to the pool rather than stranding until the end of the step.
+    for (const tr of this.regionFree) this.pool.release(tr.size, tr.buf);
+    this.regionFree = [];
     if (this.deviceError) throw new Error(this.deviceError);
+  }
+
+  /**
+   * Open a recompute region. Everything makeOut allocates from here until the
+   * matching endRegion is a candidate for reuse inside the next region.
+   */
+  beginRegion(): number {
+    this.regionsOpened++;
+    return this.transients.length;
+  }
+
+  /** How many recompute regions have been opened; 0 after a forward means no
+   * architecture on this path called `checkpoint`. */
+  regionCount(): number {
+    return this.regionsOpened;
+  }
+
+  /**
+   * Guard for the mark `beginRegion` returns: it indexes `transients`, which
+   * `sync()` and `reclaimStepTransients()` truncate. Nothing can interleave
+   * today, since `checkpoint` and `backward` are both fully synchronous, but
+   * that is invisible from the call site. One-sided on purpose: it catches a
+   * truncation, not a truncation that also pushed enough new transients to land
+   * back above the mark. That case is unreachable for the same reason, and
+   * detecting it would mean tagging every entry.
+   */
+  private checkRegionMark(mark: number): void {
+    if (mark > this.transients.length) {
+      throw new Error(
+        `endRegion: mark ${mark} is past the ${this.transients.length} live transients; ` +
+          `a sync() or reclaim ran inside the region`,
+      );
+    }
+  }
+
+  /**
+   * Close the region opened at `mark`: every transient allocated since, except
+   * the buffers behind `keep`, becomes reusable by makeOut.
+   *
+   * No fence, and none is needed. Recycling is correct because the queue orders
+   * the accesses: dispatches within one compute pass are ordered against each
+   * other, and passes within a command buffer execute in order (the shape the
+   * profiling path produces, one pass per dispatch). The dense path has always
+   * depended on the first of those, since every op reads the previous op's
+   * output out of the same pass. Nothing is destroyed here; this only moves
+   * entries between JS-side lists and the driver keeps every buffer alive.
+   *
+   * `submit()` is NOT what makes it safe, and it is not redundant either. No
+   * regionFree buffer ever reaches a queue.writeBuffer call site (makeOut is the
+   * only consumer, and the two places that hand regionFree back to the pool
+   * fence first), so correctness does not need it. What it does is hand the
+   * recorded work to the GPU at every layer boundary instead of accumulating a
+   * whole micro-batch into one pass, and that overlap is what lever 20 credits
+   * for the throughput. Remove it and every test still passes while the headline
+   * number quietly goes away.
+   *
+   * Released grad buffers are purged from pendingClears: a buffer handed on as
+   * some later tensor's DATA must not be zeroed by a clear queued when it was a
+   * gradient.
+   */
+  endRegion(mark: number, keep: Tensor[]): void {
+    this.checkRegionMark(mark);
+    this.endPass();
+    this.submit();
+    const keepBufs = new Set<GpuBuffer>();
+    for (const t of keep) {
+      const e = this.entries.get(t);
+      if (e) {
+        keepBufs.add(e.data);
+        keepBufs.add(e.grad);
+      }
+    }
+    const retained = this.transients.slice(0, mark);
+    const released = new Set<GpuBuffer>();
+    for (const tr of this.transients.slice(mark)) {
+      if (keepBufs.has(tr.buf)) retained.push(tr);
+      else {
+        this.regionFree.push(tr);
+        released.add(tr.buf);
+      }
+    }
+    this.transients = retained;
+    if (released.size > 0) {
+      this.pendingClears = this.pendingClears.filter((b) => !released.has(b));
+    }
+  }
+
+  /**
+   * Copy one tensor's gradient buffer into another's, on the device. The
+   * recompute in a checkpoint's backward produces a fresh output tensor that
+   * needs the gradient already accumulated on the original. Flushes the clears
+   * first, or the copy would be zeroed by the recomputed tensor's own pending
+   * clear.
+   */
+  seedGradFrom(dst: Tensor, src: Tensor): void {
+    // Ordering, not contents: copyBufferToBuffer overwrites the whole range, so
+    // what matters is that it happens AFTER the pending clear on the replay's
+    // own grad buffer, which would otherwise wipe the seed. That flush is this
+    // ensureBackwardBegun, and it only fires because the replay reset
+    // `backwardBegun` (its first forward op called beginForwardOp). The same
+    // flush is what zeroes the replay's INTERIOR grad buffers; if
+    // ensureBackwardBegun ever became idempotent across a replay they would
+    // never flush at all (endRegion purges them on the way out) and every
+    // interior gradient would start from pool garbage.
+    this.ensureBackwardBegun();
+    const ed = this.entries.get(dst), es = this.entries.get(src);
+    if (!ed || !es) throw new Error("seedGradFrom: tensor has no GPU buffers");
+    if (dst.size !== src.size) {
+      throw new Error(`seedGradFrom: size mismatch ${dst.size} vs ${src.size}`);
+    }
+    if (!this.enc) this.enc = this.device.createCommandEncoder();
+    this.endPass();
+    this.enc.copyBufferToBuffer(es.grad, 0, ed.grad, 0, src.size * 4);
   }
 
   /** Free every pooled GPU buffer. The backend is unusable afterwards. */
@@ -1204,6 +1348,11 @@ export class WebGPUBackend implements OpsBackend {
       this.entries.set(t, e);
       this.queue.writeBuffer(e.data, 0, t.data);
     }
+    // Load-bearing for --recompute as well as for grad accumulation: a replay
+    // calls entryFor on every parameter again, and re-queuing e.grad for a clear
+    // would zero parameter gradients mid-backward, wiping every block already
+    // processed. reclaimStepTransients deliberately leaves this set alone so the
+    // guard keeps holding across micro-batches.
     if (e.external && !this.touchedExternals.has(t)) {
       this.touchedExternals.add(t);
       if (e.gradNeedsClear) {
@@ -1219,8 +1368,8 @@ export class WebGPUBackend implements OpsBackend {
     t._prev = prev;
     const bytes = t.size * 4;
     const e: Entry = {
-      data: this.acquireTransient(bytes),
-      grad: this.acquireTransient(bytes),
+      data: this.acquireRecycled(bytes),
+      grad: this.acquireRecycled(bytes),
       bytes,
       external: false,
       gradNeedsClear: false,
@@ -1234,6 +1383,27 @@ export class WebGPUBackend implements OpsBackend {
 
   private acquirePersistent(bytes: number): GpuBuffer {
     return this.pool.acquire(bytes).buf;
+  }
+
+  /**
+   * The smallest region-released buffer that fits, else a fresh pool
+   * acquisition. Best fit rather than exact: `acquire` already hands out a
+   * rounded-up bucket, so binding a buffer wider than the request is what
+   * every op already does, and accepting one here is the difference between
+   * reusing a block and allocating beside it. Only makeOut calls this (see
+   * regionFree).
+   */
+  private acquireRecycled(bytes: number): GpuBuffer {
+    const want = this.pool.bucketSize(bytes);
+    let best = -1;
+    for (let i = 0; i < this.regionFree.length; i++) {
+      const size = this.regionFree[i].size;
+      if (size >= want && (best < 0 || size < this.regionFree[best].size)) best = i;
+    }
+    if (best < 0) return this.acquireTransient(bytes);
+    const tr = this.regionFree.splice(best, 1)[0];
+    this.transients.push(tr);
+    return tr.buf;
   }
 
   private acquireTransient(bytes: number): GpuBuffer {

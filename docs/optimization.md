@@ -564,6 +564,67 @@ Not done here: `softCrossEntropy` (the Phase B KL anchor) still materializes `[T
 dense readout, so `--loss-chunk` does not apply to it. Chunking it means fusing the same readout
 into `srcSoftCeFwd`, and the sparse teacher makes the gradient `S·p − q` rather than `p − q`.
 
+### 20. Activation recomputation: 4.6x less pool, and 2.3x FASTER (2026-09-09)
+
+`--recompute` replays each layer in backward instead of keeping its interior. Textbook gradient
+checkpointing, named `--recompute` here because a checkpoint in this repo is a saved GGUF.
+
+Measured on qwen3 293M (vocab 151936, hidden 544, 28 layers), `--seq-len 2048 --batch 2 --reclaim
+--loss-chunk 8192`, 6 steps, same seed, and re-run once to confirm (identical to the digit):
+
+| `--recompute` | throughput | peak GPU (pool + state) | loss (first 3 -> last 3) |
+| ------------- | ---------- | ----------------------- | ------------------------ |
+| off           | 72 tok/s   | 18974 MB (14480 + 4495) | 5.139 -> 6.881           |
+| on            | 168 tok/s  | 7658 MB (3163 + 4495)   | 5.139 -> 6.881           |
+
+The pool falls 4.6x. Weights and gradients are 2346 MB of what remains, so the activation term
+itself goes from ~12.1 GB to ~0.8 GB.
+
+**The throughput is the part to be suspicious of, so here is the evidence it is real.** The loss
+matches to four digits over six steps and the parity suite is bit-exact under recompute (a replay
+of the same ops reorders nothing, unlike chunking), so no work is being skipped. The baseline arm
+also reproduces lever 19's numbers (72 vs 73 tok/s, pool 14480 vs 14386), so it is not a slow
+control.
+
+The mechanism is inferred, not proven. Lever 1c found the step host-bound at `gpu_busy_percent`
+~52.5%, and `endRegion` ends the pass and submits at every layer boundary. Before this, a whole
+micro-batch was recorded into one compute pass and submitted once, so the GPU sat idle while the
+host recorded 28 layers and then raced to catch up. Now layer 1 executes while the host records
+layer 5. On that reading the extra forward pass is free because it lands in time the GPU was
+already spending idle, and the win is overlap rather than arithmetic. **A GPU-bound shape should
+expect the textbook ~30% slowdown instead.** `bench` cannot answer that question: it times kernel
+families at fixed shapes, builds no model and has no layer loop, so measure it the way this table
+was measured, with two short `pretrain` runs differing only in the flag.
+
+If that reading is right, the same overlap is available without recomputing anything, by submitting
+at layer boundaries on the dense path too. That is the obvious follow-up and it is not done here.
+
+The corollary is a trap worth naming: the `submit()` in `endRegion` is not needed for correctness,
+since no region buffer ever reaches a `queue.writeBuffer` call site. It is what produces the
+overlap. Deleting it as redundant keeps the whole suite green and silently returns the throughput
+to the dense number, so the comment there says so.
+
+**This looks like it contradicts lever 3b, and does not.** 3b costs 23% by submitting once per
+micro-batch on the same host-bound step; 20 gains 2.3x by submitting once per layer on it. The
+difference is not the frequency, it is the wait. `reclaimStepTransients` ends the pass, submits,
+and then AWAITS `onSubmittedWorkDone`, which drains the pipeline and stalls the host until the GPU
+catches up. `endRegion` submits and returns. Submitting is the overlap; waiting for the submission
+is the stall. That also sharpens the follow-up above: a dense-path version must submit without a
+fence, or it will reproduce 3b's 23% rather than this lever's 2.3x.
+
+Correctness is gated three ways rather than by the loss curve: `checkpoint == off` in
+`tests/gradcheck.ts` requires bit-identical gradients, `recomputeModelParity` runs all three
+architectures against the CPU reference, and `recompute across reclaim boundaries` drives
+`trainLMGpuResident` with reclaim on and requires a bit-identical loss.
+
+The memory claim has its own gate, because no numeric test can see it: a region buffer that never
+returns to the pool leaves every number correct and quietly allocates around it. That is not
+hypothetical, it was the first version of this change. `recomputeMemoryGate` asserts it structurally, one
+claim per drain, so no fitted constant carries the weight: with reclaim off the pool must not grow
+with step count (10.9 -> 10.9 MB healthy, 14.4 -> 20.8 MB with the `sync()` drain gone), and with
+reclaim on it must not grow with micro-batch count (7.6 -> 7.6 MB healthy, 10.0 -> 12.2 MB with the
+`reclaimStepTransients` drain gone). Each deletion was verified to fail its own arm.
+
 ## Correctness / robustness
 
 ### 5. Checkpoint optimizer state (medium, real gap): DONE

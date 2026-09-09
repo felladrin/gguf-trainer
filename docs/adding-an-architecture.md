@@ -77,6 +77,24 @@ materializes `[seq-len, vocab]` logits and caps context at a large vocab (agents
 so falling back silently would walk into the abort the flag exists to avoid. Calling `trainLM`
 directly still falls back. All three shipped architectures implement it.
 
+## The layer loop and `--recompute`
+
+Wrap each layer's body in `checkpoint([hIn], () => { ... })`, as the three shipped architectures
+do. With `--recompute` off it is a passthrough that builds exactly the graph it built before, so
+there is no second code path to keep in step.
+
+Three rules. Capture the input by value (`const hIn = h;`) rather than closing over the loop
+variable: the closure runs again during backward, long after the loop has moved `h` on to the last
+layer's output. Keep the body a pure replay, since it is called twice with the same inputs and must
+produce the same values; a captured RNG or a mutated buffer would make the second call disagree
+with the first. And every computed tensor the body reads must either be built inside the body or
+named in `inputs`: a value computed once outside the loop and read by several blocks would have its
+own backward run once per block, each time on a gradient that has already grown. `checkpoint`
+throws on that rather than letting it through, because the loss curve looks normal either way.
+Parameters need no declaring; they are leaves. The same holds in the other direction, though
+nothing checks it: nothing built inside the body may be referenced from outside it except the
+value the body returns, since everything else is discarded and rebuilt with different identity.
+
 ## The parts that are easy to get wrong
 
 **`paramGroups` decides what trains how.** 2-D hidden matmuls go to `muon`; embeddings, the output
