@@ -353,6 +353,81 @@ async function main() {
     );
   }
   {
+    // A target outside the vocab. `logits.data[t * V + target]` lands in the
+    // NEXT row, so the loss comes back finite and plausible rather than
+    // stopping; only the last row reads past the array and gives NaN. The
+    // chunked loss is quieter still, since an out-of-range target falls inside
+    // no span and leaves tgtLogit at 0. Both refuse it now, through the same
+    // helper the GPU backend calls, so the two paths cannot diverge on it.
+    const T = 3, H = 4, V = 6;
+    // A local seed: drawing from the shared rng would shift every later case's
+    // data, so a block added here would silently re-roll the ones below it.
+    const r = mulberry32(0x7a46);
+    const hid = randTensor([T, H], r);
+    const w = randTensor([V, H], r);
+    const logits = linear(hid, w);
+
+    const message = (fn: () => unknown): string => {
+      try {
+        fn();
+        return "";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    };
+    // Every chunk width separately, not one try around the loop: the first width
+    // would throw and the rest would never run, which is how a check that fired
+    // for only some spans would still look green.
+    const refuses = (targets: number[], pattern: RegExp) => {
+      let ok = pattern.test(message(() => crossEntropy(logits, targets)));
+      for (const chunk of [2, 4, V]) {
+        ok = ok && pattern.test(message(() => fusedCrossEntropy(hid, w, targets, chunk)));
+      }
+      return ok;
+    };
+    // The oracle is computed here rather than taken from either loss: both draw
+    // their denominator from the helper, so comparing them to each other would
+    // agree on a wrong kept count.
+    const accepts = (targets: number[]) => {
+      let total = 0, kept = 0;
+      for (let t = 0; t < T; t++) {
+        if (targets[t] < 0) continue;
+        let mx = -Infinity;
+        for (let v = 0; v < V; v++) mx = Math.max(mx, logits.data[t * V + v]);
+        let sum = 0;
+        for (let v = 0; v < V; v++) sum += Math.exp(logits.data[t * V + v] - mx);
+        total += Math.log(sum) + mx - logits.data[t * V + targets[t]];
+        kept++;
+      }
+      const want = total / Math.max(1, kept);
+      const d = crossEntropy(logits, targets).data[0];
+      const f = fusedCrossEntropy(hid, w, targets, 2).data[0];
+      return Math.abs(d - want) < 1e-4 && Math.abs(f - want) < 1e-4;
+    };
+
+    const range = /is not -1 \(ignore\) or an integer in \[0,6\)/;
+    const cases: [string, boolean][] = [
+      ["target == V", refuses([0, V, 1], range)],
+      ["target far past V", refuses([0, 1, 999], range)],
+      ["target on the last row", refuses([0, 1, V], range)],
+      ["a non-integer target", refuses([0, 1.5, 1], range)],
+      // -1 is the only ignore marker: uploadU32 turns -2 into 0xfffffffe, a
+      // huge target the kernel scores while the CPU would skip the row.
+      ["a -2 ignore marker", refuses([0, -2, 1], range)],
+      ["more targets than rows", refuses([0, 1, 2, 3], /4 targets for 3 logit rows/)],
+      ["V-1 still scores", accepts([0, V - 1, 1])],
+      ["-1 still means ignore", accepts([0, -1, 1])],
+      ["every row ignored", accepts([-1, -1, -1])],
+    ];
+    const bad = cases.filter(([, ok]) => !ok).map(([name]) => name);
+    const ok = bad.length === 0;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"target vocab range".padEnd(24)}        ` +
+        `V=${V}, ${cases.length} cases${bad.length ? `, failed: ${bad.join(", ")}` : ""}`,
+    );
+  }
+  {
     // The identity eval-choice depends on: it reads the mean over kept rows and
     // multiplies by that count to recover a summed NLL. That only survives the
     // chunked path if both denominators are the same count, so pin it on the

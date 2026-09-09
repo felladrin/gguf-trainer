@@ -261,10 +261,10 @@ async function choiceNLL(
   for (let i = 0; i < firstChoiceTgt; i++) targets[i] = -1;
   const nChoice = targets.length - firstChoiceTgt;
   // Two invariants the summed NLL rests on, and each catches an edit the other
-  // waves through. The GPU losses count kept rows over the whole targets array
-  // while the kernels sum only inputs.length of them, so a targets array the
-  // mask extended past the end silently divides by too much. And nChoice is
-  // what the mean is multiplied back by, so it has to be the whole choice.
+  // waves through. Both losses now refuse a targets array longer than the logit
+  // rows, so this one's value is the message: it names the choice and the count
+  // rather than the array length. And nChoice is what the mean is multiplied
+  // back by, so it has to be the whole choice, which nothing else pins.
   if (targets.length !== inputs.length || nChoice !== chIds.length) {
     throw new Error(
       `mask does not line up: inputs ${inputs.length}, targets ${targets.length}, ` +

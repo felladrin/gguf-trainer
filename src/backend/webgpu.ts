@@ -25,7 +25,7 @@
 // batch micro-steps happens by `+=` into a gradient buffer that is zeroed
 // once per step, matching the CPU semantics.
 
-import { setOpsBackend, Tensor } from "../model/autograd.ts";
+import { keptRowsInVocab, setOpsBackend, Tensor } from "../model/autograd.ts";
 import type { OpsBackend } from "../model/autograd.ts";
 import {
   bindF32,
@@ -1055,9 +1055,8 @@ export class WebGPUBackend implements OpsBackend {
     if (chunk <= 0) throw new Error(`fusedCrossEntropy chunk must be positive, got ${chunk}`);
     const eh = this.entryFor(hidden);
     const ew = this.entryFor(w);
+    const kept = keptRowsInVocab(targets, T, V, "fusedCrossEntropy");
     const tgtBuf = this.uploadU32(targets); // a target of -1 uploads as 0xffffffff (ignore)
-    let kept = 0;
-    for (const g of targets) if (g >= 0) kept++;
     const divBuf = this.uploadF32([kept > 0 ? kept : 1]);
 
     // Seeded by upload rather than by a clear: pooled buffers arrive dirty, and
@@ -1115,9 +1114,13 @@ export class WebGPUBackend implements OpsBackend {
     this.curLabel = "crossEntropy";
     const [T, V] = logits.shape;
     const el = this.entryFor(logits);
+    // On the host, before the dispatch, because the kernel cannot catch this: the
+    // logits buffer is bound whole, so LOG[t * V + tgt] with tgt >= V is an
+    // in-bounds read of the next row. Measured identical to the CPU's wrong
+    // value, so this is not a check the device was already making. Ahead of the
+    // upload, so a refusal leaves no pooled buffer behind.
+    const kept = keptRowsInVocab(targets, T, V, "crossEntropy");
     const tgtBuf = this.uploadU32(targets); // a target of -1 uploads as 0xffffffff (ignore)
-    let kept = 0;
-    for (const g of targets) if (g >= 0) kept++;
     const divBuf = this.uploadF32([kept > 0 ? kept : 1]); // mean over kept rows (== T unmasked)
     // probs holds unnormalized exp(z-max); rowInv holds each row's 1/Σ, which
     // the backward applies (srcCeFwd).

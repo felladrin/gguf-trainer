@@ -687,6 +687,53 @@ export function attention(
   return out;
 }
 
+/**
+ * Count the rows a loss will keep, refusing any target that is not an ignore
+ * marker or a row of the vocab.
+ *
+ * `-1` is the ignore marker; anything else has to index a real logit row,
+ * because `logits.data[t * V + target]` with `target >= V` reads the NEXT row's
+ * logits. Measured at T=3, V=6 with one kept row: both backends returned
+ * 2.038443088531494, that row's logsumexp minus the following row's first logit
+ * to f32. The last row is the only one where the two differ, and the GPU is the
+ * worse of the pair there: the CPU reads past its array and gives NaN, while the
+ * GPU returns a finite, plausible number whose digits depend on pool state.
+ *
+ * Only `-1` is accepted as ignore, not every negative. `uploadU32` maps `-1` to
+ * `0xffffffff`, the marker the kernels test for, but `-2` becomes `0xfffffffe`
+ * (a huge target) and `-0.5` becomes `0`. The CPU would treat both as ignore
+ * while the GPU scored them, so the host count and the kernel would disagree.
+ *
+ * `targets.length` must equal `T`: the losses sum over `T` rows and divide by
+ * the count returned here, so a longer array inflates the denominator and
+ * reports a plausible wrong loss.
+ *
+ * The usual way to get here is a corpus tokenized with a different vocab than
+ * the checkpoint, which `agents.md` invariant 1 exists to prevent: the tokenizer
+ * freezes at step one. Scoring a foreign base against the wrong `.tokens` file
+ * reaches it too.
+ */
+export function keptRowsInVocab(targets: number[], T: number, V: number, where: string): number {
+  if (targets.length !== T) {
+    throw new Error(
+      `${where}: ${targets.length} targets for ${T} logit rows. The loss sums T rows and means ` +
+        `over the targets it counts, so a mismatch reports a plausible wrong loss.`,
+    );
+  }
+  let kept = 0;
+  for (let t = 0; t < T; t++) {
+    const g = targets[t];
+    if (!Number.isInteger(g) || g < -1 || g >= V) {
+      throw new Error(
+        `${where}: target ${g} at position ${t} is not -1 (ignore) or an integer in [0,${V}). ` +
+          `A corpus tokenized with a different vocab than the checkpoint is the usual cause.`,
+      );
+    }
+    if (g >= 0) kept++;
+  }
+  return kept;
+}
+
 /** Softmax cross-entropy over logits:[T,V] vs integer targets:[T]. Returns scalar. */
 export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
   if (opsBackend) return opsBackend.crossEntropy(logits, targets);
@@ -698,7 +745,7 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
   // the mean is over kept rows only. With no ignored rows this is the plain
   // full-sequence mean (kept === T), so existing callers are unchanged.
   let total = 0;
-  let kept = 0;
+  const kept = keptRowsInVocab(targets, T, V, "crossEntropy");
   for (let t = 0; t < T; t++) {
     const b = t * V;
     let maxL = -Infinity;
@@ -719,7 +766,6 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
       // 27.63. The GPU kernel and `fusedCrossEntropy` were already computing it
       // this way, so the CPU reference was the odd one out.
       total += Math.log(sum) + maxL - logits.data[b + targets[t]];
-      kept++;
     }
   }
   const denom = kept > 0 ? kept : 1;
@@ -777,6 +823,10 @@ export function fusedCrossEntropy(
     );
   }
   if (opsBackend) return opsBackend.fusedCrossEntropy(hidden, w, targets, chunk);
+  // Before the chunk loops, not after: an out-of-range target never falls inside
+  // any span, so `tgtLogit` would stay 0 and the loss would be quietly wrong
+  // rather than NaN.
+  const kept = keptRowsInVocab(targets, T, V, "fusedCrossEntropy");
   const loss = Tensor.zeros([1]);
 
   // Online softmax over the chunked vocab: a chunk whose maximum beats the
@@ -808,11 +858,9 @@ export function fusedCrossEntropy(
   }
 
   let total = 0;
-  let kept = 0;
   for (let t = 0; t < T; t++) {
     if (targets[t] < 0) continue; // ignored position: no loss, no gradient
     total += Math.log(rowSum[t]) + rowMax[t] - tgtLogit[t];
-    kept++;
   }
   const denom = kept > 0 ? kept : 1;
   loss.data[0] = total / denom;
