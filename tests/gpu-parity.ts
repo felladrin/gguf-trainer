@@ -1458,8 +1458,11 @@ async function evalFreezeGate() {
     }
   };
   const mb = (n: number) => (n / 1e6).toFixed(2);
-  // Both readout paths: the fused one has its own dW guard, and it is the path
-  // that exists for the large-vocab models this fix matters most on.
+  // Both readout paths. fusedCrossEntropy calls entryFor on the hidden state and
+  // the readout weight itself rather than going through linear, so its touched
+  // externals, and therefore what sync() stages back, are its own. At vocab 64
+  // this is one span: multi-span numerics and the dW gemm are fusedCeParity's
+  // job, and neither runs here, since the gate never calls backward.
   for (const lossChunk of [0, 64]) {
     const hot = await arm(false, lossChunk);
     const cold = await arm(true, lossChunk);
