@@ -80,10 +80,12 @@ Violating any of these wastes a run. They are checked where possible; a few cann
    At vocab 32768 the logits are `T x 32768 x 4` bytes, so 8192 needs 1 GiB and fits an adapter
    that grants its full limit (2 GiB measured); one that falls back to the WebGPU default of
    128 MiB stops at 1024. The error names the buffer.
-   **`--loss-chunk N` removes this cap**: it fuses the readout matmul into the loss and streams
+   **`--loss-chunk N` removes this cap for training**: it fuses the readout matmul into the loss and streams
    the vocab N columns at a time, so the widest buffer becomes `[T, N]` and nothing scales with
    vocab. Measured: qwen3 293M at vocab 151936 and `--seq-len 4096` aborts on the dense path
    (2374 MiB against a 2048 MiB limit) and trains with `--loss-chunk 8192`. Lever 19.
+   `eval-loss` and `eval-choice` still take the dense path, so a checkpoint trained at a context
+   they cannot score is possible; issue #46.
 
 ## Recipes
 
@@ -274,7 +276,7 @@ the round-trip test automatically: docs/adding-an-architecture.md.
 | NaN loss partway into a run                                                                  | f16 overflow, or a learning rate above 0.01                           | keep compute f32; `--lr 0.01` is the proven ceiling, 0.02 diverged                                                          |
 | a loss far worse than the checkpoint deserves, on a model that still generates readable text | this engine and llama.cpp disagree about the forward pass             | score one file with both before blaming the corpus: `docs/optimization.md` lever 17                                         |
 | OOM at long context                                                                          | the activation pool, ~2.3 MB per token in flight (lever 3)            | add `--reclaim` (5.6x less peak memory, 23% slower, lever 3b), or lower `--seq-len` or `--batch`                            |
-| `GPU storage buffer of N MiB exceeds this device's limit`                                    | a `[seq-len, vocab]` logits buffer past `maxStorageBufferBindingSize` | `--loss-chunk 8192` (fuses the readout into the loss; lever 19), or lower `--seq-len`                                       |
+| `GPU storage buffer of N MiB exceeds this device's limit`                                    | a `[seq-len, vocab]` logits buffer past `maxStorageBufferBindingSize` | during training, `--loss-chunk 8192` (lever 19); in `eval-loss`/`eval-choice`, lower `--seq-len` (#46)                      |
 
 ## Hardware reality
 

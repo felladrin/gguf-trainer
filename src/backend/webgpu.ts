@@ -886,6 +886,12 @@ export class WebGPUBackend implements OpsBackend {
    * them is 1.16 GiB at T=2048 and 2.32 GiB at T=4096, so the binding limit,
    * not free memory, is what ends long-context training. Here the widest live
    * buffer is [T, chunk] and backward recomputes each chunk's logits.
+   *
+   * The softmax statistics and the chunk scratch are transients held from
+   * forward until backward reads them, so backward must run before the next
+   * sync() or reclaimStepTransients(). That is the same contract crossEntropy
+   * already has for its probs/rowInv, and the training loops satisfy it by
+   * calling backward() immediately; this op just holds more across the boundary.
    */
   fusedCrossEntropy(hidden: Tensor, w: Tensor, targets: number[], chunk: number): Tensor {
     this.beginForwardOp();

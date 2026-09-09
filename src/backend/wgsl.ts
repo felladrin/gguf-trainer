@@ -1212,6 +1212,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * dLogits for one chunk, written OVER the recomputed chunk in place: the chunk
  * buffer is scratch that the caller re-fills from the readout matmul on the way
  * into backward, so there is nothing in it left to preserve.
+ *
+ * An ignored row is zeroed rather than skipped, which is where this departs from
+ * `srcCeBwd`'s early `return`. There the destination is a gradient accumulator
+ * that was already cleared; here the buffer is fed straight into the dHidden and
+ * dW matmuls, so a skipped row would multiply the recomputed logits into both.
  */
 export function srcCeChunkGrad(T: number, Vc: number, voff: number): string {
   const n = T * Vc;

@@ -158,7 +158,16 @@ async function profilerSmoke(gpu: WebGPUBackend) {
  * only exercised when there is more than one chunk. Row 1 is ignore-index.
  */
 async function fusedCeParity(gpu: WebGPUBackend) {
-  for (const [T, H, V, chunk] of [[4, 3, 9, 4], [8, 16, 40, 10], [6, 12, 32, 64]]) {
+  // The last shape is the one that exercises the offset GEMM the way a real run
+  // does. Below it every span sits inside a single 64x64 block with a K loop of
+  // one BK=16 step, so `blockRow`, `blockCol` and the K stride are all pinned at
+  // their first value and a wrong offset cannot show. At T=130, V=200, chunk=70
+  // there are three spans, NT spans 2 column blocks over 3 K-steps, NN runs 5
+  // K-steps so `(gk + off)` crosses BK boundaries, and TN reaches `blockRow=64`
+  // with a nonzero offset: the exact term whose parenthesization broke once.
+  for (
+    const [T, H, V, chunk] of [[4, 3, 9, 4], [8, 16, 40, 10], [6, 12, 32, 64], [130, 40, 200, 70]]
+  ) {
     const targets = Array.from({ length: T }, (_, i) => (i === 1 ? -1 : (i * 7 + 3) % V));
     const mk = () => {
       const r = mulberry32(0xf00d);

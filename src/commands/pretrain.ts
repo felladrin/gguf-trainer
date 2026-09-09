@@ -23,6 +23,14 @@
 import { readGGUF } from "../gguf/gguf.ts";
 import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";
 import { lossTrend } from "../loss-trend.ts";
+import { sequenceLoss } from "../train/loss.ts";
+
+/**
+ * Pipeline-count ceiling for `--loss-chunk`. Each vocab span compiles five
+ * offset-baked kernels, so this caps the pre-step compile cost at ~500
+ * pipelines. A width small enough to exceed it saves no memory worth having.
+ */
+const MAX_LOSS_SPANS = 100;
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
 import { crossEntropy, mulberry32 } from "../model/autograd.ts";
@@ -220,7 +228,11 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const startStep = v.num("start-step");
   const quant = v.str("checkpoint-precision") as QuantName;
   const lossChunk = v.num("loss-chunk");
-  if (lossChunk < 0) die(`--loss-chunk must be 0 (dense) or positive, got ${lossChunk}`);
+  if (!Number.isInteger(lossChunk) || lossChunk < 0) {
+    // A fractional width would reach WGSL as `const N: u32 = 8192.5u;` and fail
+    // as a shader-compile error rather than a usage error.
+    die(`--loss-chunk must be a whole number, 0 (dense) or positive, got ${lossChunk}`);
+  }
   const resumePath = v.opt("resume");
   const outPath = v.str("out");
   const name = v.opt("name") ?? (mode === "finetune" ? "finetune" : "pretrain-base");
@@ -331,10 +343,20 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const cpuLoss = crossEntropy(model.forward(probeIn), probeTgt).data[0];
   gpu.install();
   let gpuLoss: number;
+  let fusedLoss: number | null = null;
   try {
     const l = crossEntropy(model.forward(probeIn), probeTgt);
     await gpu.sync([l]);
     gpuLoss = l.data[0];
+    if (lossChunk > 0) {
+      // The op that runs every step is not the one checked above, so check it
+      // too: at 16 tokens the dense side still fits whatever the run's seq-len
+      // would have blown, and this exercises every span offset at the real
+      // vocab before the run starts.
+      const f = sequenceLoss(model, probeIn, probeTgt, lossChunk);
+      await gpu.sync([f]);
+      fusedLoss = f.data[0];
+    }
   } finally {
     gpu.uninstall();
   }
@@ -345,6 +367,15 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     })`,
   );
   if (drift > 1e-3 + 1e-3 * Math.abs(cpuLoss)) die("GPU/CPU parity probe failed");
+  if (fusedLoss !== null) {
+    const fdrift = Math.abs(fusedLoss - gpuLoss);
+    console.log(
+      `Chunked-loss probe: dense ${gpuLoss.toFixed(4)} vs chunked ${fusedLoss.toFixed(4)} (|Δ|=${
+        fdrift.toExponential(1)
+      })`,
+    );
+    if (fdrift > 1e-3 + 1e-3 * Math.abs(gpuLoss)) die("chunked/dense loss probe failed");
+  }
 
   const groups = model.paramGroups();
   const opt = new MuonGpu(gpu, groups.muon, groups.aux, {
@@ -375,12 +406,29 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     minScale: 0.1,
   });
   const schedule = (localStep: number) => fullSchedule(startStep + localStep);
+  // Every span bakes its offset into five WGSL sources (NT, stats, grad, NN, TN),
+  // so a small width compiles thousands of pipelines before step 0 and presents
+  // as a hang. Report the count, and refuse the widths that are all cost.
+  const lossSpans = lossChunk > 0 ? Math.ceil(cfg.vocabSize / lossChunk) : 0;
+  if (lossSpans > MAX_LOSS_SPANS) {
+    die(
+      `--loss-chunk ${lossChunk} splits a ${cfg.vocabSize}-token vocab into ${lossSpans} spans, ` +
+        `each compiling 5 kernels (${lossSpans * 5} pipelines before step 0). ` +
+        `Raise it to at least ${Math.ceil(cfg.vocabSize / MAX_LOSS_SPANS)}.`,
+    );
+  }
+  if (lossChunk > 0 && !model.forwardToReadout) {
+    // Silent degradation would be the worst outcome: the only reason to pass the
+    // flag is to get past the binding limit, and the dense fallback walks back
+    // into it with nothing to say why.
+    die(`--loss-chunk needs an architecture with forwardToReadout; ${arch.name} has none`);
+  }
   console.log(
     `Schedule: muon lr ${muonLr}, aux lr ${auxLr}, WSD warmup ${
       Math.round(steps * 0.1)
     } / cooldown ${Math.round(steps * 0.2)} steps, quant ${quant}, reclaim ${
       flags.has("reclaim") ? "on" : "off"
-    }, loss ${lossChunk > 0 ? `chunked x${lossChunk}` : "dense"}`,
+    }, loss ${lossChunk > 0 ? `chunked x${lossChunk} (${lossSpans} spans)` : "dense"}`,
   );
 
   // WSD decay-phase instruct injection (MiniCPM/Xmodel-2 trick): from the cooldown
