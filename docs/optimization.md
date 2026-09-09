@@ -921,7 +921,12 @@ Making `freezeForScoring` a no-op leaves the readback at the full model; moving 
 `uploadParams` drops the readback but not the pool, and that arm is what pins the ordering.
 
 `generate` has the same defect and pays it per token rather than per window: 40.1% of its wall
-clock on the same checkpoint. It is #58, deliberately not fixed here.
+clock on the same checkpoint. It is #58, deliberately not fixed here. Freezing also leaves `sync()`
+re-queueing the shared stub for clearing once per frozen parameter per window, which is #60 and
+applies to LoRA training as much as to eval.
+
+Under `--cpu` this is a no-op: `Tensor`'s constructor allocates a gradient array for every tensor
+regardless, so there is nothing for a freeze to skip. Both arms measured 3.1600 there, as expected.
 
 ## Quality levers
 

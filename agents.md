@@ -214,8 +214,9 @@ checkpoints. `eval-choice` at these sizes hovers near chance (25.0), so read the
 number.
 
 Both eval commands freeze every parameter before the first forward (`freezeForScoring`). Nothing
-there runs backward, and an unfrozen parameter costs a gradient buffer allocated per run and copied
-back to the host per window: 14.8% of `eval-loss` wall clock on a 293M checkpoint, lever 25. Any new
+there runs backward, and on the GPU an unfrozen parameter costs a gradient buffer allocated per run
+and copied back to the host per window: 14.8% of `eval-loss` wall clock on a 293M checkpoint, lever
+25. Under `--cpu` it is a no-op, since every tensor allocates its own gradient anyway. Any new
 forward-only command wants the same line.
 
 Split a held-out set off the corpus BEFORE tokenizing it, or you cannot compare two checkpoints

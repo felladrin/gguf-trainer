@@ -1367,62 +1367,6 @@ async function recomputeModelParity(gpu: WebGPUBackend) {
  * are created outside the pool and optimizer state is counted separately, so
  * nothing else moves these numbers.
  */
-/**
- * The eval readback gate. Scoring never runs backward, but every parameter is an
- * external with `requiresGrad`, so `entryFor` gave each one a full-size gradient
- * accumulator and `sync()` staged all of them back to the host on every window.
- * `freezeForScoring` is what stops both, and neither is visible in the score, so
- * only a measurement can tell whether it is still working.
- */
-async function evalFreezeGate() {
-  const cfg = gemma3Config(64, 64, 4, 256, 16);
-  const ids = Array.from({ length: 65 }, (_, i) => (i * 11 + 5) % cfg.vocabSize);
-  const arm = async (freeze: boolean) => {
-    const gpu = (await initWebGPU())!;
-    const m = new Gemma3Model(cfg, mulberry32(5));
-    try {
-      // Before uploadParams on purpose: entryFor sizes the buffer on first use.
-      if (freeze) freezeForScoring(m);
-      gpu.install();
-      gpu.uploadParams(m.params());
-      const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
-      await gpu.sync([loss]);
-      return {
-        readback: gpu.lastSyncReadbackBytes,
-        pool: gpu.residentBytes().pool,
-        loss: loss.data[0],
-      };
-    } finally {
-      gpu.destroy();
-    }
-  };
-  const hot = await arm(false);
-  const cold = await arm(true);
-  const paramBytes = new Gemma3Model(cfg, mulberry32(5)).params()
-    .reduce((a, t) => a + t.size * 4, 0);
-
-  // 1. The unfrozen arm reads back a whole model of gradients, plus the scalar.
-  //    Pinning the baseline is what keeps arm 2 from passing on a model so small
-  //    the copies never mattered.
-  const wasCopying = hot.readback >= paramBytes;
-  // 2. Frozen, the only thing crossing the bus is the loss scalar itself.
-  const stopped = cold.readback === 4;
-  // 3. And the accumulators are not allocated either, so the pool drops by
-  //    roughly the model. Loose: the pool also holds activations.
-  const smaller = cold.pool < hot.pool - 0.9 * paramBytes;
-  // 4. The score is the point: freezing must not move it at all.
-  const same = hot.loss === cold.loss;
-
-  const ok = wasCopying && stopped && smaller && same;
-  if (!ok) failures++;
-  const mb = (n: number) => (n / 1e6).toFixed(2);
-  console.log(
-    `  ${ok ? "ok " : "FAIL"} eval freeze: readback ${mb(hot.readback)} -> ` +
-      `${cold.readback} B (params ${mb(paramBytes)} MB), pool ${mb(hot.pool)} -> ` +
-      `${mb(cold.pool)} MB, loss ${hot.loss.toFixed(6)} both arms`,
-  );
-}
-
 async function recomputeMemoryGate() {
   const cfg = gemma3Config(64, 64, 4, 256, 16);
   const tokens = Array.from({ length: 8192 }, (_, i) => (i * 7 + 3) % cfg.vocabSize);
@@ -1481,6 +1425,68 @@ async function recomputeMemoryGate() {
       `(${mb(s2)}->${mb(s6)} MB, reclaim off), flat in micro-batches ` +
       `(${mb(b2)}->${mb(b4)} MB, reclaim on), under dense (${mb(dense)} MB)`,
   );
+}
+
+/**
+ * The eval readback gate. Scoring never runs backward, but every parameter is an
+ * external with `requiresGrad`, so `entryFor` gave each one a full-size gradient
+ * accumulator and `sync()` staged all of them back to the host on every window.
+ * `freezeForScoring` is what stops both, and neither is visible in the score, so
+ * only a measurement can tell whether it is still working.
+ */
+async function evalFreezeGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const ids = Array.from({ length: 65 }, (_, i) => (i * 11 + 5) % cfg.vocabSize);
+  const arm = async (freeze: boolean, lossChunk: number) => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    try {
+      // Before uploadParams on purpose: entryFor sizes the buffer on first use.
+      if (freeze) freezeForScoring(m);
+      gpu.install();
+      gpu.uploadParams(m.params());
+      const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), lossChunk);
+      await gpu.sync([loss]);
+      return {
+        readback: gpu.lastSyncReadbackBytes,
+        pool: gpu.residentBytes().pool,
+        loss: loss.data[0],
+        paramBytes: m.params().reduce((a, t) => a + t.size * 4, 0),
+      };
+    } finally {
+      gpu.destroy();
+    }
+  };
+  const mb = (n: number) => (n / 1e6).toFixed(2);
+  // Both readout paths: the fused one has its own dW guard, and it is the path
+  // that exists for the large-vocab models this fix matters most on.
+  for (const lossChunk of [0, 64]) {
+    const hot = await arm(false, lossChunk);
+    const cold = await arm(true, lossChunk);
+    const paramBytes = hot.paramBytes;
+
+    // 1. The unfrozen arm reads back a whole model of gradients, plus the
+    //    scalar. Pinning the baseline is what keeps assertion 2 from passing on
+    //    a model so small the copies never mattered.
+    const wasCopying = hot.readback >= paramBytes;
+    // 2. Frozen, the only thing crossing the bus is the loss scalar itself.
+    const stopped = cold.readback === 4;
+    // 3. And the accumulators are not allocated either, so the pool drops by
+    //    roughly the model. Both arms allocate the same data buffers and the
+    //    same intermediates, so the gap is the parameter gradients less one
+    //    256-byte stub; 0.9 leaves an order of magnitude of slack.
+    const smaller = cold.pool < hot.pool - 0.9 * paramBytes;
+    // 4. The score is the point: freezing must not move it at all.
+    const same = hot.loss === cold.loss;
+
+    const ok = wasCopying && stopped && smaller && same;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} eval freeze (chunk ${lossChunk}): readback ` +
+        `${mb(hot.readback)} MB -> ${cold.readback} B (params ${mb(paramBytes)} MB), ` +
+        `pool ${mb(hot.pool)} -> ${mb(cold.pool)} MB, loss ${hot.loss.toFixed(6)} both arms`,
+    );
+  }
 }
 
 /**
