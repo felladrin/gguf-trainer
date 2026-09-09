@@ -669,6 +669,7 @@ async function main() {
   }
   await gpuMatmulFdCheck(gpu);
   await profilerSmoke(gpu);
+  await aliasedBinaryOpParity(gpu);
   await fusedCeParity(gpu);
   await recomputeModelParity(gpu);
   await loraModelParity(gpu);
@@ -1490,6 +1491,59 @@ async function loraModelParity(gpu: WebGPUBackend) {
       `  ${ok ? "ok " : "FAIL"} ${name} lora + recompute vs CPU (${h.adapted} adapters, ` +
         `stub ${stubDirty}, merge drift ${drift.toExponential(1)})`,
     );
+  }
+}
+
+/**
+ * Element-wise ops given the SAME tensor twice. Issue #48 predicted that
+ * `add(t, t)` would lose one of its two gradient accumulations on the GPU,
+ * because the backward binds one buffer to two read_write slots and does two
+ * read-modify-writes. It does not, and the reason is worth pinning rather than
+ * rediscovering: these kernels run one invocation per element, so both writes
+ * come from the same thread to the same address in program order. There is no
+ * cross-thread race to lose.
+ *
+ * That makes this a property the current kernels satisfy by construction and a
+ * future one could break, which is exactly what a test is for. A hand-rolled
+ * gradient seed is required: `backward` only seeds a scalar, so a non-scalar
+ * output needs `seedGradFromHost` or both sides silently compare zeros.
+ */
+async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
+  const cases: [string, (t: Tensor) => Tensor][] = [
+    ["add(t, t)", (t) => add(t, t)],
+    ["mul(t, t)", (t) => mul(t, t)],
+  ];
+  for (const [name, fwd] of cases) {
+    let ok = true;
+    for (const n of [1, 6, 257, 5000]) {
+      const rng = mulberry32(4);
+      const t = randTensor([n], rng);
+      const seed = new Float32Array(n);
+      const sr = mulberry32(7);
+      for (let i = 0; i < n; i++) seed[i] = sr() * 2 - 1;
+
+      const cpuOut = fwd(t);
+      cpuOut.grad.set(seed);
+      cpuOut._backward();
+      const cpuGrad = t.grad.slice();
+      const cpuData = cpuOut.data.slice();
+
+      t.zeroGrad();
+      gpu.install();
+      try {
+        const g = fwd(t);
+        g.grad.set(seed);
+        gpu.seedGradFromHost(g);
+        g._backward();
+        await gpu.sync([g]);
+        ok = compare(`${name}.out[n=${n}]`, g.data, cpuData, FWD) && ok;
+        ok = compare(`${name}.dInput[n=${n}]`, t.grad, cpuGrad, BWD) && ok;
+      } finally {
+        gpu.uninstall();
+      }
+    }
+    if (!ok) failures++;
+    console.log(`  ${ok ? "ok " : "FAIL"} ${name} accumulates both gradients (4 sizes)`);
   }
 }
 

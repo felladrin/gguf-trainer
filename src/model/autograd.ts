@@ -711,7 +711,14 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
     }
     for (let v = 0; v < V; v++) probs[b + v] /= sum;
     if (targets[t] >= 0) {
-      total += -Math.log(probs[b + targets[t]] + 1e-12);
+      // log(Σ exp(z - m)) + m - z_target, not -log(p_target). The normalized
+      // probability underflows f32 once the target is ~88 logits behind the
+      // maximum, and the epsilon this used to add then clamped every worse
+      // prediction to -log(1e-12) = 27.63. Measured before the change: a gap of
+      // 30 reported 27.54 against an exact 30, and a gap of 90 still reported
+      // 27.63. The GPU kernel and `fusedCrossEntropy` were already computing it
+      // this way, so the CPU reference was the odd one out.
+      total += Math.log(sum) + maxL - logits.data[b + targets[t]];
       kept++;
     }
   }
@@ -885,7 +892,10 @@ export function softCrossEntropy(
       const id = teacherIds[t * k + j];
       if (id < 0 || id >= V) throw new Error(`softCrossEntropy: teacher id ${id} out of [0,${V})`);
       const q = teacherProbs[t * k + j];
-      total += -q * Math.log(probs[b + id] + 1e-12);
+      // Σ q·(log(Σ exp(z-m)) + m - z_id), the same expansion the GPU kernel
+      // uses and for the same reason: reading a normalized probability back
+      // clamps every confident-wrong teacher term at -log(1e-12) = 27.63.
+      total += q * (Math.log(sum) + maxL - logits.data[b + id]);
       rowMass[t] += q;
     }
     kept++;

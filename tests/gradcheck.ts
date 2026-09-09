@@ -301,6 +301,30 @@ async function main() {
     );
   }
   {
+    // The loss must stay exact when the target is far behind the maximum. Both
+    // CPU losses used to read a normalized probability back and add 1e-12 to it,
+    // which clamped every worse prediction at -log(1e-12) = 27.63: a 30-logit
+    // gap reported 27.54 and a 90-logit gap still reported 27.63. Both GPU
+    // kernels already used the logsumexp form, so this was a silent CPU/GPU
+    // divergence that only appeared once a model was badly wrong.
+    let worst = 0;
+    for (const gap of [10, 30, 60, 90]) {
+      const V = 4;
+      const logits = new Tensor(Float32Array.from([gap, 0, 0, 0]), [1, V], true);
+      let sum = 0;
+      for (const z of [gap, 0, 0, 0]) sum += Math.exp(z - gap);
+      const exact = Math.log(sum) + gap; // z_target is 0
+      worst = Math.max(worst, Math.abs(crossEntropy(logits, [3]).data[0] - exact));
+      worst = Math.max(worst, Math.abs(softCrossEntropy(logits, [3], [1], 1).data[0] - exact));
+    }
+    const ok = worst < 1e-4;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"CE exact at big gaps".padEnd(24)}        ` +
+        `hard and soft, gaps to 90  maxAbs=${worst.toExponential(2)}`,
+    );
+  }
+  {
     // The identity eval-choice depends on: it reads the mean over kept rows and
     // multiplies by that count to recover a summed NLL. That only survives the
     // chunked path if both denominators are the same count, so pin it on the

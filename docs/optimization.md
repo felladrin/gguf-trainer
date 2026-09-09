@@ -807,6 +807,37 @@ removes the temp directory the killed child could not. What
 no test here can reach is the partial-write drain, since `writeSync` never returns short for a
 regular file.
 
+### 23. The CPU cross-entropy clamped every confident-wrong loss at 27.63 (2026-09-09)
+
+Found while trying to reproduce issue #48. Both CPU losses computed the row's loss by reading a
+normalized probability back and adding an epsilon, `-log(p_target + 1e-12)`. Once the target falls
+about 88 logits behind the row maximum, `p_target` underflows f32 to zero and the epsilon takes
+over, so the reported loss saturates at `-log(1e-12) = 27.63` no matter how wrong the prediction
+is. Measured on a single row before the change:
+
+| gap between the maximum and the target logit | reported  | exact     |
+| -------------------------------------------- | --------- | --------- |
+| 10                                           | 10.000136 | 10.000136 |
+| 30                                           | 27.541569 | 30        |
+| 60                                           | 27.631021 | 60        |
+| 90                                           | 27.631021 | 90        |
+
+Both GPU kernels already used the numerically stable form (`srcCeFwd` computes
+`log(s) - (z_target - m)`, and `srcSoftCeFwd`'s comment says it is "expanded so no probability is
+ever read back"), and `fusedCrossEntropy` from lever 19 was written that way too. So the dense CPU
+path was the only one of four that clamped, and the chunked path this repo added was strictly more
+accurate than the dense one it replaced.
+
+`crossEntropy` and `softCrossEntropy` now use `log(Σ exp(z - m)) + m - z_target`. Gradients were
+never affected: the backward uses the normalized probabilities, where underflow to zero is the
+correct limit.
+
+**What it was hiding.** The CPU reference is the correctness oracle for the GPU kernels, so a
+divergence that only shows at extreme logits is exactly the kind that survives a parity suite: the
+suite's shapes produce losses of 2 to 10, nowhere near the clamp. It also capped `eval-loss --cpu`
+at a perplexity of `e^27.63` for a badly mismatched model or tokenizer, which reads as a plausible
+number rather than a saturated one.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
