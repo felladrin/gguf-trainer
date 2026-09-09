@@ -84,7 +84,6 @@ for (
 // only one of the two checks. The point of the shared pair is that a fifth
 // caller cannot repeat that, so pin both here rather than in a live run.
 {
-  // deno-lint-ignore no-explicit-any
   const withReadout = { forwardToReadout: () => ({}) } as unknown as LanguageModel;
   const withoutReadout = {} as unknown as LanguageModel;
   const V = 151936;
