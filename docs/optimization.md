@@ -1316,6 +1316,91 @@ the flag narrows the window rather than closing it. Under `--recompute` that ord
 rather than exotic, since a checkpoint replay's own forward is that forward B, and it still throws on
 a real model only because the loss and readout backwards run before any checkpoint block.
 
+### 33. The GGUF tensor boundary checked shapes in neither direction (2026-09-09)
+
+Filed as #73 and #74 while reviewing lever 31, and fixed together because they are one boundary seen
+from its two sides. Neither is reachable today, which is why both are worth naming: the failure mode
+on each side is a plausible artifact rather than an error.
+
+**Writing.** `addMatrix` destructures `const [outDim, inDim] = t.shape`. A 1-D tensor leaves `inDim`
+undefined, so `inDim % 32 !== 0` is `NaN !== 0` and every such tensor silently becomes f16 whatever
+the requested quant, and the ggml `ne` goes out as `[undefined, outDim]`. That is a corrupt file
+produced without a word. `addVector` had the mirror hole.
+
+**Reading.** `tensorLoader` never looked at `t.dims` at all:
+
+```ts
+const de = dequantize(t.type, t.data, dst.size);
+dst.data.set(de);
+```
+
+The destination shape comes from `arch.build(cfg, ...)`, allocated from the metadata scalars before
+any bytes are read, so the file's own dims were pure decoration. Measured, with the direction the
+other way round from what this lever said first:
+
+| the destination against the file's tensor | before                                                                           |
+| ----------------------------------------- | -------------------------------------------------------------------------------- |
+| same element count, transposed            | a scrambled weight and a model that generates noise                              |
+| smaller                                   | a silent prefix load: a `[3,4]` tensor into a `[4]` destination gives 1, 2, 3, 4 |
+| larger                                    | `RangeError: Offset is outside the bounds of the DataView`, no tensor named      |
+
+`dequantize` always returns exactly `count` floats and a `Tensor`'s buffer always matches its shape,
+so the "fills a prefix and leaves the rest" case cannot happen; the prefix is taken from the FILE,
+not left in the destination. The only guard anywhere was the `token_embd.weight` round-trip check in
+`demo.ts`, one tensor in one command.
+
+The loader now compares `t.dims` against the destination shape reversed, ggml writing `ne`
+fastest-moving first, which is exactly what `addMatrix` does when it sends `[outDim, inDim]` out as
+`[inDim, outDim]`.
+
+The rank half of that comparison is not decoration either. `[4]` reversed is a PREFIX of `[4, 3]`,
+so an element-wise check alone accepts a 1-D destination against a 2-D tensor and `dequantize`
+returns the first four values quite happily. That case is what the length clause is for, and it is
+the one mutation that survived the first version of the test.
+
+Two more things landed with it, both the same shape one axis over.
+
+`dequantize` now checks that the buffer holds the bytes the type and count require, and that a block
+type gets a whole number of blocks. The `RangeError` above is the polite failure; **q4_0 has a silent
+one**. Its nibble read is a plain array index, and in JS `undefined & 0x0f` is 0, so every byte past
+the end of a truncated block decodes as `(0 - 8) * scale`: finite, plausible, no NaN. Measured on a
+block with half its nibbles missing, the last eight values came back as -8.
+
+And the dims comparison trims trailing 1s from both sides. GGUF itself stores an explicit `n_dims`
+and exactly that many values, so a file is never padded; llama.cpp pads `ne` to four with 1s **on
+read**, which is why `[n]` and `[n, 1]` are the same tensor to it and why a writer emitting the
+redundant trailing 1 produces a file it accepts and an exact comparison here would refuse. This repo
+reads foreign GGUFs on purpose, BF16 existing only as an import path.
+
+Trimming cannot admit anything it should refuse, because it preserves the product: if the two
+trimmed lists are equal then the element counts are equal. The `> 1` floor has no distinguishing
+input either, and that is a property rather than a gap. The two floors differ only for an all-1s
+list, `[]` against `[1]`, and a list of positive integers is all-1s exactly when its product is 1; so
+if one side is all-1s the other either is too, in which case both floors collapse both sides
+identically, or has a different product, in which case both refuse.
+
+**This brings the repo into line with llama.cpp rather than away from it,** which is the opposite of
+what this entry said first. `check_tensor_dims` in `llama-model-loader.cpp` throws
+`tensor '%s' has wrong shape` on exactly this mismatch, and it compares over `GGML_MAX_DIMS`
+requiring `cur->ne[i] == 1` past the expected shape's length, which is the trailing-1 rule
+implemented here. So the outlier was this repo, in not checking at all. I had written that llama.cpp
+tolerates a padded embedding because it sizes the model from the tensor; that was recall, the local
+checkout says otherwise, and the paragraph is gone.
+
+What a foreign file is likely to trip on instead is a defaulted metadata key. `attention.key_length`
+falls back to `embedding_length / head_count` and `vocab_size` to the token list's length, and a
+wrong default changes the shape of every `attn_q` and `attn_k`. Turning that from a scrambled weight
+into an error is the guard's best outcome, so the message names those two keys. All eight local
+checkpoints across the three architectures load unchanged under it.
+
+`assertRank` is `assertMatrix` from lever 31 with the rank as an argument, since the writer needs 2
+for a matrix and 1 for a vector. Eleven mutations, ten in `tests/export-extras.ts` and one in
+`tests/gradcheck.ts`, one per clause on each side. One survives and is left alone: loosening the
+trim's floor from `> 1` to `> 0`, for the reason above. One is worth knowing about because it looks
+like a tightening: `bytes.length < need` cannot become `!==`, since the writer pads every tensor up
+to the file's alignment and the reader slices each one to the next tensor's offset, so `t.data`
+legitimately carries that padding.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

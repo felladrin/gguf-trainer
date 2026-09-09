@@ -8,7 +8,7 @@ import { GGUFWriter } from "../gguf/gguf.ts";
 import type { GGUFFile } from "../gguf/gguf.ts";
 import { dequantize, serialize } from "../gguf/quantize.ts";
 import type { QuantName } from "../gguf/quantize.ts";
-import { Tensor } from "../model/autograd.ts";
+import { assertRank, Tensor } from "../model/autograd.ts";
 import type { TokenizerData } from "../tokenizer/bpe.ts";
 import type { ExportOpts } from "../model/arch.ts";
 
@@ -30,6 +30,11 @@ export function ones(shape: number[]): Tensor {
  * 32 the tensor falls back to f16 rather than silently mis-encoding.
  */
 export function addMatrix(w: GGUFWriter, name: string, t: Tensor, quant: QuantName) {
+  // Before the destructure, which is where a wrong rank stops being visible: a
+  // 1-D tensor leaves inDim undefined, so `inDim % 32 !== 0` is NaN !== 0 and
+  // every such tensor silently becomes f16, and the ggml ne goes out as
+  // [undefined, outDim]. A file, not an error.
+  assertRank(t, 2, name, "addMatrix");
   const [outDim, inDim] = t.shape;
   let q = quant;
   if ((quant === "q8_0" || quant === "q4_0") && inDim % 32 !== 0) q = "f16";
@@ -38,6 +43,7 @@ export function addMatrix(w: GGUFWriter, name: string, t: Tensor, quant: QuantNa
 
 /** Norm and other 1-D tensors stay f32; llama.cpp expects that. */
 export function addVector(w: GGUFWriter, name: string, t: Tensor) {
+  assertRank(t, 1, name, "addVector");
   w.addTensor(name, [t.shape[0]], serialize(t.data, "f32"));
 }
 
@@ -124,6 +130,43 @@ export function tensorLoader(g: GGUFFile): (name: string, dst: Tensor) => void {
   return (name, dst) => {
     const t = byName.get(name);
     if (!t) throw new Error(`GGUF missing tensor "${name}"`);
+    // ggml writes ne fastest-moving first, so a file's dims are this repo's
+    // shape reversed: addMatrix sends [outDim, inDim] out as [inDim, outDim].
+    // Nothing compared them before, and the destination shape comes from the
+    // metadata config rather than from the file, so a tensor whose stored dims
+    // disagreed loaded without a word. Measured: a destination SMALLER than the
+    // file's tensor takes a prefix of it and reports nothing (a [3,4] tensor
+    // into a [4] destination loads 1,2,3,4), and a transposed pair of the same
+    // element count scrambles the weight. The other direction threw, but as an
+    // unnamed DataView RangeError; dequantize names it now.
+    //
+    // Trailing 1s are trimmed from both sides, which is llama.cpp's own rule:
+    // check_tensor_dims compares over GGML_MAX_DIMS and requires cur->ne[i] == 1
+    // for every i past the expected shape's length. GGUF itself stores an
+    // explicit n_dims and exactly that many values, so a file is never padded;
+    // a writer that emits the redundant trailing 1 makes a file llama.cpp
+    // accepts, and an exact comparison here would refuse it. Trimming
+    // still refuses [4] against [4, 3], which is the case the length clause is
+    // for: [4] is a PREFIX of [4, 3], so comparing element-wise alone accepts a
+    // 1-D destination against a 2-D tensor.
+    const trim = (d: number[]) => {
+      const out = [...d];
+      while (out.length > 1 && out[out.length - 1] === 1) out.pop();
+      return out;
+    };
+    const want = trim([...dst.shape].reverse());
+    const have = trim(t.dims);
+    if (have.length !== want.length || want.some((d, i) => d !== have[i])) {
+      throw new Error(
+        `GGUF tensor "${name}" has dims [${t.dims.join(", ")}], but this model wants ` +
+          `[${want.join(", ")}] (shape [${dst.shape.join(", ")}] in this repo's order). ` +
+          `For a file this repo wrote that means corruption. For a foreign one it means ` +
+          `this repo's config and the file's tensors disagree about a dimension, so check ` +
+          `the keys defaulted when absent: attention.key_length falls back to ` +
+          `embedding_length / head_count, and vocab_size to the token list's length. A wrong ` +
+          `default changes the shape this model allocates.`,
+      );
+    }
     const de = dequantize(t.type, t.data, dst.size);
     dst.data.set(de);
   };

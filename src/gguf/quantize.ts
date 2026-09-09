@@ -46,7 +46,7 @@ export function serializeQ8_0(data: Float32Array): Serialized {
     throw new Error(`Q8_0 needs a length multiple of ${QK}, got ${data.length}`);
   }
   const nBlocks = data.length / QK;
-  const blockBytes = 2 + QK; // 34
+  const blockBytes = BLOCK_BYTES[GGMLType.Q8_0]!;
   const out = new Uint8Array(nBlocks * blockBytes);
   const dv = new DataView(out.buffer);
 
@@ -78,7 +78,7 @@ export function serializeQ4_0(data: Float32Array): Serialized {
     throw new Error(`Q4_0 needs a length multiple of ${QK}, got ${data.length}`);
   }
   const nBlocks = data.length / QK;
-  const blockBytes = 2 + QK / 2; // 18
+  const blockBytes = BLOCK_BYTES[GGMLType.Q4_0]!;
   const out = new Uint8Array(nBlocks * blockBytes);
   const dv = new DataView(out.buffer);
 
@@ -114,7 +114,53 @@ export function serializeQ4_0(data: Float32Array): Serialized {
 // as the basis for a future GGUF checkpoint loader.
 // ---------------------------------------------------------------------------
 
+/** Bytes one block of a block-quantized type occupies: an f16 scale plus its payload. */
+const BLOCK_BYTES: Partial<Record<GGMLTypeId, number>> = {
+  [GGMLType.Q8_0]: 2 + QK,
+  [GGMLType.Q4_0]: 2 + QK / 2,
+};
+
+/**
+ * Bytes `count` elements of `type` occupy, or null for a type this file cannot
+ * read, so `dequantize` keeps its own message for that case rather than losing
+ * it to a guard running first.
+ *
+ * It exists so a short buffer is refused by name instead of by a DataView
+ * RangeError, or worse. The block types are the reason: a q4_0 buffer truncated
+ * inside a block decodes its missing nibbles as `undefined & 0x0f`, i.e. 0, so
+ * every one comes out as `(0 - 8) * scale`, finite and entirely plausible.
+ */
+export function bytesFor(type: GGMLTypeId, count: number): number | null {
+  const block = BLOCK_BYTES[type];
+  if (block !== undefined) {
+    if (count % QK !== 0) {
+      throw new Error(
+        `dequantize: ggml type ${type} needs a count multiple of ${QK}, got ${count}`,
+      );
+    }
+    return (count / QK) * block;
+  }
+  if (type === GGMLType.F32) return count * 4;
+  if (type === GGMLType.F16 || type === GGMLType.BF16) return count * 2;
+  // Null, not a throw: dequantize refuses this type below with a message that
+  // names it and says what to do, and a guard running first would replace it.
+  // Safe only because the types this cannot size are exactly the ones it
+  // refuses. Add a case to that switch without an entry here and the byte guard
+  // silently stops covering it, which for a k-quant super-block is precisely
+  // where a short read is quiet.
+  return null;
+}
+
 export function dequantize(type: GGMLTypeId, bytes: Uint8Array, count: number): Float32Array {
+  const need = bytesFor(type, count);
+  // `<`, not `!==`: the writer pads every tensor up to the file's alignment and
+  // the reader slices each one to the next tensor's offset, so t.data legitimately
+  // carries that padding.
+  if (need !== null && bytes.length < need) {
+    throw new Error(
+      `dequantize: ${count} elements of ggml type ${type} need ${need} bytes, got ${bytes.length}`,
+    );
+  }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const out = new Float32Array(count);
   switch (type) {
@@ -134,7 +180,7 @@ export function dequantize(type: GGMLTypeId, bytes: Uint8Array, count: number): 
       return out;
     }
     case GGMLType.Q8_0: {
-      const blockBytes = 2 + QK;
+      const blockBytes = BLOCK_BYTES[GGMLType.Q8_0]!;
       const nBlocks = count / QK;
       for (let b = 0; b < nBlocks; b++) {
         const base = b * blockBytes;
@@ -144,7 +190,7 @@ export function dequantize(type: GGMLTypeId, bytes: Uint8Array, count: number): 
       return out;
     }
     case GGMLType.Q4_0: {
-      const blockBytes = 2 + QK / 2;
+      const blockBytes = BLOCK_BYTES[GGMLType.Q4_0]!;
       const nBlocks = count / QK;
       for (let b = 0; b < nBlocks; b++) {
         const base = b * blockBytes;

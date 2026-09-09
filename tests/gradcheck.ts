@@ -1193,12 +1193,14 @@ async function main() {
     }
     const bfOut = dequantize(30 as never, bf, bfVals.length); // 30 = BF16
     for (let i = 0; i < bfVals.length; i++) if (bfOut[i] !== bfVals[i]) ok = false;
-    // Unsupported quant type -> loud throw, not a silent zero tensor.
+    // Unsupported quant type -> loud throw, not a silent zero tensor, AND with
+    // the message someone wrote for it. bytesFor runs first and returns null for
+    // an unknown type precisely so this one survives.
     let threw = false;
     try {
       dequantize(12 as never, new Uint8Array(64), 32); // 12 = Q4_K (k-quant)
-    } catch {
-      threw = true;
+    } catch (e) {
+      threw = /Unsupported GGUF tensor type Q4_K/.test((e as Error).message);
     }
     if (!threw) ok = false;
     if (!ok) failures++;

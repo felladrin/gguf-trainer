@@ -783,19 +783,27 @@ export function assertIdsInTable(ids: number[], V: number, where: string): void 
 }
 
 /**
- * A loss input has to be the matrix its callers assume.
+ * A tensor has to be the rank its caller assumes, checked before the caller
+ * destructures a shape it has not looked at.
  *
- * The three losses read `const [T, V] = logits.shape` and then compare every id
- * against `V`. Hand one a 1-D tensor and `V` is `undefined`, so `id >= V` is
- * false for every id: the range guards below turn themselves off on exactly the
- * malformed input they exist to catch, and the loop then indexes past the
- * buffer. Checked above the backend dispatch, so neither implementation can be
- * the one that skips it.
+ * Two families of caller. The losses read `const [T, V] = logits.shape` and then
+ * compare every id against `V`, so a 1-D tensor makes `V` undefined and their
+ * range guards accept everything. The GGUF writer reads `const [outDim, inDim]`
+ * and then decides a quant from `inDim`, so a 1-D tensor makes that decision on
+ * NaN and writes an undefined into the file's ne.
+ */
+export function assertRank(t: Tensor, rank: number, name: string, where: string): void {
+  if (t.shape.length !== rank) {
+    throw new Error(`${where}: ${name} must be ${rank}-D, got [${t.shape.join(", ")}]`);
+  }
+}
+
+/**
+ * `assertRank` at 2. The losses all want a matrix, and they check above the
+ * backend dispatch so neither implementation can be the one that skips it.
  */
 export function assertMatrix(t: Tensor, name: string, where: string): void {
-  if (t.shape.length !== 2) {
-    throw new Error(`${where}: ${name} must be 2-D, got [${t.shape.join(", ")}]`);
-  }
+  assertRank(t, 2, name, where);
 }
 
 /**
