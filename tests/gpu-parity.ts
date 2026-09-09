@@ -1305,15 +1305,21 @@ async function recomputeModelParity(gpu: WebGPUBackend) {
  * around it.
  *
  * `residentBytes().pool` only grows, so it is the high-water mark rather than a
- * snapshot. Measured on this shape: dense 12.3 MB, recompute 7.6 MB (62%). With
- * the drain in `reclaimStepTransients` removed, recompute rises to 10.0 MB
- * (81%) while every loss stays identical, which is exactly the failure this
- * gate exists to see. The 75% threshold sits between those two.
+ * snapshot. Both reclaim states run, because the two drains live in different
+ * functions and testing one leaves the other deletable with every test green.
+ * The four measured ratios, healthy against a deleted drain:
+ *
+ *   reclaim on:  62% healthy, 81% with the reclaimStepTransients drain gone
+ *   reclaim off: 48% healthy, 74% with the sync() drain gone
+ *
+ * so the threshold has to sit under 74 and over 62. 70% is the midpoint, and
+ * every loss stays identical in the broken cases, which is why the ratio is the
+ * only thing that can see this.
  */
 async function recomputeMemoryGate() {
   const cfg = gemma3Config(64, 64, 4, 256, 16);
   const tokens = Array.from({ length: 4096 }, (_, i) => (i * 7 + 3) % cfg.vocabSize);
-  const poolFor = async (recompute: boolean) => {
+  const poolFor = async (recompute: boolean, reclaimTransients: boolean) => {
     const gpu = (await initWebGPU())!;
     setCheckpointing(recompute);
     const m = new Gemma3Model(cfg, mulberry32(5));
@@ -1331,7 +1337,7 @@ async function recomputeMemoryGate() {
         }),
         logEvery: 100,
         rng: mulberry32(7),
-        reclaimTransients: true,
+        reclaimTransients,
       });
       return gpu.residentBytes().pool;
     } finally {
@@ -1341,15 +1347,26 @@ async function recomputeMemoryGate() {
       gpu.destroy();
     }
   };
-  const dense = await poolFor(false);
-  const recomputed = await poolFor(true);
-  const ratio = recomputed / dense;
-  const ok = ratio < 0.75;
+  // Both reclaim states, because each drains regionFree in a different place:
+  // reclaim on exercises the drain in reclaimStepTransients, reclaim off the one
+  // in sync(). Testing only one leaves the other deletable with every test green.
+  let ok = true;
+  const parts: string[] = [];
+  for (const reclaim of [true, false]) {
+    const dense = await poolFor(false, reclaim);
+    const recomputed = await poolFor(true, reclaim);
+    const ratio = recomputed / dense;
+    if (ratio >= 0.70) ok = false;
+    parts.push(
+      `reclaim ${reclaim ? "on" : "off"} ${(dense / 1e6).toFixed(1)}->${
+        (recomputed / 1e6).toFixed(1)
+      } MB (${(ratio * 100).toFixed(0)}%)`,
+    );
+  }
   if (!ok) failures++;
   console.log(
-    `  ${ok ? "ok " : "FAIL"} recompute shrinks the pool ` +
-      `(${(dense / 1e6).toFixed(1)} MB -> ${(recomputed / 1e6).toFixed(1)} MB, ` +
-      `${(ratio * 100).toFixed(0)}% of dense, must be under 75%)`,
+    `  ${ok ? "ok " : "FAIL"} recompute shrinks the pool, both drains ` +
+      `[${parts.join(", ")}], each must be under 70%`,
   );
 }
 

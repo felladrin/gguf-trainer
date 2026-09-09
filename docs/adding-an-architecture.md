@@ -91,7 +91,9 @@ with the first. And every computed tensor the body reads must either be built in
 named in `inputs`: a value computed once outside the loop and read by several blocks would have its
 own backward run once per block, each time on a gradient that has already grown. `checkpoint`
 throws on that rather than letting it through, because the loss curve looks normal either way.
-Parameters need no declaring; they are leaves.
+Parameters need no declaring; they are leaves. The same holds in the other direction, though
+nothing checks it: nothing built inside the body may be referenced from outside it except the
+value the body returns, since everything else is discarded and rebuilt with different identity.
 
 ## The parts that are easy to get wrong
 

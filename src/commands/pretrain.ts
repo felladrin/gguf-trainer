@@ -398,6 +398,13 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     })`,
   );
   if (drift > 1e-3 + 1e-3 * Math.abs(cpuLoss)) die("GPU/CPU parity probe failed");
+  if (flags.has("recompute") && gpu.regionCount() === 0) {
+    // Matches how --loss-chunk refuses an architecture without forwardToReadout:
+    // the flag would otherwise print "recompute on" and change nothing.
+    die(
+      `--recompute needs an architecture whose forward calls checkpoint(); ${arch.name} does not`,
+    );
+  }
   if (fusedLoss !== null) {
     const fdrift = Math.abs(fusedLoss - gpuLoss);
     console.log(

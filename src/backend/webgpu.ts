@@ -324,6 +324,7 @@ export class WebGPUBackend implements OpsBackend {
    * `makeOut` draws from needs no such argument at any of them.
    */
   private regionFree: { buf: GpuBuffer; size: number }[] = [];
+  private regionsOpened = 0;
   private enc: GpuCommandEncoder | null = null;
   private pass: GpuComputePass | null = null;
   private backwardBegun = false;
@@ -427,8 +428,10 @@ export class WebGPUBackend implements OpsBackend {
     for (const tr of this.transients) this.pool.release(tr.size, tr.buf);
     this.transients = [];
     // Region buffers left unclaimed by a recompute are not in `transients`, so
-    // this is the only place they can rejoin the pool. Without it they strand,
-    // and the next step allocates fresh ones on top.
+    // only an explicit drain returns them to the pool. This is the one that runs
+    // with --reclaim off; reclaimStepTransients has the same drain for the
+    // micro-batch boundary. Without both, they strand and the next step
+    // allocates fresh ones on top.
     for (const tr of this.regionFree) this.pool.release(tr.size, tr.buf);
     this.regionFree = [];
     this.touchedExternals.clear();
@@ -486,14 +489,24 @@ export class WebGPUBackend implements OpsBackend {
    * matching endRegion is a candidate for reuse inside the next region.
    */
   beginRegion(): number {
+    this.regionsOpened++;
     return this.transients.length;
+  }
+
+  /** How many recompute regions have been opened; 0 after a forward means no
+   * architecture on this path called `checkpoint`. */
+  regionCount(): number {
+    return this.regionsOpened;
   }
 
   /**
    * Guard for the mark `beginRegion` returns: it indexes `transients`, which
    * `sync()` and `reclaimStepTransients()` truncate. Nothing can interleave
-   * today because `checkpoint` contains no `await`, but that is invisible from
-   * the call site, so fail loudly rather than silently release the wrong slice.
+   * today, since `checkpoint` and `backward` are both fully synchronous, but
+   * that is invisible from the call site. One-sided on purpose: it catches a
+   * truncation, not a truncation that also pushed enough new transients to land
+   * back above the mark. That case is unreachable for the same reason, and
+   * detecting it would mean tagging every entry.
    */
   private checkRegionMark(mark: number): void {
     if (mark > this.transients.length) {
@@ -510,13 +523,20 @@ export class WebGPUBackend implements OpsBackend {
    *
    * No fence, and none is needed. Recycling is correct because the queue orders
    * the accesses: dispatches within one compute pass are ordered against each
-   * other, passes within a command buffer execute in order (which is the path
-   * `bench --profile` takes, one pass per dispatch), and `queue.writeBuffer` is
-   * ordered behind an already-submitted command buffer. The dense path has
-   * always depended on the first of those, since every op reads the previous
-   * op's output out of the same pass. `submit()` is here so the writeBuffer
-   * clause holds, not to wait. Nothing is destroyed; this only moves entries
-   * between JS-side lists and the driver keeps every buffer alive.
+   * other, and passes within a command buffer execute in order (the shape the
+   * profiling path produces, one pass per dispatch). The dense path has always
+   * depended on the first of those, since every op reads the previous op's
+   * output out of the same pass. Nothing is destroyed here; this only moves
+   * entries between JS-side lists and the driver keeps every buffer alive.
+   *
+   * `submit()` is NOT what makes it safe, and it is not redundant either. No
+   * regionFree buffer ever reaches a queue.writeBuffer call site (makeOut is the
+   * only consumer, and the two places that hand regionFree back to the pool
+   * fence first), so correctness does not need it. What it does is hand the
+   * recorded work to the GPU at every layer boundary instead of accumulating a
+   * whole micro-batch into one pass, and that overlap is what lever 20 credits
+   * for the throughput. Remove it and every test still passes while the headline
+   * number quietly goes away.
    *
    * Released grad buffers are purged from pendingClears: a buffer handed on as
    * some later tensor's DATA must not be zeroed by a clear queued when it was a
@@ -557,12 +577,14 @@ export class WebGPUBackend implements OpsBackend {
    * clear.
    */
   seedGradFrom(dst: Tensor, src: Tensor): void {
-    // Overwrite is equivalent to accumulate here only because the replay reset
-    // `backwardBegun`: its first forward op called beginForwardOp, so this
-    // ensureBackwardBegun actually flushes the interior grad clears the replay
-    // just queued, and the copy below lands on a zeroed buffer. If
-    // ensureBackwardBegun ever became idempotent across a replay, those clears
-    // would never flush (endRegion purges them on the way out) and every
+    // Ordering, not contents: copyBufferToBuffer overwrites the whole range, so
+    // what matters is that it happens AFTER the pending clear on the replay's
+    // own grad buffer, which would otherwise wipe the seed. That flush is this
+    // ensureBackwardBegun, and it only fires because the replay reset
+    // `backwardBegun` (its first forward op called beginForwardOp). The same
+    // flush is what zeroes the replay's INTERIOR grad buffers; if
+    // ensureBackwardBegun ever became idempotent across a replay they would
+    // never flush at all (endRegion purges them on the way out) and every
     // interior gradient would start from pool garbage.
     this.ensureBackwardBegun();
     const ed = this.entries.get(dst), es = this.entries.get(src);

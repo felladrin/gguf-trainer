@@ -592,10 +592,17 @@ micro-batch was recorded into one compute pass and submitted once, so the GPU sa
 host recorded 28 layers and then raced to catch up. Now layer 1 executes while the host records
 layer 5. On that reading the extra forward pass is free because it lands in time the GPU was
 already spending idle, and the win is overlap rather than arithmetic. **A GPU-bound shape should
-expect the textbook ~30% slowdown instead.** Run `bench` before planning around this.
+expect the textbook ~30% slowdown instead.** `bench` cannot answer that question: it times kernel
+families at fixed shapes, builds no model and has no layer loop, so measure it the way this table
+was measured, with two short `pretrain` runs differing only in the flag.
 
 If that reading is right, the same overlap is available without recomputing anything, by submitting
 at layer boundaries on the dense path too. That is the obvious follow-up and it is not done here.
+
+The corollary is a trap worth naming: the `submit()` in `endRegion` is not needed for correctness,
+since no region buffer ever reaches a `queue.writeBuffer` call site. It is what produces the
+overlap. Deleting it as redundant keeps the whole suite green and silently returns the throughput
+to the dense number, so the comment there says so.
 
 Correctness is gated three ways rather than by the loss curve: `checkpoint == off` in
 `tests/gradcheck.ts` requires bit-identical gradients, `recomputeModelParity` runs all three
@@ -605,8 +612,9 @@ architectures against the CPU reference, and `recompute across reclaim boundarie
 The memory claim has its own gate, because no numeric test can see it: a region buffer that never
 returns to the pool leaves every number correct and quietly allocates around it. That is not
 hypothetical, it was the first version of this change. `recomputeMemoryGate` asserts the pool ratio
-directly: dense 12.3 MB, recompute 7.6 MB (62%), and 10.0 MB (81%) with the drain in
-`reclaimStepTransients` removed.
+directly, in both reclaim states because the two drains live in different functions: reclaim on is
+62% healthy and 81% with the `reclaimStepTransients` drain gone, reclaim off is 48% healthy and 74%
+with the `sync()` drain gone, so the gate fails over 70%.
 
 ## Correctness / robustness
 
