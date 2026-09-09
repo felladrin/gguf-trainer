@@ -57,7 +57,7 @@ async function run(v: Values) {
 
   const { model, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
   // Scoring never runs backward, and a gradient buffer per parameter would be
-  // allocated and staged back to the host on every window.
+  // allocated once and staged back to the host on every window.
   freezeForScoring(model);
   if (seqLen > cfg.maxSeq) die(`--seqLen ${seqLen} exceeds model ctx ${cfg.maxSeq}`);
   const badForModel = lossChunkModelError(lossChunk, cfg.vocabSize, cfg.arch, model);

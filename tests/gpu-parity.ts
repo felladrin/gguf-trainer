@@ -1477,7 +1477,8 @@ async function evalFreezeGate() {
     // 3. And the accumulators are not allocated either, so the pool drops by
     //    roughly the model. Both arms allocate the same data buffers and the
     //    same intermediates, so the gap is the parameter gradients less one
-    //    256-byte stub; 0.9 leaves an order of magnitude of slack.
+    //    256-byte stub. The 0.9 leaves a tenth of the model as margin, which is
+    //    slack for bucket rounding, not for a partial regression.
     const smaller = cold.pool < hot.pool - 0.9 * paramBytes;
     // 4. The score is the point: freezing must not move it at all.
     const same = hot.loss === cold.loss;

@@ -306,7 +306,7 @@ async function run(v: Values) {
   if (badChunk) die(badChunk);
   const { model, tokenizer: tok, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
   // Scoring never runs backward, and a gradient buffer per parameter would be
-  // allocated and staged back to the host on every window.
+  // allocated once and staged back to the host on every scored choice.
   freezeForScoring(model);
   const badForModel = lossChunkModelError(lossChunk, cfg.vocabSize, cfg.arch, model);
   if (badForModel) die(badForModel);

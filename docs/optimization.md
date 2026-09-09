@@ -913,14 +913,14 @@ runs each on the Strix Halo APU:
 | before | 30.75, 30.64, 30.64 s | 3.4202   |
 | after  | 26.23, 26.12, 26.07 s | 3.4202   |
 
-Median 30.64 s to 26.12 s, **14.8% faster**, with 18.8 GB of copies removed and the score
-unchanged to four decimals. That is a floor rather than the whole win: it was measured with #60
-still in place, so every window still issued one redundant `clearBuffer` per frozen parameter. The device pool also drops by the size of the model, which is what
-`evalFreezeGate` in `tests/gpu-parity.ts` pins: it measures `lastSyncReadbackBytes` and
-`residentBytes().pool` on a frozen and an unfrozen arm and requires the two losses to be bit-equal.
-Making `freezeForScoring` a no-op leaves the readback at the full model; moving it after
-`uploadParams` drops the readback but not the pool, and the pool assertion is what pins the
-ordering.
+Median 30.64 s to 26.12 s, **14.8% faster**, with 18.8 GB of copies removed and the score unchanged
+to four decimals. That is a floor rather than the whole win: it was measured with #60 still in
+place, so every window still issued one redundant `clearBuffer` per frozen parameter. The device
+pool also drops by the size of the model, which is what `evalFreezeGate` in `tests/gpu-parity.ts`
+pins: it measures `lastSyncReadbackBytes` and `residentBytes().pool` on a frozen and an unfrozen arm
+and requires the two losses to be bit-equal. Making `freezeForScoring` a no-op leaves the readback
+at the full model; moving it after `uploadParams` drops the readback but not the pool, and the pool
+assertion is what pins the ordering.
 
 `generate` has the same defect and pays it per token rather than per window: 40.1% of its wall
 clock on the same checkpoint. It is #58, deliberately not fixed here. Freezing also leaves `sync()`
