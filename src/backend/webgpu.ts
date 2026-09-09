@@ -300,6 +300,13 @@ export class WebGPUBackend implements OpsBackend {
   attnFlashMinT = 2048;
   /** Bytes staged back to the host by the most recent sync() (profiling). */
   lastSyncReadbackBytes = 0;
+  /**
+   * Gradient buffers cleared since this backend was created. Cumulative because
+   * the queue drains in two places, sync() and ensureBackwardBegun(); take a
+   * delta around the window you care about. Pure waste has no other symptom, so
+   * this is the only way a test can see it.
+   */
+  gradClearsIssued = 0;
   private device: GpuDevice;
   private queue: GpuQueue;
   private pool: BufferPool;
@@ -390,6 +397,7 @@ export class WebGPUBackend implements OpsBackend {
     this.endPass();
     if (!this.enc) this.enc = this.device.createCommandEncoder();
     for (const b of this.pendingClears) this.enc.clearBuffer(b);
+    this.gradClearsIssued += this.pendingClears.length;
     this.pendingClears = [];
 
     const stagings: { stage: GpuBuffer; dst: Float32Array }[] = [];
@@ -404,7 +412,11 @@ export class WebGPUBackend implements OpsBackend {
       if (t.requiresGrad && !this.gradKeptOnDevice.has(t)) {
         stagings.push({ stage: this.copyToStaging(e.grad, t.size * 4), dst: t.grad });
       }
-      e.gradNeedsClear = true;
+      // Only a real accumulator needs zeroing. A frozen external shares the
+      // 256-byte stub and nothing ever writes to it, so re-arming this queued
+      // one no-op clearBuffer per frozen parameter per window: a few hundred of
+      // them on a 293M model, on every eval window and every LoRA step.
+      e.gradNeedsClear = t.requiresGrad;
     }
     this.lastSyncReadbackBytes = stagings.reduce((a, s) => a + s.dst.length * 4, 0);
 
@@ -1229,6 +1241,7 @@ export class WebGPUBackend implements OpsBackend {
     if (this.pendingClears.length > 0) {
       if (!this.enc) this.enc = this.device.createCommandEncoder();
       for (const b of this.pendingClears) this.enc.clearBuffer(b);
+      this.gradClearsIssued += this.pendingClears.length;
       this.pendingClears = [];
     }
     this.submit();

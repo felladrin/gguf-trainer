@@ -679,6 +679,7 @@ async function main() {
   await recomputeMemoryGate();
   await evalFreezeGate();
   await generateFreezeGate();
+  await frozenClearGate();
   await flatOverflowGate(gpu);
   {
     // Row-per-workgroup 2-D fold: rmsNormHeads with rows = T*H past the cap.
@@ -1555,6 +1556,68 @@ async function generateFreezeGate() {
     `  ${ok ? "ok " : "FAIL"} generate freeze: readback ${mb(hot.readback)} MB -> ` +
       `${cold.readback} B (logits alone ${lastLogits} B, params ${mb(paramBytes)} MB), ` +
       `pool ${mb(hot.pool)} -> ${mb(cold.pool)} MB, ids ${cold.ids}`,
+  );
+}
+
+/**
+ * The clear queue. `sync()` re-arms `gradNeedsClear` for every touched external,
+ * and `entryFor` then queues that buffer for a `clearBuffer` on the next window.
+ * A frozen external shares one 256-byte stub that nothing ever writes, so every
+ * one of those clears was a no-op: a few hundred per window on a 293M model
+ * under eval, and per step under LoRA, where the base weights are frozen for the
+ * whole run.
+ *
+ * Waste has no symptom in a number, so the only way to see it is to count. The
+ * second window is what matters: on the first, a frozen parameter is not queued
+ * at all, because `entryFor` starts `gradNeedsClear` at `requiresGrad`. The
+ * count does not go to zero, and should not: `makeOut` queues every
+ * intermediate's gradient buffer unconditionally, which is a separate waste in a
+ * forward-only run (#67).
+ */
+async function frozenClearGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const ids = Array.from({ length: 33 }, (_, i) => (i * 11 + 5) % cfg.vocabSize);
+  const arm = async (freeze: boolean) => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    try {
+      if (freeze) freezeForScoring(m);
+      gpu.install();
+      gpu.uploadParams(m.params());
+      const window = async () => {
+        const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+        await gpu.sync([loss]);
+        return loss.data[0];
+      };
+      await window();
+      const before = gpu.gradClearsIssued;
+      const loss = await window();
+      return { second: gpu.gradClearsIssued - before, params: m.params().length, loss };
+    } finally {
+      gpu.destroy();
+    }
+  };
+  const hot = await arm(false);
+  const cold = await arm(true);
+
+  // Exactly one clear per parameter goes away, and nothing else does. The rest
+  // of the count is the per-window intermediates, which makeOut queues
+  // unconditionally at creation; those are a separate waste in a forward-only
+  // run and are #67, not this.
+  const savedTheParams = hot.second - cold.second === hot.params;
+  // A trainable parameter must still get its accumulator zeroed every window.
+  // Dropping that would break gradient accumulation, not just tidiness.
+  const stillClears = hot.second > hot.params;
+  // And the loss does not move, which is the claim that the removed clears were
+  // doing nothing in the first place.
+  const same = hot.loss === cold.loss;
+
+  const ok = savedTheParams && stillClears && same;
+  if (!ok) failures++;
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} frozen clears: second window issues ${hot.second} unfrozen ` +
+      `and ${cold.second} frozen, a saving of exactly the ${hot.params} parameters, ` +
+      `loss ${hot.loss.toFixed(6)} both`,
   );
 }
 

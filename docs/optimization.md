@@ -1052,6 +1052,44 @@ runs after `trainLMGpuResident` returns, and nothing after it reads a gradient. 
 is different enough to want its own test, since the parameters already carry full accumulators from
 training, so freezing stops the copy without saving the allocation. That is #66.
 
+### 28. The clear queue re-armed itself for frozen parameters, and it buys no time (2026-09-09)
+
+Filed as #60 while reviewing lever 25. `sync()` set `e.gradNeedsClear = true` for every touched
+external without asking whether that external has a real gradient accumulator. A frozen one does
+not: `entryFor` hands it the shared 256-byte stub precisely because nothing ever writes to it. So
+from the second window onward, every frozen parameter re-queued that one stub for a `clearBuffer`,
+and each of those cleared the same 256 bytes to no purpose. Two callers hit it: eval since lever 25,
+where every parameter is frozen, and LoRA training, where the base weights are frozen for the whole
+run. On a 310-tensor checkpoint at `--windows 16` that is 4960 no-op commands.
+
+`e.gradNeedsClear = t.requiresGrad` is the whole fix.
+
+**It is worth no measurable time, and saying so is the point of this entry.** `eval-loss --windows 16
+--seq-len 512` on `littlelamb-base.f32.gguf`, three runs each:
+
+|        | median  | spread |
+| ------ | ------- | ------ |
+| before | 26.69 s | 0.32   |
+| after  | 26.77 s | 0.07   |
+
+That is +0.3%, well inside the run-to-run spread, and the val loss is 3.4202 either way. A
+256-byte `clearBuffer` really is nearly free; what was wrong was the bookkeeping, not the clock.
+Two reasons it is still worth having: the command stream now says what it means, and #66 depends on
+it, because freezing `pretrain`'s end-of-run sample stops the copies while leaving the clears, and
+there the re-queued buffer is a full-size accumulator rather than the stub.
+
+Waste has no symptom in a number, so `frozenClearGate` in `tests/gpu-parity.ts` counts instead:
+`gradClearsIssued` is a cumulative counter and the gate takes a delta around the second window,
+which is the one that matters, since `entryFor` starts `gradNeedsClear` at `requiresGrad` and a
+frozen parameter is not queued on the first. The frozen arm issues exactly `params` fewer clears
+than the unfrozen one, and the loss is bit-equal.
+
+The count does not go to zero, and the residual is the more interesting half: `makeOut` queues every
+intermediate's gradient buffer unconditionally, 85 per window against 54 parameters on the toy model
+in the gate, and those are full-size rather than a shared stub. Nothing reads them in a forward-only
+run either. That is #67, and it measured as noise too (26.53 s against 26.69 s), so it is filed with
+the measurement attached and no speed claim.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
