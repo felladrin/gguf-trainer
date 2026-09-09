@@ -942,9 +942,8 @@ total += Math.log(sum) + maxL - logits.data[b + targets[t]];
 With `targets[t] >= V` that lands in the NEXT row's logits, so the loss comes back finite and
 plausible; only on the last row does it read past the array and give NaN. `fusedCrossEntropy` fails
 differently and more quietly: an out-of-range target falls inside no vocab span, so `tgtLogit` stays
-at 0 and the row's loss is simply wrong. `softCrossEntropy` had the check already, one line below
-the one that needed it, so the two were inconsistent and the one without it was on every training
-path.
+at 0 and the row's loss is simply wrong. `softCrossEntropy` validated its ids already, so the two
+were inconsistent and the one without a check was the one on every training path.
 
 **The GPU was not safer, which is what the issue assumed and what this lever said first.** The claim
 was that WGSL's robust buffer access clamps or discards an out-of-range read. It does not apply:
@@ -959,8 +958,13 @@ and 2 ignored, so the loss IS the kept row's term:
 | target `V` on the LAST row                                           | NaN               | 2.1300957         |
 
 Identical on an interior row, to every digit. On the last row the GPU is the worse of the two: the
-CPU reads past its array and announces itself with NaN, while the GPU reads the 256-byte bucket
-padding `BufferPool` rounds every allocation up to, and returns a plausible number.
+CPU reads past its array and announces itself with NaN, while the GPU returns a finite, plausible
+number. Where that number comes from depends on the size, and neither source is stable: at `V=6` the
+overrun stays inside the 256-byte bucket `BufferPool` rounds every allocation up to, and pooled
+buffers come back dirty, so it is whatever the last tenant left; at a real vocab the read lands well
+past the end of the buffer and WebGPU's bounds checking supplies a defined value instead. Either way
+the digits move with pool state, which is the argument for checking on the host rather than quoting
+2.1300957 as if it were a constant.
 
 That shows in the end-to-end symptom too. Scoring `smolrp.gguf` (vocab 49152) against a corpus
 tokenized with the 151936-entry Qwen3 vocab, `eval-loss --windows 1 --seq-len 128`:
@@ -991,11 +995,12 @@ The accepting cases carry an oracle computed in the test rather than a compariso
 losses, because both now draw their denominator from the same helper and would agree on a wrong
 count. Making the helper count ignored rows fails `-1 still means ignore`.
 
-Not covered, and both are the same inconsistency in neighbouring code: the GPU `softCrossEntropy`
-still does not validate its teacher ids where the CPU one does (#61), and `embedding` is the
-input-side twin, unguarded on both backends (#63). `embedding` is worth knowing about because it
-fires first in the scenario above: measured with an id past the table, the CPU returns a NaN row and
-the GPU returns a row of zeros.
+Not covered, and all three are neighbours of the same mistake: the GPU `softCrossEntropy` still does
+not validate its teacher ids where the CPU one does (#61); `embedding` is the input-side twin,
+unguarded on both backends (#63), and it is worth knowing about because it fires first in the
+scenario above, measured returning a NaN row on the CPU and a row of zeros on the GPU; and the
+refusal lands mid-run rather than at start-up (#64), which matters for `pretrain`, whose trust gate
+only reads the first 16 tokens.
 
 ## Quality levers
 

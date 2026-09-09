@@ -360,8 +360,11 @@ async function main() {
     // no span and leaves tgtLogit at 0. Both refuse it now, through the same
     // helper the GPU backend calls, so the two paths cannot diverge on it.
     const T = 3, H = 4, V = 6;
-    const hid = randTensor([T, H], rng);
-    const w = randTensor([V, H], rng);
+    // A local seed: drawing from the shared rng would shift every later case's
+    // data, so a block added here would silently re-roll the ones below it.
+    const r = mulberry32(0x7a46);
+    const hid = randTensor([T, H], r);
+    const w = randTensor([V, H], r);
     const logits = linear(hid, w);
 
     const message = (fn: () => unknown): string => {

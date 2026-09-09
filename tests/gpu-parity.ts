@@ -1676,8 +1676,8 @@ async function targetRangeGate(gpu: WebGPUBackend) {
         `(dense ${dense}, fused ${fused}, V-1 scores ${good.data[0].toFixed(4)})`,
     );
   } finally {
-    // The refusals leave a recorded dispatch and a pooled upload unsubmitted;
-    // draining here keeps the gate independent of what runs after it.
+    // The legal arm above recorded work; draining here keeps the gate
+    // independent of what runs after it.
     await gpu.sync([]);
     gpu.uninstall();
   }

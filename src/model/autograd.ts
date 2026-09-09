@@ -694,11 +694,10 @@ export function attention(
  * `-1` is the ignore marker; anything else has to index a real logit row,
  * because `logits.data[t * V + target]` with `target >= V` reads the NEXT row's
  * logits. Measured at T=3, V=6 with one kept row: both backends returned
- * 2.038443088531494, which is exactly that row's logsumexp minus the following
- * row's first logit. The last row is the only one where the two differ, and the
- * GPU is the worse of the pair there: the CPU reads past its array and gives
- * NaN, while the GPU reads the 256-byte bucket padding and returns a plausible
- * 2.1300957.
+ * 2.038443088531494, that row's logsumexp minus the following row's first logit
+ * to f32. The last row is the only one where the two differ, and the GPU is the
+ * worse of the pair there: the CPU reads past its array and gives NaN, while the
+ * GPU returns a finite, plausible number whose digits depend on pool state.
  *
  * Only `-1` is accepted as ignore, not every negative. `uploadU32` maps `-1` to
  * `0xffffffff`, the marker the kernels test for, but `-2` becomes `0xfffffffe`
