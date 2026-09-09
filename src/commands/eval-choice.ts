@@ -224,6 +224,7 @@ export function choiceMaskStart(nCtx: number, nChoice: number, maxSeq: number): 
  */
 export function choiceWindowError(nCtx: number, nChoice: number, maxSeq: number): string | null {
   if (nChoice < 1) return "a choice rendered to 0 tokens, so there is nothing to score";
+  if (nCtx < 1) return "the stem rendered to 0 tokens, so nothing predicts the first choice token";
   if (choiceMaskStart(nCtx, nChoice, maxSeq) < 0) {
     return `a choice takes ${nChoice} tokens and needs one more of context, but this model's ` +
       `context is ${maxSeq}: scoring it would drop choice tokens and flatter that option`;
@@ -254,11 +255,16 @@ async function choiceNLL(
   const firstChoiceTgt = choiceMaskStart(ctxIds.length, chIds.length, model.cfg.maxSeq);
   for (let i = 0; i < firstChoiceTgt; i++) targets[i] = -1;
   const nChoice = targets.length - firstChoiceTgt;
-  // The GPU losses count kept rows over the whole targets array while the
-  // kernels only sum inputs.length rows, so a longer targets array silently
-  // divides by too much. The mask loop used to extend it past the end.
-  if (targets.length !== inputs.length) {
-    throw new Error(`targets ${targets.length} != inputs ${inputs.length}`);
+  // Two invariants the summed NLL rests on, and each catches an edit the other
+  // waves through. The GPU losses count kept rows over the whole targets array
+  // while the kernels sum only inputs.length of them, so a targets array the
+  // mask extended past the end silently divides by too much. And nChoice is
+  // what the mean is multiplied back by, so it has to be the whole choice.
+  if (targets.length !== inputs.length || nChoice !== chIds.length) {
+    throw new Error(
+      `mask does not line up: inputs ${inputs.length}, targets ${targets.length}, ` +
+        `scored ${nChoice} of ${chIds.length} choice tokens`,
+    );
   }
   // sequenceLoss returns the mean over kept rows, exactly as crossEntropy did,
   // so multiplying by the kept count still recovers the summed NLL whichever

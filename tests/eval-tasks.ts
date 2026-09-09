@@ -201,16 +201,27 @@ ok(
   "a choice that fills the context leaves nothing to predict it from",
 );
 ok(choiceWindowError(600, 600, 512) !== null, "a choice longer than the context is refused");
-ok(choiceWindowError(20, 0, 512) !== null, "an empty choice is refused, not scored as a free 0");
+// Each refusal has to name its own cause. An empty stem reaching the
+// context-length branch reads as "this model's context is 512" when the context
+// is fine and the stem is the problem.
 ok(
-  choiceWindowError(0, 5, 512) !== null,
-  "with no context at all there is no token to predict the first choice token from",
+  choiceWindowError(20, 0, 512)?.includes("a choice rendered to 0 tokens") === true,
+  `an empty choice is refused as an empty choice, got ${choiceWindowError(20, 0, 512)}`,
+);
+ok(
+  choiceWindowError(0, 5, 512)?.includes("the stem rendered to 0 tokens") === true,
+  `an empty stem is refused as an empty stem, got ${choiceWindowError(0, 5, 512)}`,
+);
+ok(
+  choiceWindowError(1, 512, 512)?.includes("context is 512") === true,
+  `a choice that fills the context names the context, got ${choiceWindowError(1, 512, 512)}`,
 );
 
-// The composition the two formulas only describe: slice the window the way
-// choiceNLL does, run its mask loop, and look at what is left scoreable. This is
-// what pins targets.length === inputs.length, the equality the GPU losses lean on
-// when they count kept rows over the whole targets array.
+// The composition the two formulas describe: slice the window the way choiceNLL
+// does, run its mask loop, and look at what is left scoreable. The slicing is
+// re-typed here rather than called, so this pins the boundary against the shape
+// it is meant for, not choiceNLL's own three slice lines. Those are pinned at
+// runtime instead, by the invariant throw before sequenceLoss.
 for (const [nCtx, nChoice, maxSeq] of [[20, 10, 512], [100, 10, 105], [600, 10, 512], [1, 7, 8]]) {
   const shape = `ctx ${nCtx}, choice ${nChoice}, maxSeq ${maxSeq}`;
   ok(choiceWindowError(nCtx, nChoice, maxSeq) === null, `${shape} is scoreable`);
