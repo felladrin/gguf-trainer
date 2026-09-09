@@ -76,8 +76,8 @@ revisit if the vocab grows), `srcRmsNormBwdW`'s ~16x overfetch (~1% of the step)
 precompute, and sliding-window warmup (~2-3% of the run at T=2048, worse at T>=4096). Chunked online
 cross-entropy over the vocab axis is no longer deferred: it shipped as `--loss-chunk`, and it had to
 fuse the readout matmul rather than only chunk the loss, because the `[T,V]` logits and their
-gradient belong to that matmul and outweigh the softmax scratch 2:1 (lever 19). Two more stay open:
-2D workgroup tiling for attention (a staged-forward
+gradient belong to that matmul and outweigh the softmax scratch 2:1 (lever 19). Two more stay
+open: 2D workgroup tiling for attention (a staged-forward
 variant measured 17% SLOWER, `docs/notes/journal.md`), and cutting Newton-Schulz from five
 iterations to four, which needs an orthogonality-residual check to gate it.
 
@@ -1438,7 +1438,7 @@ worse than its own base is a trap for whoever sorts by size.
 - Bind-group reuse guidance: [toji.dev](https://toji.dev/webgpu-best-practices)
 - Prior art, browser WGSL training (forward+backward+AdamW, online-softmax attention; small
   scale, no published throughput at 95M): [github.com](https://github.com/toprakdeviren/webgpu-llm)
-- Fused linear-cross-entropy prior art (CUDA/Triton; concept reference for the deferred chunked-CE idea above):
+- Fused linear-cross-entropy prior art (CUDA/Triton; the shape lever 19 follows):
   [github.com](https://github.com/linkedin/Liger-Kernel), [github.com](https://github.com/mgmalek/efficient_cross_entropy)
 - FlashAttention-3 (what full 2D tiling + tensor cores buys on NVIDIA; context for why the same
   structure is not automatically fast on a no-TC, no-subgroup WebGPU path):

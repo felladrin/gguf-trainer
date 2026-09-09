@@ -497,8 +497,26 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
       }
     }
   }
+  // The pair that actually isolates reclaim: same kernels, same span order, same
+  // dispatch order, only pool-recycling timing differs, so nothing reorders the
+  // f32 reduction and this must hold as tightly as the dense pair above. The
+  // comparisons against the dense baseline are the looser, separate claim that
+  // chunking preserves the math at loop scale.
+  for (let i = 0; i < chunkOff.hist.length; i++) {
+    const dl = Math.abs(chunkOn.hist[i].loss - chunkOff.hist[i].loss);
+    if (dl > 1e-4 + 1e-4 * Math.abs(chunkOff.hist[i].loss)) {
+      console.log(
+        `    MISMATCH chunked reclaim on/off loss@step${chunkOff.hist[i].step}: ` +
+          `on=${chunkOn.hist[i].loss} off=${chunkOff.hist[i].loss}`,
+      );
+      cok = false;
+    }
+  }
   for (let i = 0; i < off.params.length; i++) {
-    cok = compare(`chunkedReclaim.param${i}`, chunkOn.params[i].data, off.params[i].data, BWD) &&
+    cok =
+      compare(`chunkedReclaim.param${i}`, chunkOn.params[i].data, chunkOff.params[i].data, BWD) &&
+      cok;
+    cok = compare(`chunkedVsDense.param${i}`, chunkOff.params[i].data, off.params[i].data, BWD) &&
       cok;
   }
   if (!cok) failures++;

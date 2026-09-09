@@ -80,11 +80,13 @@ Violating any of these wastes a run. They are checked where possible; a few cann
    At vocab 32768 the logits are `T x 32768 x 4` bytes, so 8192 needs 1 GiB and fits an adapter
    that grants its full limit (2 GiB measured); one that falls back to the WebGPU default of
    128 MiB stops at 1024. The error names the buffer.
-   **`--loss-chunk N` removes this cap for training**: it fuses the readout matmul into the
-   loss and streams the vocab N columns at a time, so the widest buffer becomes `[T, N]` and
-   nothing scales with vocab. Measured: qwen3 293M at vocab 151936 and `--seq-len 4096` aborts
-   on the dense path (2374 MiB against a 2048 MiB limit) and trains with `--loss-chunk 8192`.
-   Lever 19.
+   **`--loss-chunk N` removes the CONTEXT half of this cap for training**: it fuses the readout
+   matmul into the loss and streams the vocab N columns at a time, so no buffer scales with
+   context and vocab together. The `[vocab, hidden]` readout weight and its gradient survive
+   untouched and are the next ceiling: 315 MiB each at vocab 151936 x hidden 544, but 2374 MiB
+   at hidden 4096, over the limit again with the flag already on. Measured: qwen3 293M at vocab
+   151936 and `--seq-len 4096` aborts on the dense path (2374 MiB against a 2048 MiB limit) and
+   trains with `--loss-chunk 8192`. Lever 19.
    `eval-loss` and `eval-choice` still take the dense path, so a checkpoint trained at a context
    they cannot score is possible; issue #46.
 

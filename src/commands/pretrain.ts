@@ -24,7 +24,6 @@ import { readGGUF } from "../gguf/gguf.ts";
 import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";
 import { lossTrend } from "../loss-trend.ts";
 import { sequenceLoss } from "../train/loss.ts";
-
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
 import { crossEntropy, mulberry32 } from "../model/autograd.ts";
@@ -372,8 +371,11 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     const l = crossEntropy(model.forward(probeIn), probeTgt);
     // The op that runs every step is not the one checked above, so check it too:
     // at 16 tokens the dense side still fits whatever the run's seq-len would
-    // have blown, and this exercises every span offset at the real vocab before
-    // the run starts. Both graphs are built before the single sync: sync stages
+    // have blown, and this exercises every FORWARD span offset at the real vocab
+    // before the run starts. Only forward: the probe never calls backward, so the
+    // grad, NN and TN sources first compile at step 0. Their offsets are covered
+    // by fusedCeParity's multi-block shape, not here. Both graphs are built
+    // before the single sync: sync stages
     // back the grad of every touched external, and at probe time the optimizer
     // does not exist yet to keep them on device, so syncing twice would read
     // every parameter gradient twice.
