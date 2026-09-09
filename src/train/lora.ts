@@ -107,8 +107,14 @@ export function applyLora(
   };
 }
 
-/** Detach every adapter, so `linear` goes back to the plain product. */
-export function clearLora() {
+/**
+ * Detach every adapter and thaw what `applyLora` froze, so `linear` goes back to
+ * the plain product and the model is trainable again. Without the thaw a model
+ * that has been through `applyLora` silently produces zero gradients forever,
+ * which is a worse symptom than an error.
+ */
+export function clearLora(model?: LanguageModel) {
   setLoraAdapters(new Map());
   adaptersInstalled = false;
+  if (model) { for (const t of model.params()) t.requiresGrad = true; }
 }

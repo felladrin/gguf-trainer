@@ -439,7 +439,10 @@ for (const arch of ARCHITECTURES) {
   const baseLogits = Float32Array.from(model.forward(ids).data);
 
   const h = applyLora(model, 4, 8, mulberry32(99));
-  for (const t of h.groups.aux) for (let i = 0; i < t.data.length; i++) t.data[i] += 0.05;
+  // 0.2, not 0.05: the adapted-vs-base gap has to sit well clear of q8_0's own
+  // round-trip error (this file uses 0.05 as the q8 tolerance above), or the
+  // quant assertion below passes on quantization noise alone.
+  for (const t of h.groups.aux) for (let i = 0; i < t.data.length; i++) t.data[i] += 0.2;
   const adapted = Float32Array.from(model.forward(ids).data);
 
   const exported = (quant: "f32" | "q8_0") => {
@@ -450,7 +453,7 @@ for (const arch of ARCHITECTURES) {
     return bytes;
   };
   const f32 = exported("f32");
-  clearLora();
+  clearLora(model);
   const reloaded = loadModelFromGGUF(f32).model.forward(ids).data;
 
   let vsAdapted = 0, vsBase = 0;
@@ -463,19 +466,22 @@ for (const arch of ARCHITECTURES) {
     vsAdapted < 1e-4 && vsBase > 1e-4,
     `vs adapted ${vsAdapted.toExponential(2)}, vs base ${vsBase.toExponential(2)}`,
   );
-  // and the quant variant is the same model, not the unmerged base
+  // And the quant variant is the same model, not the unmerged base. Asserting
+  // only "differs from base" would be satisfied by quantization noise, so pin it
+  // from both sides: close to the adapted model, far from the base.
   const q8 = exported("q8_0");
   const q8Logits = loadModelFromGGUF(q8).model.forward(ids).data;
-  let q8VsBase = 0;
+  let q8VsBase = 0, q8VsAdapted = 0;
   for (let i = 0; i < adapted.length; i++) {
     q8VsBase = Math.max(q8VsBase, Math.abs(q8Logits[i] - baseLogits[i]));
+    q8VsAdapted = Math.max(q8VsAdapted, Math.abs(q8Logits[i] - adapted[i]));
   }
   check(
     `${arch.name}: a quant variant carries the adapters too`,
-    q8VsBase > 1e-4,
-    `q8_0 vs base ${q8VsBase.toExponential(2)}`,
+    q8VsAdapted < 0.05 && q8VsBase > 0.05,
+    `q8_0 vs adapted ${q8VsAdapted.toExponential(2)}, vs base ${q8VsBase.toExponential(2)}`,
   );
-  clearLora();
+  clearLora(model);
 }
 
 console.log(

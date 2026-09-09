@@ -1404,7 +1404,6 @@ async function loraModelParity(gpu: WebGPUBackend) {
     const cpuLoss = crossEntropy(cpu.forward(ids), targets);
     backward(cpuLoss, 1);
     const cpuGrads = hc.groups.aux.map((p) => p.grad.slice());
-    const frozenBases = cpu.paramGroups().muon;
     clearLora();
 
     const model = arch.build(cfg, mulberry32(5));
@@ -1455,8 +1454,6 @@ async function loraModelParity(gpu: WebGPUBackend) {
       console.log(`    MISMATCH ${name} freeze: shared=${sharedStub} stub max=${stubDirty}`);
       ok = false;
     }
-    const frozen = stubDirty;
-    void frozenBases;
 
     // merge/unmerge must return the weights bit-close to where they started.
     const snapshot = model.paramGroups().muon.map((w) => w.data.slice());
@@ -1478,7 +1475,7 @@ async function loraModelParity(gpu: WebGPUBackend) {
     if (!ok) failures++;
     console.log(
       `  ${ok ? "ok " : "FAIL"} ${name} lora vs CPU (${h.adapted} adapters, ` +
-        `frozen grad ${frozen}, merge drift ${drift.toExponential(1)})`,
+        `stub ${stubDirty}, merge drift ${drift.toExponential(1)})`,
     );
   }
 }

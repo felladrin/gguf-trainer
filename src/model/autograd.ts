@@ -756,6 +756,18 @@ export function fusedCrossEntropy(
   const [V, H2] = w.shape;
   if (H !== H2) throw new Error(`fusedCrossEntropy dim mismatch ${H} vs ${H2}`);
   if (chunk <= 0) throw new Error(`fusedCrossEntropy chunk must be positive, got ${chunk}`);
+  // Adapters live inside `linear`, and this path deliberately does not go
+  // through it. An adapted readout would therefore be adapted in the dense
+  // forward and unadapted here, i.e. in training: a silent divergence between
+  // what the trust gate checks and what the run optimizes. It holds today only
+  // because all three architectures put the readout in the aux group, which is
+  // a convention, not a guarantee.
+  if (loraAdapters.has(w)) {
+    throw new Error(
+      "fusedCrossEntropy: the readout weight carries a LoRA adapter, which this " +
+        "path cannot apply. Put the readout in the aux param group, or use --loss-chunk 0.",
+    );
+  }
   const loss = Tensor.zeros([1]);
 
   // Online softmax over the chunked vocab: a chunk whose maximum beats the

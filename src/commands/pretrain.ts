@@ -64,9 +64,6 @@ import { UsageError } from "../cli/args.ts";
  */
 const MAX_LOSS_SPANS = 100;
 
-/** Default for `--lora-alpha`; single-sourced with the flag so the two cannot drift. */
-const LORA_ALPHA_DEFAULT = 16;
-
 const DOC_SEP = "<|endoftext|>"; // TinyStories and most raw dumps mark doc boundaries with this
 const VOCAB = 16384; // .txt-mode shared vocab (caps below this on a small sample)
 const TRAIN_SAMPLE_MB = 12; // BPE converges on a few MB; no need to scan the whole corpus
@@ -244,10 +241,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     // cannot affect the loss, and look like it was working.
     die(`--lora-alpha must be positive, got ${loraAlpha}`);
   }
-  // `v.has` is true for a defaulted flag, so compare against the default: this
-  // must catch someone typing --lora-alpha and forgetting --lora-rank, and must
-  // not fire on every ordinary run.
-  if (loraRank === 0 && loraAlpha !== LORA_ALPHA_DEFAULT) {
+  if (loraRank === 0 && v.given("lora-alpha")) {
     die("--lora-alpha does nothing without --lora-rank");
   }
   const lossChunk = v.num("loss-chunk");
@@ -497,7 +491,11 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       flags.has("reclaim") ? "on" : "off"
     }, loss ${lossChunk > 0 ? `chunked x${lossChunk} (${lossSpans} spans)` : "dense"}, recompute ${
       flags.has("recompute") ? "on" : "off"
-    }, ${loraRank > 0 ? `lora r${loraRank} a${loraAlpha}` : "full fine-tune"}`,
+    }, ${
+      loraRank > 0
+        ? `lora r${loraRank} a${loraAlpha} (adapters train at aux lr; muon lr is inert)`
+        : "full fine-tune"
+    }`,
   );
 
   // WSD decay-phase instruct injection (MiniCPM/Xmodel-2 trick): from the cooldown
@@ -532,8 +530,12 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     // out. Every checkpoint this run writes loads in llama.cpp with no adapter
     // file beside it, and the run keeps training from where it was.
     lora?.merge();
-    const b = arch.exportGGUF(model, tok.export(), cfg, { quant, name, chatTemplate });
-    lora?.unmerge();
+    let b: Uint8Array;
+    try {
+      b = arch.exportGGUF(model, tok.export(), cfg, { quant, name, chatTemplate });
+    } finally {
+      lora?.unmerge(); // an export that throws must not leave the fold applied
+    }
     await writeFileBytes(`${outPath}.tmp`, b);
     const fs = await import("node:fs");
     fs.renameSync(`${outPath}.tmp`, outPath);
@@ -542,6 +544,16 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   // Optimizer-state sidecar next to the GGUF, so a resume continues with a warm
   // optimizer (Muon momentum + Adam moments) instead of cold-starting. Atomic.
   const optStatePath = `${outPath}.optstate`;
+  if (lora && await fileExists(optStatePath)) {
+    // Not writing a sidecar does not close the hazard: crash recovery here is
+    // `--resume X --out X`, so a LoRA run rewrites X with merged weights and
+    // would leave a full-parameter-set sidecar beside it. That file's param
+    // COUNT still matches, so importState accepts it and the next full
+    // fine-tune warm-starts on momentum belonging to a different weight point,
+    // silently. Remove it: this run is about to invalidate it either way.
+    (await import("node:fs")).rmSync(optStatePath);
+    console.log(`Removed ${optStatePath.split("/").pop()} (stale: this run rewrites the weights)`);
+  }
   const writeOptState = async (): Promise<number> => {
     // A LoRA run must not leave a sidecar: it would hold adapter moments beside
     // a merged dense GGUF, and the next full fine-tune resuming from that
@@ -677,8 +689,12 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     if (eq === quant) continue; // already the main artifact
     const variantPath = outPath.replace(/\.gguf$/i, `.${eq.toUpperCase()}.gguf`);
     lora?.merge(); // same fold as the main artifact: a quant variant is not a different model
-    const vb = arch.exportGGUF(model, tok.export(), cfg, { quant: eq, name, chatTemplate });
-    lora?.unmerge();
+    let vb: Uint8Array;
+    try {
+      vb = arch.exportGGUF(model, tok.export(), cfg, { quant: eq, name, chatTemplate });
+    } finally {
+      lora?.unmerge();
+    }
     await writeFileBytes(variantPath, vb);
     console.log(
       `Wrote ${variantPath.split("/").pop()} (${(vb.length / 1e6).toFixed(0)} MB, ${eq})`,
@@ -815,13 +831,13 @@ const SHARED_FLAGS: Flag[] = [
     placeholder: "N",
     default: 0,
     describe:
-      "train rank-N LoRA adapters on the hidden projections and freeze the base weights, instead of full fine-tuning (0 = full). Adapters are merged into the weights on export, so the GGUF stays an ordinary dense checkpoint",
+      "train rank-N LoRA adapters on the hidden projections and freeze everything else, including the embeddings, norms and readout, instead of full fine-tuning (0 = full). Adapters train at --aux-lr and are merged into the weights on export, so the GGUF stays an ordinary dense checkpoint",
   },
   {
     name: "lora-alpha",
     type: "number",
     placeholder: "A",
-    default: LORA_ALPHA_DEFAULT,
+    default: 16,
     describe: "LoRA scaling numerator; the update is (alpha/rank) * B*A",
   },
   {

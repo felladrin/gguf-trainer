@@ -627,10 +627,12 @@ reclaim on it must not grow with micro-batch count (7.6 -> 7.6 MB healthy, 10.0 
 
 ### 21. LoRA: the optimizer state goes 71x, the throughput goes down 14% (2026-09-09)
 
-`--lora-rank N` freezes every matrix in the Muon group and trains rank-N adapters beside them.
-Attached in `src/train/lora.ts` off `paramGroups().muon`, which is already exactly the set of 2-D
-hidden projections, and registered with `linear` rather than with the architectures: nothing in
-`src/arch/` knows adapters exist, and a new architecture gets them for free.
+`--lora-rank N` freezes every parameter the model already had and trains rank-N adapters on the
+matrices in the Muon group. Attached in `src/train/lora.ts` off `paramGroups().muon`, which is
+already exactly the set of 2-D hidden projections, and registered with `linear` rather than with
+the architectures: nothing in `src/arch/` knows adapters exist, and a new architecture gets them
+for free. Adapters train under AdamW at `--aux-lr`; `--muon-lr` is inert, because the Muon group is
+empty.
 
 Measured on qwen3 293M (vocab 151936), `--seq-len 1024 --batch 1 --reclaim --loss-chunk 8192
 --recompute`, 3 steps, same seed:
@@ -667,9 +669,14 @@ someone measures the other one. This is why `LoraHandle.groups.muon` is empty.
 
 **Merged into the base on every export.** `agents.md` says a checkpoint is already a file
 llama.cpp can load, and invariant 2 gates resume on an exact architecture match with no field for
-adapter-ness. Writing adapter tensors would break both. `exportGGUF` folds `B*A*scale` in, writes
-310 ordinary tensors, and folds it back out, so training continues from where it was. The f32
-round-trip drift is 1.5e-8 worst case, measured, against training noise of a different order.
+adapter-ness. Writing adapter tensors would break both. Every caller that exports folds
+`B*A*scale` in first and folds it back out after, so 310 ordinary tensors go to the file and
+training continues where it was. That fold is the CALLER's job at each site, not the exporter's,
+which is exactly how the deployment-quant variants shipped unmerged in the first version of this
+change. Measured merge/unmerge round-trip drift: 1.5e-8 on a tiny CPU model, 3.0e-8 through the
+device parity case. Only the host copy accumulates it, since nothing on the device writes a frozen
+base: at most half an ulp per checkpoint on a random walk, so ~3e-6 relative after a thousand
+checkpoints, against a q8_0 export error four orders of magnitude larger. Noted, not fixed.
 
 **`B` starts at zero.** The adapted model is exactly the checkpoint at step 0, so a resume does not
 jump. Verified: an adapted forward and the base forward agree to the digit before the first step.
@@ -682,7 +689,10 @@ full parameter set; a LoRA run trains 392 adapters instead, so reading one throw
 mismatch before step 0, which is what `pretrain --resume --lora-rank` did at first (`finetune`
 escaped it only because that mode defaults to a cold optimizer). Beyond the count, a resumed LoRA
 run re-initializes `A` from the seed and `B` to zero while their learned product is already folded
-into the base, so those moments describe a parameterization that no longer exists. It does not
+into the base, so those moments describe a parameterization that no longer exists. Chaining LoRA
+runs is still the normal merge-and-restart pattern and costs only a few hundred steps of AdamW
+re-warm; note that each cycle redraws `A` from the same hardcoded seed, so repeated cycles reuse
+one random subspace. It does not
 write one either: a sidecar holding adapter moments beside a merged dense GGUF would break the next
 full fine-tune resuming from that checkpoint.
 
