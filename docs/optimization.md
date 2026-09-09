@@ -1255,10 +1255,16 @@ Filed as #67 while fixing #60, and filed with its own null measurement so nobody
 speed-up. `makeOut` queues every intermediate's gradient buffer for a `clearBuffer` at creation,
 because a backward accumulates into it with `+=` and a pooled buffer arrives dirty. Its comment says
 "before this graph's backward pass runs". Eval, `generate` and `pretrain`'s trust gate never run
-one, so every one of those clears was zeroing a buffer nobody would read. On the toy model in the
-gate a forward-only window issues 139 clears, 85 intermediates and 54 parameter accumulators, and
-all 139 go: the 54 are the ones lever 28 attacked in the frozen case, and unlike those the
-intermediates are full-size buffers rather than a shared 256-byte stub.
+one, so every one of those clears was zeroing a buffer nobody would read. On the toy model in
+`forwardOnlyClearGate` a forward-only window issues 139 clears, 85 intermediates and 54 parameter
+accumulators, and all 139 go: the 54 are the ones lever 28 attacked in the frozen case, and unlike
+those the intermediates are full-size buffers rather than a shared 256-byte stub.
+
+The 54 carry a semantic change worth stating, because it is the one thing here that is not pure
+waste removal. Their clear ran BEFORE the same sync's gradient staging, so a forward-only window used
+to leave zeros in the host `grad` arrays and now leaves whatever the last backward put there. No
+caller reads them, eval and `generate` freezing and training keeping gradients on device, and the
+gate pins it so that going back to zeros means someone reintroduced the accumulator clears.
 
 `sync()` drained the queue whether or not a backward had begun, which is what forced them. It now
 asks. **Dropping rather than deferring is what the recycling forces:** those buffers return to the
@@ -1305,8 +1311,10 @@ on: its trust gate is a forward-only sync that drops every parameter's clear, an
 then accumulates into those same accumulators.
 
 The reset in `beginForwardOp` bounds what the throw catches to a backward with no forward op in
-between. Forward A, sync, forward B, backward A still slips through, as it did before this change.
-The flag narrows the window rather than closing it.
+between. Forward A, sync, forward B, backward A still slips through, as it did before this change:
+the flag narrows the window rather than closing it. Under `--recompute` that ordering is routine
+rather than exotic, since a checkpoint replay's own forward is that forward B, and it still throws on
+a real model only because the loss and readout backwards run before any checkpoint block.
 
 ## Quality levers
 

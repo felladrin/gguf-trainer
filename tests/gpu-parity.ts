@@ -1723,9 +1723,10 @@ async function frozenClearGate() {
  * dirty. Eval, `generate` and the trust gate never run one, so every one of
  * those clears was zeroing a buffer nobody would read.
  *
- * The counting arms are most of the test: this is not a speed fix, measuring
- * 26.62 s against 26.69 s on `eval-loss --windows 16`, inside the run-to-run
- * spread. What it buys is a command stream that says what it means.
+ * Two of the six assertions count; the rest guard the invariant that dropping a
+ * clear depends on. This is not a speed fix, measuring 26.62 s against 26.69 s
+ * on `eval-loss --windows 16`, inside the run-to-run spread. What it buys is a
+ * command stream that says what it means.
  *
  * The last arm is the price. Dropping a clear is safe only while no backward
  * runs over a graph built before a sync, and that ordering used to be merely
@@ -1744,38 +1745,27 @@ async function forwardOnlyClearGate() {
       const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
       if (withBackward) backward(loss, 1);
       await gpu.sync([loss]);
-      return { clears: gpu.gradClearsIssued - before, loss: loss.data[0] };
+      const clears = gpu.gradClearsIssued - before;
+      // On the same backend and the same graph, so the sync that dropped the
+      // clears is demonstrably the one whose backward is refused, rather than a
+      // second device that merely resembles it.
+      let refusedLateBackward = false;
+      if (!withBackward) {
+        try {
+          backward(loss, 1);
+          await gpu.sync([]);
+        } catch (e) {
+          refusedLateBackward = /graph built before a sync/.test((e as Error).message);
+        }
+      }
+      return { clears, loss: loss.data[0], refusedLateBackward };
     } finally {
       gpu.destroy();
     }
   };
   const bwd = await arm(true);
   const fwd = await arm(false);
-
-  // The ordering the drop makes unsafe, and which now throws instead of
-  // accumulating into pool garbage: build a graph, sync it, then ask for a
-  // backward over it. Nothing in the tree does this; the guard exists because
-  // before this change the same ordering was merely wasteful, so it would have
-  // become silently wrong rather than loudly so.
-  const refusesLateBackward = await (async () => {
-    const gpu = (await initWebGPU())!;
-    const m = new Gemma3Model(cfg, mulberry32(5));
-    try {
-      gpu.install();
-      gpu.uploadParams(m.params());
-      const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
-      await gpu.sync([loss]);
-      try {
-        backward(loss, 1);
-        await gpu.sync([]);
-        return false;
-      } catch (e) {
-        return /graph built before a sync/.test((e as Error).message);
-      }
-    } finally {
-      gpu.destroy();
-    }
-  })();
+  const refusesLateBackward = fwd.refusedLateBackward;
 
   // 1. A window with a backward still zeroes every buffer that backward will
   //    accumulate into. Losing this is a correctness bug, not a tidiness one.
@@ -1806,8 +1796,11 @@ async function forwardOnlyClearGate() {
       await gpu.sync([]);
       gpu.seedGradFromHost(g.muon[0]);
       return true;
-    } catch {
-      return false;
+    } catch (e) {
+      // Only the refusal this arm is about; anything else is a real failure and
+      // should not be reported as "optimizer-only allowed false".
+      if (/graph built before a sync/.test((e as Error).message)) return false;
+      throw e;
     } finally {
       gpu.uninstall();
       gpu.destroy();
@@ -1835,6 +1828,12 @@ async function forwardOnlyClearGate() {
       const first = await step();
       // The trust gate's shape: a forward, a sync, no backward.
       await gpu.sync([sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0)]);
+      // The semantic this change moves: that sync no longer zeroes the
+      // accumulators before staging them, so the host grads still hold the last
+      // backward's rather than zeros. Nothing reads them, but pin it: going back
+      // to zeros means someone reintroduced the accumulator clears.
+      const afterForwardOnly = m.params().map((p) => Float32Array.from(p.grad));
+      const held = first.every((g, i) => g.every((v, j) => v === afterForwardOnly[i][j]));
       const third = await step();
       let worst = 0, n = 0;
       for (let i = 0; i < first.length; i++) {
@@ -1844,7 +1843,7 @@ async function forwardOnlyClearGate() {
           n++;
         }
       }
-      return n > 0 && worst < 1e-4;
+      return held && n > 0 && worst < 1e-4;
     } finally {
       gpu.destroy();
     }

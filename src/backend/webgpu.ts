@@ -322,9 +322,12 @@ export class WebGPUBackend implements OpsBackend {
   // Set when a sync() discarded a queued clear for a GRAPH buffer because no
   // backward had begun. Cleared by the next forward op, i.e. by the next graph.
   private droppedClearsForGraph = false;
-  // Whether pendingClears holds any makeOut buffer. Those come from the pool and
-  // go back to it at the end of the sync, so dropping their clear is what a
-  // later backward would notice. entryFor's accumulators are persistent and are
+  // Whether any makeOut clear has been queued since the last drain. Not "is in
+  // pendingClears": endRegion can filter one out without emptying the array, and
+  // that buffer reaches the pool through regionFree instead, so the flag staying
+  // set still describes a graph buffer recycled dirty.
+  //
+  // entryFor's accumulators are persistent, never reach the pool, and are
   // re-armed on the drop path, so dropping theirs is free and must not arm the
   // throw: an optimizer constructor queues one per parameter.
   private pendingGraphClears = false;
@@ -408,9 +411,15 @@ export class WebGPUBackend implements OpsBackend {
     // Only if a backward actually began. makeOut queues every intermediate's
     // gradient buffer at creation, because a backward accumulates into it with
     // += and a pooled buffer arrives dirty. A forward-only window never runs
-    // one, so those clears zero buffers nobody reads: 85 per window against 54
-    // parameters on the toy model in frozenClearGate, and full-size rather than
-    // the shared stub.
+    // one, so those clears zero buffers nobody reads: 139 per forward-only window
+    // on the toy model in forwardOnlyClearGate, 85 intermediates and 54
+    // accumulators.
+    //
+    // The 54 carry a semantic change worth knowing. Their clear ran BEFORE this
+    // sync's grad staging, so a forward-only window used to leave zeros in the
+    // host grad arrays; it now leaves whatever the last backward put there. No
+    // caller reads them: eval and generate freeze, and training keeps grads on
+    // device.
     //
     // Dropping rather than deferring is what the recycling below forces: these
     // buffers return to the pool at the end of this sync, so a clear held over
@@ -1288,7 +1297,10 @@ export class WebGPUBackend implements OpsBackend {
     // The reset in beginForwardOp bounds what this catches to a backward with no
     // forward op in between. Forward A, sync, forward B, backward A slips
     // through, as it did before this change; the flag narrows the window, it
-    // does not close it.
+    // does not close it. Under --recompute that ordering is routine rather than
+    // exotic, a checkpoint replay's own forward being that forward B, and it
+    // still throws on a real model only because the loss and readout backwards
+    // run before any checkpoint block.
     if (this.droppedClearsForGraph) {
       throw new Error(
         "backward over a graph built before a sync(): that sync recycled the graph's " +
