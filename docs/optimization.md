@@ -1465,6 +1465,34 @@ same-size or larger vocab passes, and so does any narrower vocab that flips the 
 the half-word case above. Closing the class needs tokenizer identity, a hash beside the
 `.tokens`, not a range check.
 
+### 35. `eval-choice` refuses an unscoreable item before the first forward (2026-09-09)
+
+Filed as #57 while fixing #52. `choiceNLL` refuses a window it cannot score, which is right, but it
+does it on the item that holds one: after the GGUF is loaded, after the GPU is initialized, and after
+however many items sit ahead of it. On a full HellaSwag set that is hours of forwards before the
+command exits with a usage error.
+
+The obvious preflight is to encode every pair up front and run the same check. **Measured, that costs
+6.7 s** on a full set, 40168 context+choice pairs at 0.17 ms each, on every run including the ones
+that were always going to be fine. For a condition the four shipped tasks cannot currently reach,
+that is a poor trade, and it is close enough to a poor trade that it was worth measuring before
+writing it.
+
+The check does not need a tokenizer. **A string of C characters can never encode to more than C
+tokens**, so a rendered choice shorter than `maxSeq` characters provably cannot reach `maxSeq`
+tokens, and a non-empty stem provably encodes to at least one. The character lengths settle every
+pair except one whose choice is longer than the model's whole declared context, and only those get
+encoded. On the shipped tasks that is none, and the whole preflight is a pass over strings the
+scoring loop was going to build anyway.
+
+The bound is exact at its boundary, which is where a `>=` earns its place: a choice of exactly
+`maxSeq` characters could encode to `maxSeq` tokens, one character fewer could not. Weakening it to
+`>` fails the case that pins it.
+
+`preflightByChars` returns the pairs that still need encoding rather than doing the encoding itself,
+so the arithmetic is testable without a tokenizer or a model, which is the same split
+`choiceMaskStart` and `choiceWindowError` already use.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

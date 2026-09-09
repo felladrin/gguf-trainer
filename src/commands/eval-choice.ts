@@ -221,6 +221,32 @@ export function choiceMaskStart(nCtx: number, nChoice: number, maxSeq: number): 
 }
 
 /**
+ * Refuse an unscoreable item before the first forward, without a tokenizer.
+ *
+ * `choiceWindowError` needs token counts, and encoding every item's choices up
+ * front costs 6.7 s on a full HellaSwag set, measured. It is not needed for
+ * almost any of them, because a string of C characters can never encode to more
+ * than C tokens: a rendered choice shorter than `maxSeq` characters provably
+ * cannot reach `maxSeq` tokens, and a non-empty stem provably encodes to at
+ * least one. So the character lengths settle every item except the few whose
+ * choice is longer than the whole context, and only those need encoding.
+ *
+ * Returns the pairs that still have to be checked exactly, usually none.
+ */
+export function preflightByChars(
+  pairs: { ctxOnly: string; choiceText: string }[],
+  maxSeq: number,
+): { needExactCheck: { ctxOnly: string; choiceText: string }[]; emptyStem: boolean } {
+  const needExactCheck: { ctxOnly: string; choiceText: string }[] = [];
+  let emptyStem = false;
+  for (const p of pairs) {
+    if (p.ctxOnly.length === 0) emptyStem = true;
+    if (p.choiceText.length >= maxSeq) needExactCheck.push(p);
+  }
+  return { needExactCheck, emptyStem };
+}
+
+/**
  * Null when the window can score every choice token with at least one token in
  * front of it to predict the first one from. A negative start means truncation
  * would eat choice tokens, and a short score is not comparable to a full one:
@@ -339,6 +365,35 @@ async function run(v: Values) {
     const shotItems = items.slice(0, shots);
     const evalItems = items.slice(shots, limit ? shots + limit : undefined);
     const preamble = shotItems.map((s) => task.render(s.context, s.choices[s.gold])).join("\n\n");
+
+    // Before any forward. choiceNLL refuses an unscoreable window, but it does
+    // it on the item that holds one, which on a full set is hours in. The
+    // character bound settles almost every pair without a tokenizer; only a
+    // choice longer than the whole context needs encoding.
+    const pairs = evalItems.flatMap((it) => {
+      const ctx = preamble ? `${preamble}\n\n${it.context}` : it.context;
+      const ctxOnly = task.render(ctx, "").replace(/\s+$/, "");
+      return it.choices.map((ch) => ({
+        ctxOnly,
+        choiceText: task.render(ctx, ch).slice(ctxOnly.length),
+      }));
+    });
+    const pre = preflightByChars(pairs, cfg.maxSeq);
+    if (pre.emptyStem) {
+      die(`${taskName}: an item's stem rendered to 0 tokens, so nothing scores it`);
+    }
+    for (const p of pre.needExactCheck) {
+      const bad = choiceWindowError(
+        tok.encode(p.ctxOnly).length,
+        tok.encode(p.choiceText).length,
+        cfg.maxSeq,
+      );
+      if (bad) die(`${bad}. The choice reads ${JSON.stringify(p.choiceText.slice(0, 60))}`);
+    }
+    console.log(
+      `Windows: ${pairs.length} choices fit a ${cfg.maxSeq}-token context ` +
+        `(${pre.needExactCheck.length} needed encoding) ✓`,
+    );
 
     let correctNorm = 0, correctRaw = 0, done = 0;
     const t0 = Date.now();

@@ -10,6 +10,7 @@ import {
   hellaswagItem,
   hellaswagPreprocess,
   piqaItem,
+  preflightByChars,
   TASKS,
 } from "../src/commands/eval-choice.ts";
 
@@ -243,6 +244,39 @@ for (const [nCtx, nChoice, maxSeq] of [[20, 10, 512], [100, 10, 105], [600, 10, 
     targets.slice(start).join(",") === ids.slice(-nChoice).join(","),
     `the scored targets are the choice tokens themselves (${shape})`,
   );
+}
+
+// The preflight. choiceNLL refuses an unscoreable window on the item that holds
+// one, which on a full set is hours in. Encoding every pair up front to find
+// them costs 6.7 s on HellaSwag, measured, so the character bound does the work
+// instead: a string of C characters can never encode to more than C tokens, so a
+// rendered choice shorter than maxSeq characters provably cannot reach maxSeq
+// tokens, and a non-empty stem provably encodes to at least one.
+{
+  const pair = (ctxOnly: string, choiceText: string) => ({ ctxOnly, choiceText });
+  const maxSeq = 16;
+
+  const none = preflightByChars([pair("Question: x\nAnswer:", " yes"), pair("q", "a")], maxSeq);
+  ok(none.needExactCheck.length === 0, "short choices need no tokenizer at all");
+  ok(!none.emptyStem, "and a non-empty stem is settled by being non-empty");
+
+  // At exactly maxSeq characters the bound stops proving anything, so that pair
+  // has to be encoded. One character less and it cannot reach maxSeq tokens.
+  const boundary = preflightByChars([pair("q", "x".repeat(maxSeq))], maxSeq);
+  ok(boundary.needExactCheck.length === 1, "a choice of maxSeq characters is not settled");
+  const under = preflightByChars([pair("q", "x".repeat(maxSeq - 1))], maxSeq);
+  ok(under.needExactCheck.length === 0, "one character under, it is");
+
+  const empty = preflightByChars([pair("", " yes")], maxSeq);
+  ok(empty.emptyStem, "an empty stem is caught, and needs no tokenizer either");
+
+  // Only the long ones are handed on, not the whole batch.
+  const mixed = preflightByChars(
+    [pair("q", "short"), pair("q", "y".repeat(99)), pair("q", "also short")],
+    maxSeq,
+  );
+  ok(mixed.needExactCheck.length === 1, "only the pair that could reach the ceiling is returned");
+  ok(mixed.needExactCheck[0].choiceText.length === 99, "and it is the right one");
 }
 
 console.log("eval-tasks: all checks passed");
