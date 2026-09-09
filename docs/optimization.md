@@ -977,8 +977,9 @@ tokenized with the 151936-entry Qwen3 vocab, `eval-loss --windows 1 --seq-len 12
 | `--cpu` | `val loss NaN  ppl NaN`          | `crossEntropy: target 49751 at position 19 is not -1 (ignore) or an integer in [0,49152)` | `embedding: id 49751 at position 20 ...` |
 | GPU     | `val loss 10.9754  ppl 58420.99` | the same message                                                                          | the same message                         |
 
-The third column is what you see today. Lever 29 guards the input side, which the same corpus reaches
-one step earlier, so this check now fires only when the inputs are in range and a target is not.
+The third column is what you see today. Lever 29 guards the input side, which the same corpus
+reaches one step earlier, so this check now fires only when the inputs are in range and a target is
+not.
 
 A perplexity of 58421 from a completely mismatched pairing is a believable-looking number, and it is
 the reason the check runs on the host rather than being left to the device. Read the CPU's NaN there

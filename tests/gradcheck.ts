@@ -388,7 +388,13 @@ async function main() {
       // either, a loop starting at t = 1 or reporting t + 1 passes everything,
       // and lever 29's "position 20 against position 19" argument rests on that
       // number.
-      ["id == V", refuses([0, V, 1], /id 6 at position 1 is not an integer in \[0,6\)/)],
+      // Anchored on the label too: "embedding:" against "crossEntropy:" is how a
+      // reader tells which of the two guards fired, and lever 29's ordering
+      // argument is quoted from those prefixes.
+      [
+        "id == V",
+        refuses([0, V, 1], /^embedding: id 6 at position 1 is not an integer in \[0,6\)/),
+      ],
       ["id == V in the first position", refuses([V, 0, 1])],
       ["id far past V", refuses([0, 1, 999])],
       ["a negative id", refuses([0, -1, 1])],

@@ -700,9 +700,13 @@ export function attention(
  * run continues on a number that looks fine.
  *
  * Unlike a loss target there is no ignore marker: every position of a batch is
- * a real token. Checked above the backend dispatch rather than in each backend,
- * which is this file's convention for a guard both paths need and neither can
- * fold into work it already does.
+ * a real token.
+ *
+ * Checked above the backend dispatch rather than in each backend, which is what
+ * `fusedCrossEntropy` does with its dimension, chunk and LoRA guards, and which
+ * makes the omission `keptRowsInVocab` invites unreachable: that one validates
+ * below the dispatch, so every implementation needs its own call, and the one
+ * nobody remembered is the GPU `softCrossEntropy` (#61).
  */
 export function assertIdsInTable(ids: number[], V: number, where: string): void {
   for (let t = 0; t < ids.length; t++) {

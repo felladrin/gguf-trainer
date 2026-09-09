@@ -1845,11 +1845,19 @@ async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
 }
 
 /**
- * The vocab-range refusal on the device. The kernel cannot catch this: the
+ * Out-of-range indices, refused on the host, with an installed backend.
+ *
+ * The two losses need one arm each because they validate BELOW the backend
+ * dispatch, so each implementation carries its own call and this is what proves
+ * the device ones are still there. The kernel could not catch it for them: the
  * logits buffer is bound whole, so `LOG[t * V + tgt]` with `tgt >= V` is an
- * in-bounds read of the next row, and it was measured returning exactly the
- * CPU's wrong value. The check therefore runs on the host, and this pins that
- * both GPU losses actually call it.
+ * in-bounds read of the next row, measured returning exactly the CPU's wrong
+ * value.
+ *
+ * The embedding arm is here for the opposite reason. Its guard sits ABOVE the
+ * dispatch, so no backend can skip it, and what this pins is that placement:
+ * move the call below and the CPU cases in gradcheck still pass while this
+ * fails.
  */
 async function targetRangeGate(gpu: WebGPUBackend) {
   const T = 3, H = 4, V = 6;
@@ -1877,10 +1885,10 @@ async function targetRangeGate(gpu: WebGPUBackend) {
     const logits = linear(hid, w);
     const dense = refused(() => crossEntropy(logits, [0, V, 1]));
     const fused = refused(() => fusedCrossEntropy(hid, w, [0, V, 1], 2));
-    // The input side too. Its guard sits above the backend dispatch, so this
-    // fails if someone moves it below, where an installed backend skips it.
-    const table = randTensor([V, H], mulberry32(41));
-    const embed = refused(() => embedding(table, [0, V, 1]), /is not an integer in \[0,/);
+    // The input side too, reusing w as the table since it is already [V, H].
+    // Its guard sits above the backend dispatch, so this fails if someone moves
+    // it below, where an installed backend would skip it.
+    const embed = refused(() => embedding(w, [0, V, 1]), /^embedding: id \d+ at position \d+ /);
     const ok = dense && fused && embed && scores;
     if (!ok) failures++;
     console.log(
