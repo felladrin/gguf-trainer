@@ -749,6 +749,36 @@ a real dual-machine drift bug. A small sync script with `--delete` (excluding `c
 reading is far out; checkpoints every 500 steps are the only early signal. A `--logEvery` flag would
 give a tighter early-training view without touching the checkpoint cadence.
 
+### 22. `writeFileSync` wrote 1 TB for a 2.39 GB checkpoint (2026-09-09)
+
+Not a performance lever, recorded here because it is a measured runtime limit that silently caps
+what this repo can export. Exporting a Qwen3-0.6B-shaped checkpoint filled a 1.9 TB disk twice: the
+`.tmp` reached 1.19 TB and then 855 GB, still growing when killed.
+
+`exportGGUF` was innocent, and instrumenting it proved that: it returned exactly 2,390,146,560
+bytes. The inflation was entirely in `writeFileBytes`, a bare `fs.writeFileSync(path, data)`. On
+Deno 2.9.1 that call does not survive a buffer longer than 2^31 bytes, and rather than failing it
+writes without bound. Isolated:
+
+| buffer            | result                                         |
+| ----------------- | ---------------------------------------------- |
+| 1.90 GiB          | file matches                                   |
+| 2^31 - 1024 bytes | file matches                                   |
+| 2^31 + 1024 bytes | unbounded write, process killed by `ulimit -f` |
+
+Reads are unaffected: `readFileSync` returns a 2 GiB+ file correctly, so `--resume` was never at
+risk. `writeFileBytes` now writes through an open handle in 1 GiB spans.
+
+**What it was capping.** An f32 GGUF crosses 2^31 bytes at ~537M parameters, so the two largest
+rows of the readme's own base-model table could not be exported at all: Qwen3-0.6B-Base (2.22 GiB)
+and TinyLlama_v1.1 (4.10 GiB). Nothing had hit it because every model taken end to end here is
+smaller: LittleLamb-293M exports at 1.09 GiB.
+
+The regression test is `tests/large-file-write.ts`. Its cheap half checks the span arithmetic and a
+real multi-chunk round trip; the >2 GiB case is behind `GGUF_TRAINER_BIG_IO=1` because it needs
+~2.2 GB of RAM and disk. Note the failure mode: a regression runs away rather than failing an
+assertion, so run that case under `ulimit -f`.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
