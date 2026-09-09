@@ -362,7 +362,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       console.log(`No optimizer state at ${optPath}; optimizer cold-starts (momentum re-warms)`);
     }
   } else if (resumePath) {
-    console.log(`--coldOpt: ignoring any optimizer state (momentum from another objective)`);
+    console.log(`--cold-optimizer: ignoring any optimizer state (momentum from another objective)`);
   }
   // WSD over the FULL run (0..steps); on resume we offset into it so the LR
   // continues rather than re-warming. 10% warmup / 20% cooldown, floor 0.1.
