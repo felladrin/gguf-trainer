@@ -19,3 +19,5 @@
 # Agent scratch, not project source.
 /memory/
 /.consult/
+# Agent worktrees live here, so this holds whole checkouts of the repo.
+/.claude/
