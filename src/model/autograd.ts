@@ -688,30 +688,49 @@ export function attention(
 }
 
 /**
- * Count the rows a loss will keep, refusing any target that is not a row of the
- * vocab. A target < 0 is the ignore marker; anything else has to index a real
- * logit row, because `logits.data[t * V + target]` with `target >= V` reads the
- * NEXT row's logits (or past the end of the array on the last row, which gives
- * `undefined` and a NaN loss). Either way the run continues on a plausible
- * number instead of stopping.
+ * Count the rows a loss will keep, refusing any target that is not an ignore
+ * marker or a row of the vocab.
+ *
+ * `-1` is the ignore marker; anything else has to index a real logit row,
+ * because `logits.data[t * V + target]` with `target >= V` reads the NEXT row's
+ * logits. Measured at T=3, V=6 with one kept row: both backends returned
+ * 2.038443088531494, which is exactly that row's logsumexp minus the following
+ * row's first logit. The last row is the only one where the two differ, and the
+ * GPU is the worse of the pair there: the CPU reads past its array and gives
+ * NaN, while the GPU reads the 256-byte bucket padding and returns a plausible
+ * 2.1300957.
+ *
+ * Only `-1` is accepted as ignore, not every negative. `uploadU32` maps `-1` to
+ * `0xffffffff`, the marker the kernels test for, but `-2` becomes `0xfffffffe`
+ * (a huge target) and `-0.5` becomes `0`. The CPU would treat both as ignore
+ * while the GPU scored them, so the host count and the kernel would disagree.
+ *
+ * `targets.length` must equal `T`: the losses sum over `T` rows and divide by
+ * the count returned here, so a longer array inflates the denominator and
+ * reports a plausible wrong loss.
  *
  * The usual way to get here is a corpus tokenized with a different vocab than
  * the checkpoint, which `agents.md` invariant 1 exists to prevent: the tokenizer
  * freezes at step one. Scoring a foreign base against the wrong `.tokens` file
  * reaches it too.
  */
-export function keptRowsInVocab(targets: number[], V: number, where: string): number {
+export function keptRowsInVocab(targets: number[], T: number, V: number, where: string): number {
+  if (targets.length !== T) {
+    throw new Error(
+      `${where}: ${targets.length} targets for ${T} logit rows. The loss sums T rows and means ` +
+        `over the targets it counts, so a mismatch reports a plausible wrong loss.`,
+    );
+  }
   let kept = 0;
-  for (let t = 0; t < targets.length; t++) {
+  for (let t = 0; t < T; t++) {
     const g = targets[t];
-    if (g < 0) continue;
-    if (!Number.isInteger(g) || g >= V) {
+    if (!Number.isInteger(g) || g < -1 || g >= V) {
       throw new Error(
-        `${where}: target ${g} at position ${t} is outside [0,${V}). ` +
+        `${where}: target ${g} at position ${t} is not -1 (ignore) or an integer in [0,${V}). ` +
           `A corpus tokenized with a different vocab than the checkpoint is the usual cause.`,
       );
     }
-    kept++;
+    if (g >= 0) kept++;
   }
   return kept;
 }
@@ -727,7 +746,7 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
   // the mean is over kept rows only. With no ignored rows this is the plain
   // full-sequence mean (kept === T), so existing callers are unchanged.
   let total = 0;
-  const kept = keptRowsInVocab(targets, V, "crossEntropy");
+  const kept = keptRowsInVocab(targets, T, V, "crossEntropy");
   for (let t = 0; t < T; t++) {
     const b = t * V;
     let maxL = -Infinity;
@@ -808,7 +827,7 @@ export function fusedCrossEntropy(
   // Before the chunk loops, not after: an out-of-range target never falls inside
   // any span, so `tgtLogit` would stay 0 and the loss would be quietly wrong
   // rather than NaN.
-  const kept = keptRowsInVocab(targets, V, "fusedCrossEntropy");
+  const kept = keptRowsInVocab(targets, T, V, "fusedCrossEntropy");
   const loss = Tensor.zeros([1]);
 
   // Online softmax over the chunked vocab: a chunk whose maximum beats the

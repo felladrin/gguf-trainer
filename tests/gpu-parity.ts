@@ -1630,11 +1630,21 @@ async function loraModelParity(gpu: WebGPUBackend) {
  * All of those are properties of the current kernels that a future change could
  * break, which is what this is here for.
  */
+async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
+  for (const n of [1, 6, 257, 5000]) {
+    const t = randTensor([n], mulberry32(4));
+    await opCase(gpu, `add(t, t) [n=${n}]`, [t], () => add(t, t));
+    const u = randTensor([n], mulberry32(9));
+    await opCase(gpu, `mul(t, t) [n=${n}]`, [u], () => mul(u, u));
+  }
+}
+
 /**
- * The vocab-range refusal on the device. WGSL's robust buffer access means an
- * out-of-range target never produced the CPU's symptom here, so the GPU could
- * not be relied on to notice: the check runs on the host, before the dispatch,
- * and this pins that both GPU losses actually call it.
+ * The vocab-range refusal on the device. The kernel cannot catch this: the
+ * logits buffer is bound whole, so `LOG[t * V + tgt]` with `tgt >= V` is an
+ * in-bounds read of the next row, and it was measured returning exactly the
+ * CPU's wrong value. The check therefore runs on the host, and this pins that
+ * both GPU losses actually call it.
  */
 async function targetRangeGate(gpu: WebGPUBackend) {
   const T = 3, H = 4, V = 6;
@@ -1646,8 +1656,8 @@ async function targetRangeGate(gpu: WebGPUBackend) {
       try {
         fn();
         return false;
-      } catch {
-        return true;
+      } catch (e) {
+        return /is not -1 \(ignore\) or an integer in \[0,/.test((e as Error).message);
       }
     };
     // The legal arm first, and read back: on the device `loss.data` holds zeros
@@ -1666,16 +1676,10 @@ async function targetRangeGate(gpu: WebGPUBackend) {
         `(dense ${dense}, fused ${fused}, V-1 scores ${good.data[0].toFixed(4)})`,
     );
   } finally {
+    // The refusals leave a recorded dispatch and a pooled upload unsubmitted;
+    // draining here keeps the gate independent of what runs after it.
+    await gpu.sync([]);
     gpu.uninstall();
-  }
-}
-
-async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
-  for (const n of [1, 6, 257, 5000]) {
-    const t = randTensor([n], mulberry32(4));
-    await opCase(gpu, `add(t, t) [n=${n}]`, [t], () => add(t, t));
-    const u = randTensor([n], mulberry32(9));
-    await opCase(gpu, `mul(t, t) [n=${n}]`, [u], () => mul(u, u));
   }
 }
 

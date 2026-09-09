@@ -930,7 +930,7 @@ applies to LoRA training as much as to eval.
 Under `--cpu` this is a no-op: `Tensor`'s constructor allocates a gradient array for every tensor
 regardless, so there is nothing for a freeze to skip. Both arms measured 3.1600 there, as expected.
 
-### 26. A target outside the vocab read the next row's logits instead of stopping (2026-09-09)
+### 26. A target outside the vocab read the next row's logits, on BOTH backends (2026-09-09)
 
 Found while reviewing #54 and filed as #55. `crossEntropy` never checked that a target indexes a
 real logit row:
@@ -946,28 +946,56 @@ at 0 and the row's loss is simply wrong. `softCrossEntropy` had the check alread
 the one that needed it, so the two were inconsistent and the one without it was on every training
 path.
 
-The reachable case is a corpus tokenized with a different vocab than the checkpoint, which
-`agents.md` invariant 1 exists to prevent. Scoring a foreign base against the wrong `.tokens` file
-reaches it too, and that is how it looks from the outside: `smolrp.gguf` (vocab 49152) scored
-against a corpus tokenized with the 151936-entry Qwen3 vocab.
+**The GPU was not safer, which is what the issue assumed and what this lever said first.** The claim
+was that WGSL's robust buffer access clamps or discards an out-of-range read. It does not apply:
+`bindGroup` passes no offset and no size, so the logits buffer is bound whole and `LOG[t * V + tgt]`
+with `tgt >= V` is a perfectly in-bounds read of the next row. Measured at `T=3, V=6` with rows 0
+and 2 ignored, so the loss IS the kept row's term:
 
-|                        | before                  | after                                                            |
-| ---------------------- | ----------------------- | ---------------------------------------------------------------- |
-| `eval-loss --cpu`      | `val loss NaN  ppl NaN` | `crossEntropy: target 49751 at position 19 is outside [0,49152)` |
-| `eval-loss` on the GPU | `val loss NaN  ppl NaN` | the same message                                                 |
+|                                                                      | CPU               | GPU               |
+| -------------------------------------------------------------------- | ----------------- | ----------------- |
+| target `V` on an interior row                                        | 2.038443088531494 | 2.038443088531494 |
+| the same, predicted as "row 1's logsumexp minus row 2's first logit" | 2.038443096517044 |                   |
+| target `V` on the LAST row                                           | NaN               | 2.1300957         |
 
-`keptRowsInVocab` now does the range check and returns the kept count, so it replaces the counting
-loop each of the four losses already ran and costs no extra pass. All four call it: the CPU and GPU
-`crossEntropy` and the CPU and GPU `fusedCrossEntropy`.
+Identical on an interior row, to every digit. On the last row the GPU is the worse of the two: the
+CPU reads past its array and announces itself with NaN, while the GPU reads the 256-byte bucket
+padding `BufferPool` rounds every allocation up to, and returns a plausible number.
 
-The GPU was safer by accident, never by design. `srcCeFwd` indexes a buffer bound with a fixed size,
-so WGSL's robust buffer access clamps or discards an out-of-range read rather than crossing into a
-neighbouring row. It produced no wrong neighbour and no error either, which is why the check runs on
-the host before the dispatch, and why `targetRangeGate` in `tests/gpu-parity.ts` pins both device
-call sites separately: reverting either one alone fails it.
+That shows in the end-to-end symptom too. Scoring `smolrp.gguf` (vocab 49152) against a corpus
+tokenized with the 151936-entry Qwen3 vocab, `eval-loss --windows 1 --seq-len 128`:
 
-Not covered: the GPU `softCrossEntropy` still does not validate its teacher ids, where the CPU one
-does. That is the same inconsistency mirrored, and it is #61.
+|         | before                           | after                                                                                     |
+| ------- | -------------------------------- | ----------------------------------------------------------------------------------------- |
+| `--cpu` | `val loss NaN  ppl NaN`          | `crossEntropy: target 49751 at position 19 is not -1 (ignore) or an integer in [0,49152)` |
+| GPU     | `val loss 10.9754  ppl 58420.99` | the same message                                                                          |
+
+A perplexity of 58421 from a completely mismatched pairing is a believable-looking number, and it is
+the reason the check runs on the host rather than being left to the device.
+
+`keptRowsInVocab` does the range check and returns the kept count, so it replaces the counting loop
+each of the four losses already ran and costs no extra pass. All four call it: the CPU and GPU
+`crossEntropy` and the CPU and GPU `fusedCrossEntropy`. It refuses three things, and each is pinned
+by its own case in `tests/gradcheck.ts`:
+
+- a target that is not an integer in `[0, V)`. Weakening `>= V` to `> V` fails on `target == V`
+  alone, which is the boundary the whole check turns on.
+- a negative other than `-1`. `uploadU32` maps `-1` to `0xffffffff`, the marker the kernels test
+  for, but `-2` becomes `0xfffffffe`, a huge target the GPU scores while the CPU skips the row.
+- `targets.length !== T`. The losses sum `T` rows and divide by the count the helper returns, so a
+  longer array inflates the denominator. The CPU used to count only `t < T` while the GPU counted
+  the whole array, which was itself a divergence; it was reachable only through the `eval-choice`
+  mask bug fixed in #56.
+
+The accepting cases carry an oracle computed in the test rather than a comparison between the two
+losses, because both now draw their denominator from the same helper and would agree on a wrong
+count. Making the helper count ignored rows fails `-1 still means ignore`.
+
+Not covered, and both are the same inconsistency in neighbouring code: the GPU `softCrossEntropy`
+still does not validate its teacher ids where the CPU one does (#61), and `embedding` is the
+input-side twin, unguarded on both backends (#63). `embedding` is worth knowing about because it
+fires first in the scenario above: measured with an id past the table, the CPU returns a NaN row and
+the GPU returns a row of zeros.
 
 ## Quality levers
 
