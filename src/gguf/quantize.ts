@@ -46,7 +46,7 @@ export function serializeQ8_0(data: Float32Array): Serialized {
     throw new Error(`Q8_0 needs a length multiple of ${QK}, got ${data.length}`);
   }
   const nBlocks = data.length / QK;
-  const blockBytes = BLOCK_BYTES[GGMLType.Q8_0]!; // 34
+  const blockBytes = BLOCK_BYTES[GGMLType.Q8_0]!;
   const out = new Uint8Array(nBlocks * blockBytes);
   const dv = new DataView(out.buffer);
 
@@ -78,7 +78,7 @@ export function serializeQ4_0(data: Float32Array): Serialized {
     throw new Error(`Q4_0 needs a length multiple of ${QK}, got ${data.length}`);
   }
   const nBlocks = data.length / QK;
-  const blockBytes = BLOCK_BYTES[GGMLType.Q4_0]!; // 18
+  const blockBytes = BLOCK_BYTES[GGMLType.Q4_0]!;
   const out = new Uint8Array(nBlocks * blockBytes);
   const dv = new DataView(out.buffer);
 
@@ -142,11 +142,20 @@ export function bytesFor(type: GGMLTypeId, count: number): number | null {
   }
   if (type === GGMLType.F32) return count * 4;
   if (type === GGMLType.F16 || type === GGMLType.BF16) return count * 2;
+  // Null, not a throw: dequantize refuses this type below with a message that
+  // names it and says what to do, and a guard running first would replace it.
+  // Safe only because the types this cannot size are exactly the ones it
+  // refuses. Add a case to that switch without an entry here and the byte guard
+  // silently stops covering it, which for a k-quant super-block is precisely
+  // where a short read is quiet.
   return null;
 }
 
 export function dequantize(type: GGMLTypeId, bytes: Uint8Array, count: number): Float32Array {
   const need = bytesFor(type, count);
+  // `<`, not `!==`: the writer pads every tensor up to the file's alignment and
+  // the reader slices each one to the next tensor's offset, so t.data legitimately
+  // carries that padding.
   if (need !== null && bytes.length < need) {
     throw new Error(
       `dequantize: ${count} elements of ggml type ${type} need ${need} bytes, got ${bytes.length}`,

@@ -1379,19 +1379,27 @@ list, `[]` against `[1]`, and a list of positive integers is all-1s exactly when
 if one side is all-1s the other either is too, in which case both floors collapse both sides
 identically, or has a different product, in which case both refuse.
 
-**The trade it makes, stated because it is a live one.** This repo sizes a model from its metadata
-and llama.cpp sizes it from the tensor. A foreign checkpoint whose embedding is padded wider than its
-declared vocab used to load a prefix, and the prefix was the CORRECT weights, the padded rows being
-unused. It now stops. That is the point of the guard, silence being the thing #74 is about, but the
-message names that case so the person who hits it is not sent looking for a corrupt download. The
-readme's verified base-model list is unaffected: all eight local checkpoints across all three
-architectures load unchanged.
+**This brings the repo into line with llama.cpp rather than away from it,** which is the opposite of
+what this entry said first. `check_tensor_dims` in `llama-model-loader.cpp` throws
+`tensor '%s' has wrong shape` on exactly this mismatch, and it compares over `GGML_MAX_DIMS`
+requiring `cur->ne[i] == 1` past the expected shape's length, which is the trailing-1 rule
+implemented here. So the outlier was this repo, in not checking at all. I had written that llama.cpp
+tolerates a padded embedding because it sizes the model from the tensor; that was recall, the local
+checkout says otherwise, and the paragraph is gone.
+
+What a foreign file is likely to trip on instead is a defaulted metadata key. `attention.key_length`
+falls back to `embedding_length / head_count` and `vocab_size` to the token list's length, and a
+wrong default changes the shape of every `attn_q` and `attn_k`. Turning that from a scrambled weight
+into an error is the guard's best outcome, so the message names those two keys. All eight local
+checkpoints across the three architectures load unchanged under it.
 
 `assertRank` is `assertMatrix` from lever 31 with the rank as an argument, since the writer needs 2
-for a matrix and 1 for a vector. Nine mutations in `tests/export-extras.ts`, one per clause on each
-side. One survives and is left alone: loosening the trim's floor from `> 1` to `> 0` lets an all-1s
-dims list trim to empty, and there is no distinguishing input, since both sides then trim to empty
-together and compare equal either way.
+for a matrix and 1 for a vector. Eleven mutations, ten in `tests/export-extras.ts` and one in
+`tests/gradcheck.ts`, one per clause on each side. One survives and is left alone: loosening the
+trim's floor from `> 1` to `> 0`, for the reason above. One is worth knowing about because it looks
+like a tightening: `bytes.length < need` cannot become `!==`, since the writer pads every tensor up
+to the file's alignment and the reader slices each one to the next tensor's offset, so `t.data`
+legitimately carries that padding.
 
 ## Quality levers
 

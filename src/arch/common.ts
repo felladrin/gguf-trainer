@@ -140,11 +140,12 @@ export function tensorLoader(g: GGUFFile): (name: string, dst: Tensor) => void {
     // element count scrambles the weight. The other direction threw, but as an
     // unnamed DataView RangeError; dequantize names it now.
     //
-    // Trailing 1s are trimmed from both sides. GGUF stores an explicit n_dims
-    // and exactly that many values, so a file is never padded; llama.cpp pads
-    // ne to four with 1s ON READ, which is why [n] and [n, 1] are the same
-    // tensor to it and why a writer that emits the redundant trailing 1
-    // produces a file it accepts and an exact comparison here would refuse. Trimming
+    // Trailing 1s are trimmed from both sides, which is llama.cpp's own rule:
+    // check_tensor_dims compares over GGML_MAX_DIMS and requires cur->ne[i] == 1
+    // for every i past the expected shape's length. GGUF itself stores an
+    // explicit n_dims and exactly that many values, so a file is never padded;
+    // a writer that emits the redundant trailing 1 makes a file llama.cpp
+    // accepts, and an exact comparison here would refuse it. Trimming
     // still refuses [4] against [4, 3], which is the case the length clause is
     // for: [4] is a PREFIX of [4, 3], so comparing element-wise alone accepts a
     // 1-D destination against a 2-D tensor.
@@ -160,9 +161,10 @@ export function tensorLoader(g: GGUFFile): (name: string, dst: Tensor) => void {
         `GGUF tensor "${name}" has dims [${t.dims.join(", ")}], but this model wants ` +
           `[${want.join(", ")}] (shape [${dst.shape.join(", ")}] in this repo's order). ` +
           `For a file this repo wrote that means corruption. For a foreign one it means ` +
-          `its metadata and its tensors disagree about a dimension: the common benign case ` +
-          `is an embedding padded wider than the declared vocab, which llama.cpp tolerates ` +
-          `because it sizes the model from the tensor and this repo does not.`,
+          `this repo's config and the file's tensors disagree about a dimension, so check ` +
+          `the keys defaulted when absent: attention.key_length falls back to ` +
+          `embedding_length / head_count, and vocab_size to the token list's length. A wrong ` +
+          `default changes the shape this model allocates.`,
       );
     }
     const de = dequantize(t.type, t.data, dst.size);
