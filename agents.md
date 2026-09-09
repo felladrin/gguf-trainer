@@ -218,8 +218,8 @@ number.
 gradient buffer allocated per run and copied back to the host on every `sync()`: 14.8% of
 `eval-loss` wall clock on a 293M checkpoint (lever 25) and 39.0% of `generate`'s, which syncs per
 token (lever 27). Under `--cpu` it is a no-op, since every tensor allocates its own gradient anyway.
-Any new forward-only command wants the same line, in the command rather than in the shared helper:
-`pretrain` samples through `greedyComplete` mid-run, and the freeze is one-way.
+Any new forward-only command wants the same line, in the command rather than in `greedyComplete` or
+`sequenceLoss`: those are shared, and the freeze is a one-way mutation of a model the caller owns.
 
 Split a held-out set off the corpus BEFORE tokenizing it, or you cannot compare two checkpoints
 that trained for different numbers of epochs: whatever you hold out from the shorter run is

@@ -1025,19 +1025,29 @@ each on the Strix Halo APU:
 
 Median 29.81 s to 18.19 s, **39.0% faster**, and 46.9 GB of gradient copies that never happen. It is
 the same `freezeForScoring` call lever 25 added, in the same place, and it lands in
-`src/commands/generate.ts` rather than in `greedyComplete`: `pretrain` samples through that same
-function mid-run, and the freeze is one-way, so putting it there would zero the training model's
-gradients for the rest of the run.
+`src/commands/generate.ts` rather than in `greedyComplete`. That helper is shared, and `pretrain`
+hands it the model it just trained on the backend it trained through; an irreversible mutation of a
+caller-owned model does not belong in a forward helper, whether or not it happens to be safe for
+today's callers.
 
-`generateFreezeGate` in `tests/gpu-parity.ts` pins it the way lever 25's gate does, with one
-difference that matters: the assertion that would make the change unshippable is that the generated
-ids are identical between the arms. The frozen arm's readback is exactly the last step's logits,
-`[ctx, vocab]` f32 and nothing else. Making `freezeForScoring` a no-op leaves the readback at the
-full model; moving the call after `uploadParams` drops the readback but not the pool.
+`generateFreezeGate` in `tests/gpu-parity.ts` pins it the way lever 25's gate does. The frozen arm's
+readback is exactly the last step's logits, `[ctx, vocab]` f32 and nothing else, which is safe to
+assert exactly because no stop token is passed (so the loop always runs to `maxNew`) and the context
+never reaches `maxSeq`. Making `freezeForScoring` a no-op leaves the readback at the full model;
+moving the call after `uploadParams` drops the readback but not the pool.
 
-Still unfixed, and the last instance of this: `pretrain`'s mid-training sample runs `greedyComplete`
-on a model that is genuinely training, so it cannot be frozen and still pays per token. It is
-bounded by `--sample-every` rather than by the run length.
+The arm that compares the generated ids is a **canary, not a guard**. Nothing in the forward reads
+`requiresGrad`: every read is `entryFor`'s buffer choice, `sync()`'s staging decision, or a dW
+dispatch inside a `_backward` closure. So no regression in the freeze can move the text, and that
+assertion cannot be mutation-proved. It is there to catch a future forward-path read of the flag,
+which is a different thing from evidence that this change is safe.
+
+`generate` is the last forward-only COMMAND, but not the last forward-only workload. `pretrain`
+samples once when training is over, two prompts at 60 tokens through the same `greedyComplete`, and
+pays the same cost per token. It can be frozen, contrary to what this lever said first: the sample
+runs after `trainLMGpuResident` returns, and nothing after it reads a gradient. The mechanism there
+is different enough to want its own test, since the parameters already carry full accumulators from
+training, so freezing stops the copy without saving the allocation. That is #66.
 
 ## Quality levers
 

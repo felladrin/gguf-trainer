@@ -23,9 +23,10 @@ async function run(v: Values) {
   const { model, tokenizer } = loadModelFromGGUF(bytes);
   // Generation never runs backward, and greedyComplete syncs once per token, so
   // an unfrozen parameter is a gradient buffer copied back on every one of them.
-  // Here rather than inside greedyComplete: pretrain samples through the same
-  // function mid-run, and freezing is one-way, so it would zero that model's
-  // gradients for the rest of the training.
+  // Here rather than inside greedyComplete: that helper is shared, and pretrain
+  // hands it the model it just trained, on the backend it trained through. An
+  // irreversible mutation of a caller-owned model does not belong in a forward
+  // helper, whether or not it would happen to be safe for today's callers.
   freezeForScoring(model);
 
   const gpu = v.bool("cpu") ? null : await initWebGPU();

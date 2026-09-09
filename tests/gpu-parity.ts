@@ -1512,6 +1512,8 @@ async function generateFreezeGate() {
     const gpu = (await initWebGPU())!;
     const m = new Gemma3Model(cfg, mulberry32(5));
     try {
+      // Before uploadParams on purpose: entryFor sizes the buffer on first use,
+      // so freezing after it stops the copies but keeps the allocation.
       if (freeze) freezeForScoring(m);
       gpu.install();
       gpu.uploadParams(m.params());
@@ -1529,15 +1531,18 @@ async function generateFreezeGate() {
   const hot = await arm(false);
   const cold = await arm(true);
   const paramBytes = hot.paramBytes;
-  // The last sync reads back the last step's logits, [ctx, vocab] f32, and the
-  // context has grown by one token per step already taken.
-  const lastLogits = (prompt.length + maxNew - 1) * cfg.vocabSize * 4;
+  // The last sync reads back the last step's logits, [ctx, vocab] f32: the
+  // context has grown by one token per step already taken, and greedyComplete
+  // trims it to maxSeq. No stop token is passed, so the loop always runs to
+  // maxNew and the count is exact rather than a bound.
+  const lastLogits = Math.min(prompt.length + maxNew - 1, cfg.maxSeq) * cfg.vocabSize * 4;
 
   const wasCopying = hot.readback >= paramBytes;
   const stopped = cold.readback === lastLogits;
   const smaller = cold.pool < hot.pool - 0.9 * paramBytes;
-  // The point of the command is its text, so this is the assertion that would
-  // make the whole change unshippable.
+  // A canary, not a guard: nothing in the forward reads requiresGrad, so no
+  // regression in the freeze can move the text and this cannot be
+  // mutation-proved. It is here to catch a future forward-path read of it.
   const same = hot.ids === cold.ids;
 
   const ok = wasCopying && stopped && smaller && same;
