@@ -205,6 +205,33 @@ async function loadRows(task: Task, limit: number): Promise<Row[]> {
   return rows;
 }
 
+/**
+ * The target index the choice span starts at, measured on the window AFTER
+ * truncation. Deriving it from the untruncated context length instead masks the
+ * wrong span once context plus choice passes maxSeq: the score then covers only
+ * the tail of the choice, or none of it.
+ */
+export function choiceMaskStart(nCtx: number, nChoice: number, maxSeq: number): number {
+  return Math.min(nCtx + nChoice, maxSeq) - nChoice - 1;
+}
+
+/**
+ * Null when the window can score every choice token with at least one token in
+ * front of it to predict the first one from. A negative start means truncation
+ * would eat choice tokens, and a short score is not comparable to a full one:
+ * the summed NLL drops while acc_norm still divides by the whole choice, so the
+ * truncated option wins on a discount it did not earn.
+ */
+export function choiceWindowError(nCtx: number, nChoice: number, maxSeq: number): string | null {
+  if (nChoice < 1) return "a choice rendered to 0 tokens, so there is nothing to score";
+  if (nCtx < 1) return "the stem rendered to 0 tokens, so nothing predicts the first choice token";
+  if (choiceMaskStart(nCtx, nChoice, maxSeq) < 0) {
+    return `a choice takes ${nChoice} tokens and needs one more of context, but this model's ` +
+      `context is ${maxSeq}: scoring it would drop choice tokens and flatter that option`;
+  }
+  return null;
+}
+
 /** Summed negative log-likelihood of `choiceText` given `ctxText`, scored over
  * ONLY the choice tokens. Runs on GPU if `gpu` is installed. */
 async function choiceNLL(
@@ -217,21 +244,34 @@ async function choiceNLL(
 ): Promise<number> {
   const ctxIds = tok.encode(ctxText);
   const chIds = tok.encode(choiceText);
+  const bad = choiceWindowError(ctxIds.length, chIds.length, model.cfg.maxSeq);
+  if (bad) die(`${bad}. The choice reads ${JSON.stringify(choiceText.slice(0, 60))}`);
   const full = [...ctxIds, ...chIds].slice(-model.cfg.maxSeq);
   const inputs = full.slice(0, -1);
   const targets = full.slice(1);
   // Keep only the choice tokens as targets; -1 (ignored) everywhere else. The
-  // first choice token is predicted from the last context token, at targets
-  // index ctxIds.length-1.
-  const firstChoiceTgt = Math.max(0, ctxIds.length - 1);
+  // first choice token is predicted from the token before it, so the boundary
+  // sits one index earlier than the choice does.
+  const firstChoiceTgt = choiceMaskStart(ctxIds.length, chIds.length, model.cfg.maxSeq);
   for (let i = 0; i < firstChoiceTgt; i++) targets[i] = -1;
   const nChoice = targets.length - firstChoiceTgt;
+  // Two invariants the summed NLL rests on, and each catches an edit the other
+  // waves through. The GPU losses count kept rows over the whole targets array
+  // while the kernels sum only inputs.length of them, so a targets array the
+  // mask extended past the end silently divides by too much. And nChoice is
+  // what the mean is multiplied back by, so it has to be the whole choice.
+  if (targets.length !== inputs.length || nChoice !== chIds.length) {
+    throw new Error(
+      `mask does not line up: inputs ${inputs.length}, targets ${targets.length}, ` +
+        `scored ${nChoice} of ${chIds.length} choice tokens`,
+    );
+  }
   // sequenceLoss returns the mean over kept rows, exactly as crossEntropy did,
   // so multiplying by the kept count still recovers the summed NLL whichever
   // path it took.
   const loss = sequenceLoss(model, inputs, targets, lossChunk);
   if (gpu) await gpu.sync([loss]);
-  return loss.data[0] * Math.max(1, nChoice);
+  return loss.data[0] * nChoice;
 }
 
 /**

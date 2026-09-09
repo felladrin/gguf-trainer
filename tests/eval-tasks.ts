@@ -5,6 +5,8 @@
 import {
   argminPerChar,
   attachPiqaLabels,
+  choiceMaskStart,
+  choiceWindowError,
   hellaswagItem,
   hellaswagPreprocess,
   piqaItem,
@@ -152,5 +154,95 @@ ok(argminPerChar([10, 12], ["ab", "abcd"]) === 1, "the longer choice wins on cos
 ok(argminPerChar([10, 12], ["ab", "ab"]) === 0, "equal lengths fall back to the raw sum");
 ok(argminPerChar([5], ["only"]) === 0, "a single choice is the prediction");
 ok(argminPerChar([1, 1], ["", "abcd"]) === 1, "an empty choice does not divide by zero");
+
+// The choice mask. The scored span is the last nChoice targets of the window the
+// model actually sees, so it has to be measured after truncation. Measuring it
+// from the untruncated context length instead scores only the tail of the choice
+// once context plus choice passes maxSeq, and scores none of it once the context
+// alone fills maxSeq, which returns a summed NLL of 0 that wins both metrics.
+ok(choiceMaskStart(20, 10, 512) === 19, "an untruncated window masks the whole context");
+ok(
+  choiceMaskStart(100, 10, 105) === 94,
+  `a partly truncated window keeps all 10 choice tokens, got ${choiceMaskStart(100, 10, 105)}`,
+);
+ok(
+  choiceMaskStart(600, 10, 512) === 501,
+  `a fully truncated context keeps all 10 choice tokens, got ${choiceMaskStart(600, 10, 512)}`,
+);
+
+// The two invariants choiceNLL relies on, over every window shape it accepts:
+// the boundary indexes a real target, and the count it multiplies the mean back
+// by is the whole choice.
+for (const maxSeq of [8, 105, 512]) {
+  for (let nCtx = 1; nCtx <= maxSeq + 40; nCtx += 7) {
+    for (let nChoice = 1; nChoice < maxSeq; nChoice += 3) {
+      if (choiceWindowError(nCtx, nChoice, maxSeq) !== null) continue;
+      const nTargets = Math.min(nCtx + nChoice, maxSeq) - 1; // targets = full.slice(1)
+      const start = choiceMaskStart(nCtx, nChoice, maxSeq);
+      const shape = `ctx ${nCtx}, choice ${nChoice}, maxSeq ${maxSeq}`;
+      ok(
+        start >= 0 && start < nTargets,
+        `the mask boundary stays inside the targets (${shape}): ${start} of ${nTargets}`,
+      );
+      ok(
+        nTargets - start === nChoice,
+        `every choice token is scored (${shape}): ${nTargets - start} of ${nChoice}`,
+      );
+    }
+  }
+}
+
+// Refusing beats scoring a shortened choice: the summed NLL falls while acc_norm
+// keeps dividing by the full character count, so the truncated option wins.
+ok(choiceWindowError(20, 10, 512) === null, "a window that fits is scoreable");
+ok(choiceWindowError(1, 511, 512) === null, "a choice with one token of context to spare fits");
+ok(
+  choiceWindowError(1, 512, 512) !== null,
+  "a choice that fills the context leaves nothing to predict it from",
+);
+ok(choiceWindowError(600, 600, 512) !== null, "a choice longer than the context is refused");
+// Each refusal has to name its own cause. An empty stem reaching the
+// context-length branch reads as "this model's context is 512" when the context
+// is fine and the stem is the problem.
+ok(
+  choiceWindowError(20, 0, 512)?.includes("a choice rendered to 0 tokens") === true,
+  `an empty choice is refused as an empty choice, got ${choiceWindowError(20, 0, 512)}`,
+);
+ok(
+  choiceWindowError(0, 5, 512)?.includes("the stem rendered to 0 tokens") === true,
+  `an empty stem is refused as an empty stem, got ${choiceWindowError(0, 5, 512)}`,
+);
+ok(
+  choiceWindowError(1, 512, 512)?.includes("context is 512") === true,
+  `a choice that fills the context names the context, got ${choiceWindowError(1, 512, 512)}`,
+);
+
+// The composition the two formulas describe: slice the window the way choiceNLL
+// does, run its mask loop, and look at what is left scoreable. The slicing is
+// re-typed here rather than called, so this pins the boundary against the shape
+// it is meant for, not choiceNLL's own three slice lines. Those are pinned at
+// runtime instead, by the invariant throw before sequenceLoss.
+for (const [nCtx, nChoice, maxSeq] of [[20, 10, 512], [100, 10, 105], [600, 10, 512], [1, 7, 8]]) {
+  const shape = `ctx ${nCtx}, choice ${nChoice}, maxSeq ${maxSeq}`;
+  ok(choiceWindowError(nCtx, nChoice, maxSeq) === null, `${shape} is scoreable`);
+  const ids = Array.from({ length: nCtx + nChoice }, (_, i) => i + 1);
+  const full = ids.slice(-maxSeq);
+  const inputs = full.slice(0, -1);
+  const targets = full.slice(1);
+  const start = choiceMaskStart(nCtx, nChoice, maxSeq);
+  for (let i = 0; i < start; i++) targets[i] = -1;
+  ok(
+    targets.length === inputs.length,
+    `the mask does not extend the targets (${shape}): ${targets.length} vs ${inputs.length}`,
+  );
+  ok(
+    targets.filter((t) => t >= 0).length === nChoice,
+    `the kept count is the whole choice (${shape})`,
+  );
+  ok(
+    targets.slice(start).join(",") === ids.slice(-nChoice).join(","),
+    `the scored targets are the choice tokens themselves (${shape})`,
+  );
+}
 
 console.log("eval-tasks: all checks passed");

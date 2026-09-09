@@ -852,6 +852,44 @@ against cpu 27.63. It also capped `eval-loss --cpu`
 at a perplexity of `e^27.63` for a badly mismatched model or tokenizer, which reads as a plausible
 number rather than a saturated one.
 
+### 24. `eval-choice` scored the wrong span once the prompt outgrew the context (2026-09-09)
+
+Found while reviewing #51 and filed as #52. `choiceNLL` truncated the token window to `maxSeq` but
+took the mask boundary from the _untruncated_ context length, so the two disagreed exactly when
+truncation happened:
+
+| ctx | choice | maxSeq | targets | boundary | choice tokens scored |
+| --: | -----: | -----: | ------: | -------: | :------------------- |
+|  20 |     10 |    512 |      29 |       19 | 10 of 10             |
+| 100 |     10 |    105 |     104 |       99 | **5 of 10**          |
+| 600 |     10 |    512 |     511 |      599 | **0 of 10**          |
+
+Partial truncation scored only the tail of the choice. `kept` and the count the mean is multiplied
+back by still agreed, so the summed NLL was self-consistent and merely too small, while `acc_norm`
+kept dividing by the whole choice's character count: a truncated option won on a discount it did
+not earn.
+
+Full truncation was worse. The boundary (599) ran past `targets.length` (511), so the mask loop
+_extended_ the array rather than writing into it, nothing was kept, and `choiceNLL` returned exactly
+0. A summed NLL of zero beats every real one, so that option was always the prediction.
+
+The boundary now comes from the window the model actually sees, `min(nCtx + nChoice, maxSeq) -
+nChoice - 1`, which scores the whole choice at every context length: a prompt that outgrows the
+context is trimmed from the left, so the choice always survives intact and only the oldest context
+goes. Solving `choiceMaskStart < 0` gives the truncation refusals exactly, and they are narrow: a single
+candidate answer at least as long as the model's whole declared context, or a stem that rendered to
+nothing. A choice that itself rendered to nothing is refused by its own branch instead, since it
+never reaches that solution set: it has no tokens to score at all. None of the three is scoreable,
+and a shortened score is not comparable to a full one. `choiceMaskStart` and
+`choiceWindowError` are exported and swept in `tests/eval-tasks.ts` over every window shape the
+command accepts; restoring the old boundary fails them.
+
+**The published numbers are unaffected.** `maxSeq` is the GGUF's declared `context_length`, which
+this repo's exporter sets to `max(8192, seq-len)`, and the Intelligence Index table in lever 9c was
+measured 0-shot, where the longest of these four prompts is a few hundred tokens. The bug needed
+either a foreign base with a short declared context or a large `--shots`: `--shots 10` against a
+512-context checkpoint reaches it.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
