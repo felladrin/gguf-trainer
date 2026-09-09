@@ -27,11 +27,13 @@ import {
   rmsNormHeads,
   rope,
   scale,
+  setCheckpointing,
   silu,
   softCrossEntropy,
   Tensor,
 } from "../src/model/autograd.ts";
-import { Gemma3Model } from "../src/arch/gemma3.ts";
+import { gemma3Config, Gemma3Model } from "../src/arch/gemma3.ts";
+import { getArch } from "../src/model/registry.ts";
 import type { Gemma3Config } from "../src/arch/gemma3.ts";
 import { Muon, newtonSchulz } from "../src/train/muon.ts";
 import { trainLM } from "../src/train/trainer.ts";
@@ -436,7 +438,8 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
   const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
   const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
 
-  const run = async (reclaimTransients: boolean, lossChunk = 0) => {
+  const run = async (reclaimTransients: boolean, lossChunk = 0, recompute = false) => {
+    setCheckpointing(recompute);
     const model = new Gemma3Model(cfg, mulberry32(5));
     const g = model.paramGroups();
     const hist = await trainLMGpuResident(model, gpu, {
@@ -450,6 +453,7 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
       reclaimTransients,
       lossChunk,
     });
+    setCheckpointing(false);
     return { hist, params: model.params() };
   };
 
@@ -523,6 +527,36 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
   console.log(
     `  ${cok ? "ok " : "FAIL"} chunked loss across reclaim boundaries ` +
       `(${steps} steps x ${batchPerStep} micro-batches, chunk 16 over vocab ${cfg.vocabSize})`,
+  );
+
+  // Recompute across the same boundaries. The loss must be BIT-identical, not
+  // merely close: recompute is a deterministic replay of the same ops on the
+  // same inputs, so unlike chunking it reorders nothing, and any drift at all
+  // means a buffer moved under the replay. The memory side of the region
+  // free-list is a separate claim and cannot be seen from here, since a
+  // stranded buffer still produces correct numbers: recomputeMemoryGate.
+  const rcOff = await run(false, 0, true);
+  const rcOn = await run(true, 0, true);
+  let rok = true;
+  for (let i = 0; i < off.hist.length; i++) {
+    for (const [tag, arm] of [["reclaim-off", rcOff], ["reclaim-on", rcOn]] as const) {
+      if (arm.hist[i].loss !== off.hist[i].loss) {
+        console.log(
+          `    MISMATCH recompute ${tag} loss@step${off.hist[i].step}: ` +
+            `${arm.hist[i].loss} vs dense ${off.hist[i].loss}`,
+        );
+        rok = false;
+      }
+    }
+  }
+  for (let i = 0; i < off.params.length; i++) {
+    rok = compare(`recomputeReclaim.param${i}`, rcOn.params[i].data, off.params[i].data, BWD) &&
+      rok;
+  }
+  if (!rok) failures++;
+  console.log(
+    `  ${rok ? "ok " : "FAIL"} recompute across reclaim boundaries ` +
+      `(${steps} steps x ${batchPerStep} micro-batches, bit-identical loss)`,
   );
 }
 
@@ -635,6 +669,8 @@ async function main() {
   await gpuMatmulFdCheck(gpu);
   await profilerSmoke(gpu);
   await fusedCeParity(gpu);
+  await recomputeModelParity(gpu);
+  await recomputeMemoryGate();
   await flatOverflowGate(gpu);
   {
     // Row-per-workgroup 2-D fold: rmsNormHeads with rows = T*H past the cap.
@@ -1213,6 +1249,108 @@ async function qkClipTrajectoryParity(gpu: WebGPUBackend) {
  * If the first sync didn't actually fence, the second sync's copy would race
  * the linear dispatch and either deadlock (invalid pipeline) or read zeros.
  */
+/**
+ * Activation recomputation on the device, over a whole model, against the CPU
+ * reference WITHOUT it. Two things this reaches that the CPU gradcheck cannot:
+ * the region free-list actually handing a released buffer to a later makeOut,
+ * and the device-side gradient seed that carries the accumulated gradient into
+ * the replayed subgraph. Run for all three architectures, since each wraps its
+ * own layer body.
+ */
+async function recomputeModelParity(gpu: WebGPUBackend) {
+  for (const name of ["gemma3", "llama", "qwen3"]) {
+    const arch = getArch(name)!;
+    // deno-lint-ignore no-explicit-any
+    const cfg = arch.tinyConfig(23) as any;
+    const ids = [3, 9, 1, 14, 7, 2], targets = [9, 1, 14, 7, 2, 5];
+
+    const cpu = arch.build(cfg, mulberry32(5));
+    const cpuLoss = crossEntropy(cpu.forward(ids), targets);
+    backward(cpuLoss, 1);
+    const cpuGrads = cpu.params().map((p) => p.grad.slice());
+
+    const model = arch.build(cfg, mulberry32(5));
+    gpu.install();
+    setCheckpointing(true);
+    let ok = true;
+    try {
+      const loss = crossEntropy(model.forward(ids), targets);
+      backward(loss, 1);
+      await gpu.sync([loss]);
+      const dl = Math.abs(loss.data[0] - cpuLoss.data[0]);
+      if (dl > 1e-3 + 1e-3 * Math.abs(cpuLoss.data[0])) {
+        console.log(`    MISMATCH ${name} recompute loss: ${loss.data[0]} vs ${cpuLoss.data[0]}`);
+        ok = false;
+      }
+      const ps = model.params();
+      for (let i = 0; i < ps.length; i++) {
+        ok = compare(`recompute.${name}.dParam${i}`, ps[i].grad, cpuGrads[i], BWD) && ok;
+      }
+    } finally {
+      setCheckpointing(false);
+      gpu.uninstall();
+    }
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${name} recompute vs dense reference ` +
+        `(${model.params().length} param tensors)`,
+    );
+  }
+}
+
+/**
+ * The memory claim, which no correctness test can make: recompute must actually
+ * shrink the pool, and a region buffer that never finds its way back is invisible
+ * to every numeric check because the run stays correct while quietly allocating
+ * around it.
+ *
+ * `residentBytes().pool` only grows, so it is the high-water mark rather than a
+ * snapshot. Measured on this shape: dense 12.3 MB, recompute 7.6 MB (62%). With
+ * the drain in `reclaimStepTransients` removed, recompute rises to 10.0 MB
+ * (81%) while every loss stays identical, which is exactly the failure this
+ * gate exists to see. The 75% threshold sits between those two.
+ */
+async function recomputeMemoryGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const tokens = Array.from({ length: 4096 }, (_, i) => (i * 7 + 3) % cfg.vocabSize);
+  const poolFor = async (recompute: boolean) => {
+    const gpu = (await initWebGPU())!;
+    setCheckpointing(recompute);
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    const g = m.paramGroups();
+    try {
+      await trainLMGpuResident(m, gpu, {
+        tokens,
+        seqLen: 128,
+        steps: 3,
+        batchPerStep: 2,
+        optimizer: new MuonGpu(gpu, g.muon, g.aux, {
+          lr: 0.01,
+          momentum: 0.95,
+          aux: { lr: 3e-3, weightDecay: 0, clip: 1 },
+        }),
+        logEvery: 100,
+        rng: mulberry32(7),
+        reclaimTransients: true,
+      });
+      return gpu.residentBytes().pool;
+    } finally {
+      setCheckpointing(false);
+      gpu.destroy();
+    }
+  };
+  const dense = await poolFor(false);
+  const recomputed = await poolFor(true);
+  const ratio = recomputed / dense;
+  const ok = ratio < 0.75;
+  if (!ok) failures++;
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} recompute shrinks the pool ` +
+      `(${(dense / 1e6).toFixed(1)} MB -> ${(recomputed / 1e6).toFixed(1)} MB, ` +
+      `${(ratio * 100).toFixed(0)}% of dense, must be under 75%)`,
+  );
+}
+
 async function syncFenceGate(gpu: WebGPUBackend) {
   const rng = mulberry32(0xfeed);
   const x = randTensor([8, 16], rng);

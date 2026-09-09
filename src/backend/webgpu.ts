@@ -229,12 +229,17 @@ class BufferPool {
     return this.allocated;
   }
 
+  /** The bucket a request of `bytes` lands in; see acquire for the rounding. */
+  bucketSize(bytes: number): number {
+    return Math.max(256, Math.ceil(bytes / 256) * 256);
+  }
+
   acquire(bytes: number): { buf: GpuBuffer; size: number } {
     // The 256-byte rounding is load-bearing beyond pooling: bind groups pass no
     // offset or size, so a pooled buffer is always bound whole, and the flash
     // attention kernels bind these same buffers as array<vec4<f32>>, which needs
     // the bound size to be a multiple of 16. Do not round this down.
-    const size = Math.max(256, Math.ceil(bytes / 256) * 256);
+    const size = this.bucketSize(bytes);
     const list = this.free.get(size);
     if (list && list.length > 0) return { buf: list.pop()!, size };
     guardBufferSize(size, this.maxBinding);
@@ -306,6 +311,19 @@ export class WebGPUBackend implements OpsBackend {
   private gradKeptOnDevice = new WeakSet<Tensor>();
   private transients: { buf: GpuBuffer; size: number }[] = [];
   private pendingClears: GpuBuffer[] = [];
+  /**
+   * Buffers released by endRegion, reusable ONLY by makeOut.
+   *
+   * Deliberately not returned to the pool. `pool.acquire` also serves
+   * `entryFor`, `uploadU32` and `uploadF32`, and those write with
+   * `queue.writeBuffer`, whose safety argument (see uploadU32) is that the
+   * buffer "was free in the pool until this call" and so cannot appear in an
+   * already-encoded, unsubmitted pass. Recycling a mid-graph buffer through the
+   * pool would falsify that and let a writeBuffer land before the pass that
+   * still reads it. Keeping a separate list that only makeOut draws from makes
+   * that hazard structurally impossible rather than merely argued away.
+   */
+  private regionFree: { buf: GpuBuffer; size: number }[] = [];
   private enc: GpuCommandEncoder | null = null;
   private pass: GpuComputePass | null = null;
   private backwardBegun = false;
@@ -408,6 +426,11 @@ export class WebGPUBackend implements OpsBackend {
     // every transient buffer is idle and safe to recycle.
     for (const tr of this.transients) this.pool.release(tr.size, tr.buf);
     this.transients = [];
+    // Region buffers left unclaimed by a recompute are not in `transients`, so
+    // this is the only place they can rejoin the pool. Without it they strand,
+    // and the next step allocates fresh ones on top.
+    for (const tr of this.regionFree) this.pool.release(tr.size, tr.buf);
+    this.regionFree = [];
     this.touchedExternals.clear();
     this.backwardBegun = false;
 
@@ -450,7 +473,80 @@ export class WebGPUBackend implements OpsBackend {
       else this.pool.release(tr.size, tr.buf);
     }
     this.transients = retained;
+    // Same reasoning as in sync(): onSubmittedWorkDone above proves the GPU is
+    // done, so anything the micro-batch's recompute regions left behind can go
+    // back to the pool rather than stranding until the end of the step.
+    for (const tr of this.regionFree) this.pool.release(tr.size, tr.buf);
+    this.regionFree = [];
     if (this.deviceError) throw new Error(this.deviceError);
+  }
+
+  /**
+   * Open a recompute region. Everything makeOut allocates from here until the
+   * matching endRegion is a candidate for reuse inside the next region.
+   */
+  beginRegion(): number {
+    return this.transients.length;
+  }
+
+  /**
+   * Close the region opened at `mark`: every transient allocated since, except
+   * the buffers behind `keep`, becomes reusable by makeOut.
+   *
+   * No fence. `submit()` is what makes this safe, not a wait: dispatches inside
+   * one compute pass are ordered against each other, so a later dispatch writing
+   * a recycled buffer cannot outrun an earlier one reading it, and submitting
+   * closes the only unordered writer (queue.writeBuffer, which is ordered behind
+   * an already-submitted command buffer). Nothing is destroyed here; the driver
+   * keeps every buffer alive and this only moves entries between JS-side lists.
+   *
+   * Released grad buffers are purged from pendingClears: a buffer handed on as
+   * some later tensor's DATA must not be zeroed by a clear queued when it was a
+   * gradient.
+   */
+  endRegion(mark: number, keep: Tensor[]): void {
+    this.endPass();
+    this.submit();
+    const keepBufs = new Set<GpuBuffer>();
+    for (const t of keep) {
+      const e = this.entries.get(t);
+      if (e) {
+        keepBufs.add(e.data);
+        keepBufs.add(e.grad);
+      }
+    }
+    const retained = this.transients.slice(0, mark);
+    const released = new Set<GpuBuffer>();
+    for (const tr of this.transients.slice(mark)) {
+      if (keepBufs.has(tr.buf)) retained.push(tr);
+      else {
+        this.regionFree.push(tr);
+        released.add(tr.buf);
+      }
+    }
+    this.transients = retained;
+    if (released.size > 0) {
+      this.pendingClears = this.pendingClears.filter((b) => !released.has(b));
+    }
+  }
+
+  /**
+   * Copy one tensor's gradient buffer into another's, on the device. The
+   * recompute in a checkpoint's backward produces a fresh output tensor that
+   * needs the gradient already accumulated on the original. Flushes the clears
+   * first, or the copy would be zeroed by the recomputed tensor's own pending
+   * clear.
+   */
+  seedGradFrom(dst: Tensor, src: Tensor): void {
+    this.ensureBackwardBegun();
+    const ed = this.entries.get(dst), es = this.entries.get(src);
+    if (!ed || !es) throw new Error("seedGradFrom: tensor has no GPU buffers");
+    if (dst.size !== src.size) {
+      throw new Error(`seedGradFrom: size mismatch ${dst.size} vs ${src.size}`);
+    }
+    if (!this.enc) this.enc = this.device.createCommandEncoder();
+    this.endPass();
+    this.enc.copyBufferToBuffer(es.grad, 0, ed.grad, 0, src.size * 4);
   }
 
   /** Free every pooled GPU buffer. The backend is unusable afterwards. */
@@ -1219,8 +1315,8 @@ export class WebGPUBackend implements OpsBackend {
     t._prev = prev;
     const bytes = t.size * 4;
     const e: Entry = {
-      data: this.acquireTransient(bytes),
-      grad: this.acquireTransient(bytes),
+      data: this.acquireRecycled(bytes),
+      grad: this.acquireRecycled(bytes),
       bytes,
       external: false,
       gradNeedsClear: false,
@@ -1234,6 +1330,27 @@ export class WebGPUBackend implements OpsBackend {
 
   private acquirePersistent(bytes: number): GpuBuffer {
     return this.pool.acquire(bytes).buf;
+  }
+
+  /**
+   * The smallest region-released buffer that fits, else a fresh pool
+   * acquisition. Best fit rather than exact: `acquire` already hands out a
+   * rounded-up bucket, so binding a buffer wider than the request is what
+   * every op already does, and accepting one here is the difference between
+   * reusing a block and allocating beside it. Only makeOut calls this (see
+   * regionFree).
+   */
+  private acquireRecycled(bytes: number): GpuBuffer {
+    const want = this.pool.bucketSize(bytes);
+    let best = -1;
+    for (let i = 0; i < this.regionFree.length; i++) {
+      const size = this.regionFree[i].size;
+      if (size >= want && (best < 0 || size < this.regionFree[best].size)) best = i;
+    }
+    if (best < 0) return this.acquireTransient(bytes);
+    const tr = this.regionFree.splice(best, 1)[0];
+    this.transients.push(tr);
+    return tr.buf;
   }
 
   private acquireTransient(bytes: number): GpuBuffer {

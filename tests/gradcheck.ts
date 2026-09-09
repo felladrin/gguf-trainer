@@ -16,6 +16,7 @@ import {
   add,
   attention,
   backward,
+  checkpoint,
   crossEntropy,
   embedding,
   fusedCrossEntropy,
@@ -28,6 +29,7 @@ import {
   rmsNormHeads,
   rope,
   scale,
+  setCheckpointing,
   silu,
   softCrossEntropy,
   Tensor,
@@ -242,6 +244,44 @@ async function main() {
     const logits = randTensor([T, V], rng);
     const targets = [2, 7, 2, 0];
     fdCheck("crossEntropy", [logits], () => crossEntropy(logits, targets));
+  }
+  {
+    // Activation recomputation. Two claims, and the second is the one that
+    // matters: the analytic gradient still matches finite differences THROUGH a
+    // recompute boundary, and enabling it changes nothing. The recompute is a
+    // deterministic replay of the same ops on the same inputs, so "nothing"
+    // means bit-exact, not merely within tolerance.
+    const T = 4, H = 5;
+    const x = randTensor([T, H], rng);
+    const w1 = randTensor([H, H], rng);
+    const w2 = randTensor([H, H], rng);
+    const block = () => silu(linear(linear(x, w1), w2));
+
+    setCheckpointing(true);
+    fdCheck("checkpoint(block)", [x, w1, w2], () => checkpoint([x], block));
+    setCheckpointing(false);
+
+    const grads = (on: boolean) => {
+      setCheckpointing(on);
+      for (const t of [x, w1, w2]) t.zeroGrad();
+      const out = checkpoint([x], block);
+      backwardFrom(out, new Float32Array(out.data.length).fill(1));
+      setCheckpointing(false);
+      return [x, w1, w2].map((t) => t.grad.slice());
+    };
+    const gOff = grads(false), gOn = grads(true);
+    let worst = 0;
+    for (let k = 0; k < gOff.length; k++) {
+      for (let i = 0; i < gOff[k].length; i++) {
+        worst = Math.max(worst, Math.abs(gOff[k][i] - gOn[k][i]));
+      }
+    }
+    const exact = worst === 0;
+    if (!exact) failures++;
+    console.log(
+      `  ${exact ? "ok " : "FAIL"} ${"checkpoint == off".padEnd(24)}        bit-exact grads  ` +
+        `maxAbs=${worst.toExponential(2)}`,
+    );
   }
   {
     // Fused readout + chunked cross-entropy. Both inputs are differentiated,

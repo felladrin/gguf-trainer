@@ -132,6 +132,95 @@ export interface OpsBackend {
   ): Tensor;
 }
 
+/**
+ * Optional backend capability behind `checkpoint()`. Kept off `OpsBackend`,
+ * which is the op set and must be implemented in full: the CPU reference needs
+ * none of this, because dropping the tape is enough for the garbage collector
+ * to reclaim an intermediate. On a device backend it is not, since the buffers
+ * are held by the backend rather than by the tensors.
+ */
+export interface RegionBackend {
+  beginRegion(): number;
+  endRegion(mark: number, keep: Tensor[]): void;
+  seedGradFrom(dst: Tensor, src: Tensor): void;
+}
+
+function regionBackend(): RegionBackend | null {
+  const b = opsBackend as unknown as Partial<RegionBackend> | null;
+  return b && typeof b.beginRegion === "function" ? (b as RegionBackend) : null;
+}
+
+let checkpointing = false;
+
+/**
+ * Turn `checkpoint()` from a passthrough into a recompute boundary. Off by
+ * default, so an architecture can call `checkpoint` unconditionally and a run
+ * that has not asked for it builds exactly the graph it built before.
+ */
+export function setCheckpointing(on: boolean) {
+  checkpointing = on;
+}
+
+export function isCheckpointing(): boolean {
+  return checkpointing;
+}
+
+/**
+ * Run `fn` without keeping its interior, and recompute it in backward.
+ *
+ * Activation memory is the largest term in a training step, and almost all of
+ * it is intermediates that exist only to be read once by their own backward
+ * closure. This trades that for arithmetic: forward keeps the block's output
+ * and throws the rest away, backward replays `fn` to rebuild what it needs.
+ *
+ * `inputs` are the tensors gradients must flow back to. They are excluded from
+ * the replayed subgraph's traversal, so their own backward closures run once,
+ * in the outer graph, rather than once per checkpoint.
+ *
+ * `fn` must be a pure replay: same inputs, same graph, same values. It is
+ * called exactly twice per step, and a hidden dependency on call order (a
+ * captured RNG, a mutated buffer) would make the second call disagree with the
+ * first and corrupt the gradient silently.
+ */
+export function checkpoint(inputs: Tensor[], fn: () => Tensor): Tensor {
+  if (!checkpointing) return fn();
+  const rb = regionBackend();
+
+  const mark = rb ? rb.beginRegion() : 0;
+  const out = fn();
+  // Keeping `out` alive is the whole point: everything else the block allocated
+  // becomes reusable, and the next block's forward draws from it.
+  if (rb) rb.endRegion(mark, [out]);
+
+  // Rewiring the tensor in place, rather than wrapping it, is what drops the
+  // interior: nothing else references those nodes, so they are collectable.
+  out._prev = inputs;
+  out._backward = () => {
+    const mark2 = rb ? rb.beginRegion() : 0;
+    const replay = fn();
+    if (rb) rb.seedGradFrom(replay, out);
+    else replay.grad.set(out.grad);
+
+    // Seeding `seen` with the inputs stops the walk at the block boundary, so
+    // this accumulates INTO their gradients without descending past them.
+    const topo: Tensor[] = [];
+    const seen = new Set<Tensor>(inputs);
+    const build = (t: Tensor) => {
+      if (seen.has(t)) return;
+      seen.add(t);
+      for (const p of t._prev) build(p);
+      topo.push(t);
+    };
+    build(replay);
+    for (let i = topo.length - 1; i >= 0; i--) topo[i]._backward();
+
+    // The replay's interior has been read; release it before the next block
+    // recomputes, or backward peaks at every block's replay at once.
+    if (rb) rb.endRegion(mark2, []);
+  };
+  return out;
+}
+
 let opsBackend: OpsBackend | null = null;
 
 export function setOpsBackend(b: OpsBackend | null) {

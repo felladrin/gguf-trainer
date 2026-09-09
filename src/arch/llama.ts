@@ -24,6 +24,7 @@
 import {
   add,
   attention,
+  checkpoint,
   embedding,
   linear,
   mul,
@@ -185,20 +186,27 @@ export class LlamaModel implements LanguageModel {
     let h = embedding(this.tokenEmbd, ids); // no input scale, unlike Gemma3
 
     for (const L of this.layers) {
-      const n1 = rmsNorm(h, L.attnNorm, c.rmsEps);
-      let q = linear(n1, L.qProj);
-      let k = linear(n1, L.kProj);
-      const v = linear(n1, L.vProj);
-      q = rope(q, T, c.nHeads, c.headDim, c.ropeBase);
-      k = rope(k, T, c.nKVHeads, c.headDim, c.ropeBase);
-      // window 0: full causal attention on every layer.
-      const a = attention(q, k, v, T, c.nHeads, c.nKVHeads, c.headDim, 0);
-      h = add(h, linear(a, L.oProj));
+      // hIn, not h: the closure runs again in backward, long after the loop
+      // variable has moved on to the last layer's output.
+      const hIn = h;
+      h = checkpoint([hIn], () => {
+        let h = hIn;
+        const n1 = rmsNorm(h, L.attnNorm, c.rmsEps);
+        let q = linear(n1, L.qProj);
+        let k = linear(n1, L.kProj);
+        const v = linear(n1, L.vProj);
+        q = rope(q, T, c.nHeads, c.headDim, c.ropeBase);
+        k = rope(k, T, c.nKVHeads, c.headDim, c.ropeBase);
+        // window 0: full causal attention on every layer.
+        const a = attention(q, k, v, T, c.nHeads, c.nKVHeads, c.headDim, 0);
+        h = add(h, linear(a, L.oProj));
 
-      const n2 = rmsNorm(h, L.ffnNorm, c.rmsEps);
-      const g = silu(linear(n2, L.gate)); // SwiGLU, where Gemma3 uses gelu
-      const u = linear(n2, L.up);
-      h = add(h, linear(mul(g, u), L.down));
+        const n2 = rmsNorm(h, L.ffnNorm, c.rmsEps);
+        const g = silu(linear(n2, L.gate)); // SwiGLU, where Gemma3 uses gelu
+        const u = linear(n2, L.up);
+        h = add(h, linear(mul(g, u), L.down));
+        return h;
+      });
     }
 
     return {
