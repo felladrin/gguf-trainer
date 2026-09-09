@@ -24,11 +24,15 @@ export const WRITE_CHUNK_BYTES = 1 << 30;
  * `chunk`. Separated from the I/O so the arithmetic that keeps every call under
  * the boundary can be checked without writing gigabytes.
  */
-export function writeSpans(
+export function chunkSpans(
   total: number,
-  chunk: number = WRITE_CHUNK_BYTES,
+  chunk: number,
 ): { off: number; len: number }[] {
-  if (!(chunk > 0)) throw new Error(`writeSpans: chunk must be positive, got ${chunk}`);
+  // A positive INTEGER: a fractional chunk terminates but hands a caller a
+  // fractional length, and a non-positive one never advances at all.
+  if (!Number.isInteger(chunk) || chunk < 1) {
+    throw new Error(`chunkSpans: chunk must be a positive whole number, got ${chunk}`);
+  }
   const spans: { off: number; len: number }[] = [];
   for (let off = 0; off < total; off += chunk) {
     spans.push({ off, len: Math.min(chunk, total - off) });
@@ -49,7 +53,7 @@ export async function writeFileBytes(
   const fs = await import("node:fs");
   // Spans first: openSync(path, "w") truncates, and an invalid chunk should not
   // cost an existing file before it throws.
-  const spans = writeSpans(data.length, chunk);
+  const spans = chunkSpans(data.length, chunk);
   const fd = fs.openSync(path, "w");
   try {
     for (const { off, len } of spans) {

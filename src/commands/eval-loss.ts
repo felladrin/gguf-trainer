@@ -31,7 +31,7 @@ import {
   lossChunkValueError,
   sequenceLoss,
 } from "../train/loss.ts";
-import { diskTokenSource, tokenBytes } from "../data/tokens.ts";
+import { assertCorpusFitsVocab, diskTokenSource, tokenBytes } from "../data/tokens.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
 import { initWebGPU } from "../backend/webgpu.ts";
@@ -72,6 +72,19 @@ async function run(v: Values) {
   if (hi <= lo) {
     die(`holdout region too small: need > ${seqLen + 1} tokens, have ${src.length - lo}`);
   }
+
+  // Up front, not on whichever window happens to hold the bad id: the whole
+  // score is meaningless if the corpus and the checkpoint disagree. Only over
+  // [lo, length), which is exactly what gets scored, since every window start is
+  // >= lo and every read ends by length. The command's own header describes a
+  // watch loop re-running this every ten minutes against a live run's corpus,
+  // and a full pass over a FineWeb-scale file each time would evict more cache
+  // than it warms.
+  const scanned = assertCorpusFitsVocab(src, cfg.vocabSize, tokensPath, { from: lo });
+  console.log(
+    `Corpus: ${(scanned / 1e6).toFixed(1)}M tokens in the scored region fit vocab ` +
+      `${cfg.vocabSize} ✓`,
+  );
 
   // FIXED windows: seeded once, so every checkpoint is scored on the same tokens.
   const rng = mulberry32(seed);

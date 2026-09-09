@@ -42,7 +42,13 @@ import type { TokenizerData } from "../tokenizer/bpe.ts";
 import { CURRICULUM_SPECIALS } from "../data/chat.ts";
 import { llamaRunScript } from "../export/export-gguf.ts";
 import { wsdSchedule } from "../train/schedule.ts";
-import { diskTokenSource, idArrayFor, tokenBytes, writeTokenFile } from "../data/tokens.ts";
+import {
+  assertCorpusFitsVocab,
+  diskTokenSource,
+  idArrayFor,
+  tokenBytes,
+  writeTokenFile,
+} from "../data/tokens.ts";
 import type { IdArray } from "../data/tokens.ts";
 import type { TokenSource } from "../data/tokens.ts";
 import { parseQuantList } from "../gguf/quantize.ts";
@@ -287,9 +293,14 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   // --- Tokens + tokenizer: pretokenized (.tokens) or raw (.txt) input ---
   let tok: BPETokenizer;
   let src: TokenSource;
+  // The file the source actually reads, which in the .txt branch is the derived
+  // .tokens beside it. An error naming the .txt would send you to retokenize
+  // when the fix is deleting the stale .tokens the branch below reuses.
+  let srcPath: string;
   if (inputPath.endsWith(".tokens")) {
     tok = await siblingTokenizer(inputPath);
     src = await diskTokenSource(inputPath, tokenBytes(tok.vocabSize));
+    srcPath = inputPath;
     console.log(`Tokens: ${inputPath} (${(src.length / 1e6).toFixed(1)}M, pretokenized)`);
   } else {
     const corpus = await readFileText(inputPath).catch(() =>
@@ -305,6 +316,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       await writeTokenFile(tokensPath, encodeCorpus(tok, corpus), bpt);
     }
     src = await diskTokenSource(tokensPath, bpt);
+    srcPath = tokensPath;
   }
   // Instruct/SFT stage (--mask): supervise only the assistant turns, using the
   // mask `chat-corpus` wrote beside the .tokens file. Without it every
@@ -375,6 +387,13 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   // Set before the probe, so the trust gate exercises the graph the run will
   // actually build rather than a different one.
   setCheckpointing(flags.has("recompute"));
+
+  // Before the trust gate, which only reads the first 16 tokens: a .tokens file
+  // built against a different vocab passes that and the run gets tens of
+  // thousands of steps in before some later window happens to hold a high id.
+  // One sequential pass over a file this run is about to read thousands of times.
+  const scanned = assertCorpusFitsVocab(src, cfg.vocabSize, srcPath);
+  console.log(`Vocab fit: ${(scanned / 1e6).toFixed(1)}M tokens under ${cfg.vocabSize} ✓`);
 
   // Trust gate: GPU forward+loss must match the CPU reference at init.
   const probeIn = src.window(0, 16), probeTgt = src.window(1, 16);
@@ -489,6 +508,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const injectFrom = flags.get("injectFrom") ? Number(flags.get("injectFrom")) : cooldownStart;
   if (injectPath) {
     injectSource = await diskTokenSource(injectPath, tokenBytes(tok.vocabSize));
+    assertCorpusFitsVocab(injectSource, cfg.vocabSize, injectPath);
     console.log(
       `Inject: ${injectPath} (${(injectSource.length / 1e6).toFixed(1)}M tokens), ` +
         `frac ${injectFrac} from step ${injectFrom}`,

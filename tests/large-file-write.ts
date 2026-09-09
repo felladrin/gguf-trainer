@@ -25,7 +25,7 @@
 // Run:  deno run -A tests/large-file-write.ts
 //       GGUF_TRAINER_BIG_IO=1 deno run -A tests/large-file-write.ts
 
-import { readFileBytes, WRITE_CHUNK_BYTES, writeFileBytes, writeSpans } from "../src/io.ts";
+import { chunkSpans, readFileBytes, WRITE_CHUNK_BYTES, writeFileBytes } from "../src/io.ts";
 
 // node:fs and node:os rather than the Deno globals: `deno task test:node` runs
 // this file too, and src/io.ts exists precisely to keep the tree runtime-neutral.
@@ -65,7 +65,7 @@ for (
     [2_390_146_560, WRITE_CHUNK_BYTES], // the Qwen3-0.6B f32 export that started this
   ] as [number, number][]
 ) {
-  const spans = writeSpans(total, chunk);
+  const spans = chunkSpans(total, chunk);
   let cursor = 0;
   let contiguous = true;
   let withinLimit = true;
@@ -87,10 +87,22 @@ check(
   `${WRITE_CHUNK_BYTES} < ${2 ** 31}`,
 );
 check(
-  "writeSpans rejects a non-positive chunk",
+  "chunkSpans rejects a non-positive chunk",
   (() => {
     try {
-      writeSpans(10, 0);
+      chunkSpans(10, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  })(),
+);
+
+check(
+  "chunkSpans rejects a fractional chunk",
+  (() => {
+    try {
+      chunkSpans(10, 2.5);
       return false;
     } catch {
       return true;
@@ -101,7 +113,7 @@ check(
 // 2. A real round trip that crosses several chunk boundaries. Small enough to
 //    run anywhere; the point is that the drain loop reassembles the file byte
 //    for byte, including a ragged final span.
-// The chunk argument must actually reach writeSpans. Without this, an edit that
+// The chunk argument must actually reach chunkSpans. Without this, an edit that
 // drops it leaves every round trip below passing on a single span, which is the
 // shape the bug had in the first place.
 {
@@ -114,7 +126,7 @@ check(
   } finally {
     fs.rmSync(path, { force: true });
   }
-  check("writeFileBytes passes its chunk through to writeSpans", threw);
+  check("writeFileBytes passes its chunk through to chunkSpans", threw);
 }
 
 // A 5000-byte write at the default 1 GiB chunk is ONE span, so it would never

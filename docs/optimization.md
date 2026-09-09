@@ -1401,6 +1401,70 @@ like a tightening: `bytes.length < need` cannot become `!==`, since the writer p
 to the file's alignment and the reader slices each one to the next tensor's offset, so `t.data`
 legitimately carries that padding.
 
+### 34. The corpus/vocab mismatch is caught when the file opens, not on the window that hits it (2026-09-09)
+
+Filed as #64 while fixing #55. Levers 26, 29 and 30 made an out-of-range id an explicit error
+instead of a silently wrong loss, which is the right outcome, but they raise it on whichever window
+happens to contain the id. For eval that is fine, a run being minutes. For `pretrain` it is not: the
+trust gate reads only the first 16 tokens, so a `.tokens` file built with the wrong tokenizer passes
+it and the run can be tens of thousands of steps in before some later window holds a high id.
+Everything written up to that point trained on whatever the guards were catching.
+
+`assertCorpusFitsVocab` walks the source once when it opens, and `pretrain` calls it before the trust
+gate rather than after.
+
+`eval-loss` scans only `[lo, length)`, the region it actually scores, which at the default
+`--holdout 0.01` is a hundredth of the file. That is not a micro-optimization: this command's own
+header describes a watch loop re-running it every ten minutes against a live run's corpus, and a full
+sequential pass over a FineWeb-scale file each time would evict more page cache than it warms, while
+the eval itself touches 65,536 tokens.
+
+**It costs almost nothing.** Measured at **310M tokens/s** on this machine, so the 17.4M-token
+`lambrp.tokens` scans in 0.06 s and a FineWeb-scale 10B-token corpus would cost about 32 seconds,
+once, against a run of hours. End to end on `eval-loss --windows 4` over that corpus the difference
+is inside the noise: 17.90 and 17.93 s against `main`'s 17.89 and 17.99 s, and that is with the scan
+narrowed to the scored region.
+
+The mismatched pair from lever 26 now stops in 5.9 s instead of after loading a model and running a
+forward:
+
+```
+data/lambrp-hold.tokens: token 52897 at position 36 is outside [0,49152). The corpus was
+tokenized with a different vocab than the checkpoint; retokenize it with the checkpoint's
+own tokenizer.
+```
+
+It catches a width mismatch in one direction, for free: a 2-byte file read as 4-byte yields ids in
+the hundreds of millions, and one of this repo's own corpora reports `token 205291510 at position 0`
+when read against the wrong vocab. **Not the other direction.** A 4-byte file read as 2-byte passes
+the size check, which is only `% 2`, and every id becomes a half-word, so the count silently doubles
+and every second one reads as 0. Nothing here catches that, and it belongs with the stale-`.tokens`
+class below rather than with what this closes.
+
+`memTokenSource.window` also gained the bounds check `diskTokenSource` always had. Without it a
+window past the end returned `undefined` per token, which the losses refuse as "not an integer" by an
+odd route.
+
+The scan itself is `chunkSpans` from `src/io.ts`, which is `writeSpans` renamed and generalized: it
+already computed exactly this loop and already refused a bad chunk, and reusing it deletes a second
+copy of both. The rename also tightened it to a positive **integer**, since a fractional chunk
+terminates but hands the caller a fractional length. The circularity that removed is worth naming:
+the guard I had written existed only to protect the parameter I had just added, and the version in
+`io.ts` has its own test.
+
+Nine mutations in `tests/large-vocab.ts`, one in `tests/large-file-write.ts`. Two are worth naming:
+the scan stopping after its first chunk is caught only because the chunk size is a parameter, which
+is why it is one; and dropping `from` from the reported position is caught because the `from` case
+asserts an absolute position, which is what a user needs to seek to.
+
+**Still open, and not closed by a range check.** In the `.txt` branch `pretrain` reuses an existing
+`${stem}.tokens` without rewriting it, while `sharedTokenizer` retrains the vocab whenever
+`${stem}.tokenizer.json` is missing. Delete that json and you train on a stale token file built from
+a vocab that no longer exists; this catches it only if the stale ids exceed the new vocab, so a
+same-size or larger vocab passes, and so does any narrower vocab that flips the file's id width, per
+the half-word case above. Closing the class needs tokenizer identity, a hash beside the
+`.tokens`, not a range check.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
