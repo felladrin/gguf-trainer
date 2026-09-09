@@ -376,7 +376,9 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   console.log(
     `Schedule: muon lr ${muonLr}, aux lr ${auxLr}, WSD warmup ${
       Math.round(steps * 0.1)
-    } / cooldown ${Math.round(steps * 0.2)} steps, quant ${quant}`,
+    } / cooldown ${Math.round(steps * 0.2)} steps, quant ${quant}, reclaim ${
+      flags.has("reclaim") ? "on" : "off"
+    }`,
   );
 
   // WSD decay-phase instruct injection (MiniCPM/Xmodel-2 trick): from the cooldown
