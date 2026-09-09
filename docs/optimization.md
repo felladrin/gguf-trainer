@@ -766,8 +766,10 @@ writes without bound. Isolated:
 | 2^31 - 1024 bytes | file matches                                   |
 | 2^31 + 1024 bytes | unbounded write, process killed by `ulimit -f` |
 
-Reads are unaffected: `readFileSync` returns a 2 GiB+ file correctly, so `--resume` was never at
-risk. `writeFileBytes` now writes through an open handle in 1 GiB spans.
+Reads are unaffected on Deno: `readFileSync` returns a 2 GiB+ file correctly, so `--resume` was
+never at risk. Under Node it throws `ERR_FS_FILE_TOO_LARGE` past 2^31 - 1 (measured at both 2.2 GB
+and 4.4 GB on v26.8.1), which no shipped path reaches because the CLI is Deno-only, and which is why
+the large case below skips on Node rather than reporting a failure that is not this defect. `writeFileBytes` now writes through an open handle in 1 GiB spans.
 
 **What it was capping.** An f32 GGUF crosses 2^31 bytes at ~537M parameters, so the two largest
 rows of the readme's own base-model table could not be exported at all: Qwen3-0.6B-Base (2.22 GiB)
@@ -784,7 +786,8 @@ byte-exact round trips at chunk sizes small enough to cross several spans in mil
 the part an edit is likely to break; a 5000-byte write at the production 1 GiB chunk is one span and
 would exercise none of it. The real 4.10 GiB write is behind `GGUF_TRAINER_BIG_IO=1` (~4.6 GB of RAM
 and disk) and runs in a child process under `ulimit -f`, because a regression there does not fail an
-assertion, it runs away: bounded, it dies on SIGXFSZ and the parent reports an ordinary FAIL. What
+assertion, it runs away: bounded, it dies on SIGXFSZ and the parent reports an ordinary FAIL and
+removes the temp directory the killed child could not. What
 no test here can reach is the partial-write drain, since `writeSync` never returns short for a
 regular file.
 

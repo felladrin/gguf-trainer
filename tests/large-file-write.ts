@@ -31,8 +31,12 @@ import { readFileBytes, WRITE_CHUNK_BYTES, writeFileBytes, writeSpans } from "..
 // this file too, and src/io.ts exists precisely to keep the tree runtime-neutral.
 const fs = await import("node:fs");
 const os = await import("node:os");
+// A private directory, not counter-named files in a shared /tmp: those collide
+// between concurrent runs, and a prefix sweep would try to delete other users'
+// leftovers and die on EPERM.
+const tmpDir = fs.mkdtempSync(`${os.tmpdir()}/gguf-trainer-io-`);
 let tmpSeq = 0;
-const tmpPath = () => `${os.tmpdir()}/gguf-trainer-io-${tmpSeq++}.bin`;
+const tmpPath = () => `${tmpDir}/${tmpSeq++}.bin`;
 const envVar = (k: string): string | undefined =>
   // deno-lint-ignore no-explicit-any
   (globalThis as any).Deno?.env?.get(k) ?? (globalThis as any).process?.env?.[k];
@@ -143,9 +147,10 @@ for (
 // not fail an assertion: the write runs away, and unbounded it fills the disk.
 // The child dies on SIGXFSZ instead and the parent reports an ordinary FAIL.
 // `--big-child` is the child re-entering this file to do the write itself.
-// Past 2^31 and 2^32, and above TinyLlama_v1.1's 4.40e9-byte f32 export, which
-// is the largest thing the readme's base-model table can ask this repo to write.
-const BIG_BYTES = 4_400_000_000 + 4096;
+// Past 2^31 and 2^32, and above TinyLlama_v1.1's f32 tensors (1,100,048,384
+// parameters = 4,400,193,536 bytes), which is the largest thing the readme's
+// base-model table can ask this repo to write.
+const BIG_BYTES = 4_401_000_000 + 4096;
 
 async function bigWrite(): Promise<void> {
   const path = tmpPath();
@@ -174,34 +179,48 @@ async function bigWrite(): Promise<void> {
 const argv: string[] = (globalThis as any).Deno?.args ??
   // deno-lint-ignore no-explicit-any
   ((globalThis as any).process?.argv ?? []).slice(2);
+// deno-lint-ignore no-explicit-any
+const isDeno = !!(globalThis as any).Deno;
 
 if (argv.includes("--big-child")) {
   await bigWrite();
-} else if (envVar("GGUF_TRAINER_BIG_IO") === "1") {
+} else if (envVar("GGUF_TRAINER_BIG_IO") !== "1") {
+  console.log("  ..  large-write case skipped (set GGUF_TRAINER_BIG_IO=1 to run it)");
+} else if (!isDeno) {
+  // Node's readFileSync throws ERR_FS_FILE_TOO_LARGE above 2^31 - 1 (measured on
+  // v26.8.1, at 2.2 GB as well as 4.4 GB), so the readback would fail for a
+  // reason that has nothing to do with the defect. A false FAIL is worse than a
+  // skip here, because this wrapper exists so that a FAIL means the write ran
+  // away. The CLI is Deno-only, so nothing real is uncovered.
+  console.log("  ..  large-write case skipped on Node (readFileSync caps at 2^31)");
+} else {
   const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
   // deno-lint-ignore no-explicit-any
   const g = globalThis as any;
-  const self = new URL(import.meta.url).pathname;
-  const cmd = g.Deno
-    ? `${g.Deno.execPath()} run -A ${self} --big-child`
-    : `${g.process.execPath} --experimental-strip-types ${self} --big-child`;
-  // A cap a few GB above the target: enough for the real write, far below a
-  // runaway. Exceeding it kills the child rather than the disk.
-  const r = spawnSync("sh", ["-c", `ulimit -f 12000000; exec ${cmd}`], { stdio: "inherit" });
-  // A killed child never reaches its own `finally`, so it leaves a multi-GB temp
-  // file behind. Sweep them here: that is the failing path, and the point of
-  // this wrapper is that a regression costs no disk.
-  for (const f of fs.readdirSync(os.tmpdir())) {
-    if (f.startsWith("gguf-trainer-io-")) fs.rmSync(`${os.tmpdir()}/${f}`, { force: true });
-  }
+  // fileURLToPath, not URL.pathname: the latter leaves percent-escapes in, so a
+  // checkout under a path with a space would send the child somewhere else.
+  const self = fileURLToPath(import.meta.url);
+  const cmd = [g.Deno.execPath(), "run", "-A", self, "--big-child"];
+  // The command travels in argv via "$@" rather than interpolated into the
+  // script, so quoting never enters into it; the shell is only here for
+  // `ulimit`, which is a builtin. The unit is 512-byte blocks in dash and 1024
+  // in bash, so this caps a runaway at 6.1 GB or 12.3 GB depending on /bin/sh.
+  // Either is far above the ~4.4 GB the real write needs and far below a disk.
+  const r = spawnSync("sh", ["-c", 'ulimit -f 12000000; exec "$@"', "sh", ...cmd], {
+    stdio: "inherit",
+  });
   check(
-    "the >2 GiB case completed inside its file-size limit",
+    "the large-write case completed inside its file-size limit",
     r.status === 0,
     r.status === null ? `killed by ${r.signal}` : `exit ${r.status}`,
   );
-} else {
-  console.log("  ..  large-write case skipped (set GGUF_TRAINER_BIG_IO=1 to run it)");
 }
+
+// Unconditional: a child killed mid-write never reaches its own `finally` and
+// would otherwise leave several GB behind, which is exactly what this wrapper
+// is meant to prevent.
+fs.rmSync(tmpDir, { recursive: true, force: true });
 
 console.log(
   failures === 0 ? "\n=== large-file write checks passed ===" : `\n=== ${failures} FAILURES ===`,

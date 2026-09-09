@@ -7,9 +7,11 @@
  * `fs.writeFileSync(path, data)` does not survive a `data` longer than 2^31
  * bytes on Deno 2.9.1: instead of failing it writes without bound, and a 2.39 GB
  * export grew past 1 TB and filled the disk before anything noticed. Reads are
- * unaffected; `readFileSync` returns a >2 GiB file correctly. 1 GiB leaves the
- * boundary a wide margin: three write calls on a 2.22 GiB Qwen3-0.6B export,
- * five on a 4.10 GiB TinyLlama one.
+ * unaffected on Deno, where `readFileSync` returns a >2 GiB file correctly;
+ * under Node it throws ERR_FS_FILE_TOO_LARGE past 2^31 - 1, which no shipped
+ * path hits because the CLI is Deno-only. 1 GiB leaves the boundary a wide
+ * margin: three write calls on a 2.22 GiB Qwen3-0.6B export, five on a
+ * 4.10 GiB TinyLlama one.
  *
  * This is not hypothetical for the models in the readme's own table: an f32
  * GGUF passes 2^31 bytes at ~537M parameters, so Qwen3-0.6B-Base (2.22 GiB) and
@@ -45,9 +47,12 @@ export async function writeFileBytes(
   chunk: number = WRITE_CHUNK_BYTES,
 ): Promise<void> {
   const fs = await import("node:fs");
+  // Spans first: openSync(path, "w") truncates, and an invalid chunk should not
+  // cost an existing file before it throws.
+  const spans = writeSpans(data.length, chunk);
   const fd = fs.openSync(path, "w");
   try {
-    for (const { off, len } of writeSpans(data.length, chunk)) {
+    for (const { off, len } of spans) {
       // writeSync may satisfy only part of a request, so drain each span. A
       // non-positive return would otherwise spin here forever, silently.
       let done = 0;
