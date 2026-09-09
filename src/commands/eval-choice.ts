@@ -22,7 +22,7 @@
 
 import { readFileBytes } from "../io.ts";
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
-import { crossEntropy } from "../model/autograd.ts";
+import { sequenceLoss } from "../train/loss.ts";
 import type { LanguageModel } from "../model/arch.ts";
 import type { BPETokenizer } from "../tokenizer/bpe.ts";
 import { initWebGPU } from "../backend/webgpu.ts";
@@ -213,6 +213,7 @@ async function choiceNLL(
   gpu: WebGPUBackend | null,
   ctxText: string,
   choiceText: string,
+  lossChunk: number,
 ): Promise<number> {
   const ctxIds = tok.encode(ctxText);
   const chIds = tok.encode(choiceText);
@@ -225,7 +226,10 @@ async function choiceNLL(
   const firstChoiceTgt = Math.max(0, ctxIds.length - 1);
   for (let i = 0; i < firstChoiceTgt; i++) targets[i] = -1;
   const nChoice = targets.length - firstChoiceTgt;
-  const loss = crossEntropy(model.forward(inputs), targets);
+  // sequenceLoss returns the mean over kept rows, exactly as crossEntropy did,
+  // so multiplying by the kept count still recovers the summed NLL whichever
+  // path it took.
+  const loss = sequenceLoss(model, inputs, targets, lossChunk);
   if (gpu) await gpu.sync([loss]);
   return loss.data[0] * Math.max(1, nChoice);
 }
@@ -251,7 +255,16 @@ async function run(v: Values) {
   const useCpu = v.bool("cpu");
 
   console.log(`=== eval-choice: ${taskName} on ${modelPath.split("/").pop()} ===`);
-  const { model, tokenizer: tok } = loadModelFromGGUF(await readFileBytes(modelPath));
+  const { model, tokenizer: tok, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
+  const lossChunk = v.num("loss-chunk");
+  if (!Number.isInteger(lossChunk) || lossChunk < 0) {
+    die(`--loss-chunk must be a whole number, 0 (dense) or positive, got ${lossChunk}`);
+  }
+  if (lossChunk > 0 && !model.forwardToReadout) {
+    // Same stance as pretrain: the only reason to pass the flag is to get past
+    // the binding limit, and a silent dense fallback walks back into it.
+    die(`--loss-chunk needs an architecture with forwardToReadout; ${cfg.arch} has none`);
+  }
 
   let gpu: WebGPUBackend | null = null;
   if (!useCpu) {
@@ -292,7 +305,9 @@ async function run(v: Values) {
         // Score only the choice span: render context without the answer to find
         // the boundary, then score the full render's choice tokens.
         const ctxOnly = task.render(ctx, "").replace(/\s+$/, "");
-        sums.push(await choiceNLL(model, tok, gpu, ctxOnly, full.slice(ctxOnly.length)));
+        sums.push(
+          await choiceNLL(model, tok, gpu, ctxOnly, full.slice(ctxOnly.length), lossChunk),
+        );
       }
       const bestNorm = argminPerChar(sums, it.choices);
       let bestRaw = 0;
@@ -358,6 +373,14 @@ comparable to that board.`,
       type: "number",
       default: 0,
       describe: "few-shot examples prepended to each question",
+    },
+    {
+      name: "loss-chunk",
+      type: "number",
+      default: 0,
+      placeholder: "N",
+      describe:
+        "stream the readout and the loss in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way to score a large-vocab model at long context (0 = dense)",
     },
     { name: "cpu", type: "boolean", describe: "force the CPU forward pass instead of WebGPU" },
   ],

@@ -560,6 +560,14 @@ costs its own pipelines. In the two CE kernels the offset is read in exactly two
 the ceiling nearly free to raise. The GEMM offsets are the harder half, and their byte-identity
 property at `off = 0` is worth keeping, so this is the lever that removes the cap, not a defect.
 
+`eval-loss` and `eval-choice` took the flag later, in the same shape: both build the same
+`crossEntropy(model.forward(...), targets)` and both now call `sequenceLoss`. `eval-choice` needed
+no other change, because it recovers a summed NLL as mean-times-kept-count and the chunked path uses
+the same denominator; `tests/gradcheck.ts` pins that identity on the shape it builds. Measured:
+`eval-loss --seq-len 4096` on a 151936-vocab checkpoint aborts dense and scores with
+`--loss-chunk 8192`, and both commands return identical numbers at seq 512 (val loss 3.6200, and
+piqa acc_norm 60.00% over 30 items).
+
 Not done here: `softCrossEntropy` (the Phase B KL anchor) still materializes `[T,V]` through the
 dense readout, so `--loss-chunk` does not apply to it. Chunking it means fusing the same readout
 into `srcSoftCeFwd`, and the sparse teacher makes the gradient `S·p − q` rather than `p − q`.
@@ -781,7 +789,9 @@ optimizer sidecar would have hit this before the weights did: it is 1504 MB for 
 0.6B run's sidecar is ~3 GB. `chat-corpus` reaches it too, through `writeTokenFile`, past ~537M
 tokens.
 
-The regression test is `tests/large-file-write.ts`. Its cheap half checks the span arithmetic and
+Reported upstream as [denoland/deno#36810](https://github.com/denoland/deno/issues/36810); the
+native `Deno.writeFileSync` handles the same buffer correctly, so it is specific to the `node:fs`
+layer. The regression test is `tests/large-file-write.ts`. Its cheap half checks the span arithmetic and
 byte-exact round trips at chunk sizes small enough to cross several spans in milliseconds, which is
 the part an edit is likely to break; a 5000-byte write at the production 1 GiB chunk is one span and
 would exercise none of it. The real 4.10 GiB write is behind `GGUF_TRAINER_BIG_IO=1` (~4.6 GB of RAM

@@ -301,6 +301,30 @@ async function main() {
     );
   }
   {
+    // The identity eval-choice depends on: it reads the mean over kept rows and
+    // multiplies by that count to recover a summed NLL. That only survives the
+    // chunked path if both denominators are the same count, so pin it on the
+    // shape eval-choice actually builds, an ignored context prefix followed by
+    // the scored choice tokens.
+    const T = 7, H = 5, V = 23;
+    const hid = randTensor([T, H], rng);
+    const w = randTensor([V, H], rng);
+    const targets = [-1, -1, -1, 4, 9, 2, 17];
+    const kept = targets.filter((t) => t >= 0).length;
+    const dense = crossEntropy(linear(hid, w), targets).data[0] * kept;
+    let worst = 0;
+    for (const chunk of [4, 8, 100]) {
+      const fused = fusedCrossEntropy(hid, w, targets, chunk).data[0] * kept;
+      worst = Math.max(worst, Math.abs(dense - fused));
+    }
+    const ok = worst < 1e-5;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"chunked summed NLL".padEnd(24)}        ` +
+        `eval-choice identity, ${kept} kept of ${T}  maxAbs=${worst.toExponential(2)}`,
+    );
+  }
+  {
     // Activation recomputation. Two claims, and the second is the one that
     // matters: the analytic gradient still matches finite differences THROUGH a
     // recompute boundary, and enabling it changes nothing. The recompute is a

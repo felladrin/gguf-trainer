@@ -24,7 +24,8 @@
 
 import { readFileBytes } from "../io.ts";
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
-import { crossEntropy, mulberry32 } from "../model/autograd.ts";
+import { mulberry32 } from "../model/autograd.ts";
+import { sequenceLoss } from "../train/loss.ts";
 import { diskTokenSource, tokenBytes } from "../data/tokens.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -47,6 +48,15 @@ async function run(v: Values) {
 
   const { model, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
   if (seqLen > cfg.maxSeq) die(`--seqLen ${seqLen} exceeds model ctx ${cfg.maxSeq}`);
+  const lossChunk = v.num("loss-chunk");
+  if (!Number.isInteger(lossChunk) || lossChunk < 0) {
+    die(`--loss-chunk must be a whole number, 0 (dense) or positive, got ${lossChunk}`);
+  }
+  if (lossChunk > 0 && !model.forwardToReadout) {
+    // Same stance as pretrain: the only reason to pass the flag is to get past
+    // the binding limit, and a silent dense fallback walks back into it.
+    die(`--loss-chunk needs an architecture with forwardToReadout; ${cfg.arch} has none`);
+  }
 
   const src = await diskTokenSource(tokensPath, tokenBytes(cfg.vocabSize));
   // Held-out region: the last `holdout` fraction of the stream. maxStart leaves
@@ -78,7 +88,7 @@ async function run(v: Values) {
     for (const start of starts) {
       const inputs = src.window(start, seqLen);
       const targets = src.window(start + 1, seqLen);
-      const loss = crossEntropy(model.forward(inputs), targets);
+      const loss = sequenceLoss(model, inputs, targets, lossChunk);
       if (gpu) await gpu.sync([loss]); // recycles this window's transients too
       sum += loss.data[0];
     }
@@ -146,6 +156,14 @@ optimistic; pass a separate token file with --holdout 1 for a true generalizatio
       type: "number",
       default: 1234,
       describe: "window-sampling seed; keep it fixed across checkpoints",
+    },
+    {
+      name: "loss-chunk",
+      type: "number",
+      default: 0,
+      placeholder: "N",
+      describe:
+        "stream the readout and the loss in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way to score a large-vocab model at long context (0 = dense)",
     },
     { name: "cpu", type: "boolean", describe: "force the CPU forward pass instead of WebGPU" },
   ],

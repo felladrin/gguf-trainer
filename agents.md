@@ -91,15 +91,15 @@ Violating any of these wastes a run. They are checked where possible; a few cann
    At vocab 32768 the logits are `T x 32768 x 4` bytes, so 8192 needs 1 GiB and fits an adapter
    that grants its full limit (2 GiB measured); one that falls back to the WebGPU default of
    128 MiB stops at 1024. The error names the buffer.
-   **`--loss-chunk N` removes the CONTEXT half of this cap for training**: it fuses the readout
+   **`--loss-chunk N` removes the CONTEXT half of this cap**: it fuses the readout
    matmul into the loss and streams the vocab N columns at a time, so no buffer scales with
    context and vocab together. The `[vocab, hidden]` readout weight and its gradient survive
    untouched and are the next ceiling: 315 MiB each at vocab 151936 x hidden 544, but 2374 MiB
    at hidden 4096, over the limit again with the flag already on. Measured: qwen3 293M at vocab
    151936 and `--seq-len 4096` aborts on the dense path (2374 MiB against a 2048 MiB limit) and
    trains with `--loss-chunk 8192`. Lever 19.
-   `eval-loss` and `eval-choice` still take the dense path, so a checkpoint trained at a context
-   they cannot score is possible; issue #46.
+   `pretrain`, `finetune`, `eval-loss` and `eval-choice` all take the flag, so a checkpoint can be
+   scored at the context it was trained at.
 
 ## Recipes
 
@@ -290,7 +290,7 @@ the round-trip test automatically: docs/adding-an-architecture.md.
 | NaN loss partway into a run                                                                  | f16 overflow, or a learning rate above 0.01                           | keep compute f32; `--lr 0.01` is the proven ceiling, 0.02 diverged                                                                                                                                                                                                          |
 | a loss far worse than the checkpoint deserves, on a model that still generates readable text | this engine and llama.cpp disagree about the forward pass             | score one file with both before blaming the corpus: `docs/optimization.md` lever 17                                                                                                                                                                                         |
 | OOM at long context                                                                          | the activation pool, ~2.3 MB per token in flight (lever 3)            | add `--recompute` first (activations ~12.1 GB to ~0.8 GB measured alongside `--reclaim`, not instead of it; faster on this host-bound step, expect the textbook ~30% slower on a GPU-bound one: lever 20), then `--reclaim` (lever 3b), then lower `--seq-len` or `--batch` |
-| `GPU storage buffer of N MiB exceeds this device's limit`                                    | a `[seq-len, vocab]` logits buffer past `maxStorageBufferBindingSize` | during training, `--loss-chunk 8192` (lever 19); in `eval-loss`/`eval-choice`, lower `--seq-len` (#46)                                                                                                                                                                      |
+| `GPU storage buffer of N MiB exceeds this device's limit`                                    | a `[seq-len, vocab]` logits buffer past `maxStorageBufferBindingSize` | `--loss-chunk 8192` (lever 19); every command that runs a forward takes it                                                                                                                                                                                                  |
 | an export that never finishes, and a disk filling up                                         | fixed: `writeFileSync` wrote without bound past 2^31 bytes            | `writeFileBytes` chunks under that now; an f32 GGUF crosses it at ~537M params                                                                                                                                                                                              |
 
 ## Hardware reality
