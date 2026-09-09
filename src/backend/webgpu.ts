@@ -938,7 +938,10 @@ export class WebGPUBackend implements OpsBackend {
     out._backward = () => {
       this.ensureBackwardBegun();
       this.curLabel = "embedding";
-      this.dispatch(srcEmbeddingBwd(T, d, V), [idsBuf, eo.grad, ew.grad], ceilDiv(V * d, 256));
+      // Frozen (LoRA base): no accumulator to write, and this dispatch is V*d.
+      if (weight.requiresGrad) {
+        this.dispatch(srcEmbeddingBwd(T, d, V), [idsBuf, eo.grad, ew.grad], ceilDiv(V * d, 256));
+      }
     };
     return out;
   }
@@ -1100,7 +1103,7 @@ export class WebGPUBackend implements OpsBackend {
           g.y,
         );
         this.gemm("NN", true, T, H, vc, chunkBuf, ew.data, eh.grad, v0);
-        this.gemm("TN", true, vc, H, T, chunkBuf, eh.data, ew.grad, v0);
+        if (w.requiresGrad) this.gemm("TN", true, vc, H, T, chunkBuf, eh.data, ew.grad, v0);
       }
     };
     return loss;
@@ -1483,11 +1486,13 @@ export class WebGPUBackend implements OpsBackend {
       this.ensureBackwardBegun();
       this.curLabel = "rmsnorm";
       this.dispatch(srcRmsNormBwdX(rows, d), [ex.data, ew.data, eo.grad, rInv, ex.grad], rows);
-      this.dispatch(
-        srcRmsNormBwdW(rows, d),
-        [ex.data, eo.grad, rInv, ew.grad],
-        ceilDiv(d, 64),
-      );
+      if (weight.requiresGrad) {
+        this.dispatch(
+          srcRmsNormBwdW(rows, d),
+          [ex.data, eo.grad, rInv, ew.grad],
+          ceilDiv(d, 64),
+        );
+      }
     };
     return out;
   }

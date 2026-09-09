@@ -9,12 +9,18 @@
 import { type LoraAdapter, param, setLoraAdapters, Tensor } from "../model/autograd.ts";
 import type { LanguageModel } from "../model/arch.ts";
 
+// Module state mirrors the adapter map in autograd.ts, which has no reader.
+// Guarding on it turns "the second applyLora silently replaced the first" into
+// an error, which matters most in tests where models come and go.
+let adaptersInstalled = false;
+
 export interface LoraHandle {
   /** The trainable tensors, in the split the optimizer expects. */
   groups: { muon: Tensor[]; aux: Tensor[] };
   rank: number;
-  /** Adapted matrices, and the trainable parameter count. */
+  /** Adapted matrices, frozen tensors, and the trainable parameter count. */
   adapted: number;
+  frozen: number;
   trainable: number;
   /** Fold `B*A*scale` into each frozen base. Idempotent with `unmerge`. */
   merge(): void;
@@ -44,10 +50,23 @@ export function applyLora(
   rng: () => number,
 ): LoraHandle {
   if (rank <= 0) throw new Error(`applyLora: rank must be positive, got ${rank}`);
+  if (alpha <= 0) throw new Error(`applyLora: alpha must be positive, got ${alpha}`);
+  if (adaptersInstalled) {
+    throw new Error("applyLora: adapters are already installed; call clearLora() first");
+  }
   const base = model.paramGroups().muon;
   const adapters = new Map<Tensor, LoraAdapter>();
   const aux: Tensor[] = [];
   const scale = alpha / rank;
+
+  // Freeze EVERYTHING the model already had, not just the matrices being
+  // adapted. Embeddings, norms and the readout are dropped from the optimizer
+  // either way; leaving them thawed keeps allocating their gradient
+  // accumulators, dispatching their backward kernels, and (for a tied readout
+  // at a large vocab) staging a several-hundred-MB device-to-host copy every
+  // step for a gradient nothing reads. Freezing them is also the honest
+  // statement of what this trains.
+  for (const t of model.params()) t.requiresGrad = false;
 
   for (const w of base) {
     if (w.shape.length !== 2) continue; // Muon holds only matrices, but do not assume it
@@ -56,11 +75,11 @@ export function applyLora(
     // adapter contributes nothing until it has learned something.
     const a = param([rank, inDim], 1 / Math.sqrt(inDim), rng);
     const b = Tensor.zeros([outDim, rank], true);
-    w.requiresGrad = false;
     adapters.set(w, { a, b, scale });
     aux.push(a, b);
   }
   setLoraAdapters(adapters);
+  adaptersInstalled = true;
 
   const fold = (sign: number) => {
     for (const [w, ad] of adapters) {
@@ -78,6 +97,7 @@ export function applyLora(
   };
 
   return {
+    frozen: model.params().length,
     groups: { muon: [], aux },
     rank,
     adapted: adapters.size,
@@ -90,4 +110,5 @@ export function applyLora(
 /** Detach every adapter, so `linear` goes back to the plain product. */
 export function clearLora() {
   setLoraAdapters(new Map());
+  adaptersInstalled = false;
 }

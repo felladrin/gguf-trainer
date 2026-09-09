@@ -448,6 +448,7 @@ export function rmsNorm(x: Tensor, weight: Tensor, eps: number): Tensor {
     for (let j = 0; j < d; j++) out.data[b + j] = x.data[b + j] * r * weight.data[j];
   }
   out._prev = [x, weight];
+  const wantsDW = weight.requiresGrad; // frozen (LoRA base): nothing accumulates
   out._backward = () => {
     for (let t = 0; t < T; t++) {
       const b = t * d;
@@ -457,7 +458,7 @@ export function rmsNorm(x: Tensor, weight: Tensor, eps: number): Tensor {
       for (let j = 0; j < d; j++) {
         const g = out.grad[b + j];
         x.grad[b + j] += weight.data[j] * r * g - (x.data[b + j] / d) * r * r * r * S;
-        weight.grad[j] += g * x.data[b + j] * r;
+        if (wantsDW) weight.grad[j] += g * x.data[b + j] * r;
       }
     }
   };
@@ -488,6 +489,7 @@ export function rmsNormHeads(
     }
   }
   out._prev = [x, weight];
+  const wantsDW = weight.requiresGrad; // frozen (LoRA base): nothing accumulates
   out._backward = () => {
     for (let t = 0; t < T; t++) {
       for (let h = 0; h < H; h++) {
@@ -498,7 +500,7 @@ export function rmsNormHeads(
         for (let j = 0; j < hd; j++) {
           const g = out.grad[b + j];
           x.grad[b + j] += weight.data[j] * r * g - (x.data[b + j] / hd) * r * r * r * S;
-          weight.grad[j] += g * x.data[b + j] * r;
+          if (wantsDW) weight.grad[j] += g * x.data[b + j] * r;
         }
       }
     }
@@ -518,11 +520,12 @@ export function embedding(weight: Tensor, ids: number[]): Tensor {
     for (let j = 0; j < d; j++) out.data[dst + j] = weight.data[src + j];
   }
   out._prev = [weight];
+  const wantsDW = weight.requiresGrad; // frozen (LoRA base): nothing accumulates
   out._backward = () => {
     for (let t = 0; t < T; t++) {
       const src = ids[t] * d;
       const dst = t * d;
-      for (let j = 0; j < d; j++) weight.grad[src + j] += out.grad[dst + j];
+      if (wantsDW) { for (let j = 0; j < d; j++) weight.grad[src + j] += out.grad[dst + j]; }
     }
   };
   return out;
@@ -804,7 +807,7 @@ export function fusedCrossEntropy(
           const d = scale * (p - (v === targets[t] ? 1 : 0));
           for (let i = 0; i < H; i++) {
             hidden.grad[t * H + i] += d * w.data[v * H + i];
-            w.grad[v * H + i] += d * hidden.data[t * H + i];
+            if (w.requiresGrad) w.grad[v * H + i] += d * hidden.data[t * H + i];
           }
         }
       }

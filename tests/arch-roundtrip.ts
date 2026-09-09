@@ -21,6 +21,7 @@
 import { mulberry32 } from "../src/model/autograd.ts";
 import { ARCHITECTURES } from "../src/model/registry.ts";
 import { loadModelFromGGUF } from "../src/export/load-gguf.ts";
+import { applyLora, clearLora } from "../src/train/lora.ts";
 import { readGGUF } from "../src/gguf/gguf.ts";
 import { resumeFlags } from "../src/commands/inspect.ts";
 import { Values } from "../src/cli/args.ts";
@@ -421,6 +422,60 @@ for (const arch of ARCHITECTURES) {
       localMismatch ?? "returned null",
     );
   }
+}
+
+// LoRA reaches the exported file, at every quant. This covers the mechanism, not
+// the caller: `pretrain` writes the main artifact and each deployment quant from
+// two different call sites, and only one of them merged at first, so a correct
+// .gguf sat next to variants silently holding the pre-LoRA base. That symmetry
+// lives in pretrain.ts and is checked by running it; what is checked here is
+// that a merged export really does carry the adapters and an unmerged one would
+// be visibly the base.
+for (const arch of ARCHITECTURES) {
+  const cfg = arch.tinyConfig(tok.vocabSize);
+  const ids = [3, 9, 1, 14, 7, 2];
+  // deno-lint-ignore no-explicit-any
+  const model = arch.build(cfg as any, mulberry32(5));
+  const baseLogits = Float32Array.from(model.forward(ids).data);
+
+  const h = applyLora(model, 4, 8, mulberry32(99));
+  for (const t of h.groups.aux) for (let i = 0; i < t.data.length; i++) t.data[i] += 0.05;
+  const adapted = Float32Array.from(model.forward(ids).data);
+
+  const exported = (quant: "f32" | "q8_0") => {
+    h.merge();
+    // deno-lint-ignore no-explicit-any
+    const bytes = arch.exportGGUF(model, tok.export(), cfg as any, { quant });
+    h.unmerge();
+    return bytes;
+  };
+  const f32 = exported("f32");
+  clearLora();
+  const reloaded = loadModelFromGGUF(f32).model.forward(ids).data;
+
+  let vsAdapted = 0, vsBase = 0;
+  for (let i = 0; i < adapted.length; i++) {
+    vsAdapted = Math.max(vsAdapted, Math.abs(reloaded[i] - adapted[i]));
+    vsBase = Math.max(vsBase, Math.abs(reloaded[i] - baseLogits[i]));
+  }
+  check(
+    `${arch.name}: an exported LoRA checkpoint reproduces the ADAPTED model`,
+    vsAdapted < 1e-4 && vsBase > 1e-4,
+    `vs adapted ${vsAdapted.toExponential(2)}, vs base ${vsBase.toExponential(2)}`,
+  );
+  // and the quant variant is the same model, not the unmerged base
+  const q8 = exported("q8_0");
+  const q8Logits = loadModelFromGGUF(q8).model.forward(ids).data;
+  let q8VsBase = 0;
+  for (let i = 0; i < adapted.length; i++) {
+    q8VsBase = Math.max(q8VsBase, Math.abs(q8Logits[i] - baseLogits[i]));
+  }
+  check(
+    `${arch.name}: a quant variant carries the adapters too`,
+    q8VsBase > 1e-4,
+    `q8_0 vs base ${q8VsBase.toExponential(2)}`,
+  );
+  clearLora();
 }
 
 console.log(

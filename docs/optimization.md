@@ -625,7 +625,7 @@ with step count (10.9 -> 10.9 MB healthy, 14.4 -> 20.8 MB with the `sync()` drai
 reclaim on it must not grow with micro-batch count (7.6 -> 7.6 MB healthy, 10.0 -> 12.2 MB with the
 `reclaimStepTransients` drain gone). Each deletion was verified to fail its own arm.
 
-### 21. LoRA: the optimizer state goes 71x, the throughput goes the wrong way (2026-09-09)
+### 21. LoRA: the optimizer state goes 71x, the throughput goes down 14% (2026-09-09)
 
 `--lora-rank N` freezes every matrix in the Muon group and trains rank-N adapters beside them.
 Attached in `src/train/lora.ts` off `paramGroups().muon`, which is already exactly the set of 2-D
@@ -638,18 +638,25 @@ Measured on qwen3 293M (vocab 151936), `--seq-len 1024 --batch 1 --reclaim --los
 | mode             | throughput | peak GPU (pool + state) | trainable     |
 | ---------------- | ---------- | ----------------------- | ------------- |
 | full             | 43 tok/s   | 12838 MB (8343 + 4495)  | 293.3M        |
-| `--lora-rank 16` | 30 tok/s   | 7884 MB (7821 + 63)     | 7.90M (2.69%) |
+| `--lora-rank 16` | 37 tok/s   | 7554 MB (7490 + 63)     | 7.90M (2.69%) |
 
 **Optimizer state is the whole story: 4495 MB to 63 MB, 71x.** That term is `16 B/param` for Muon
 matrices and `8 B/param` for aux (lever 19's arithmetic), so it is the one cost that scales purely
-with the trainable count, and the one that dominates at any model worth adapting. The pool moves
-much less: frozen bases give up their gradient buffers (1173 MB) but the adapters add two small
-GEMMs and their activations per projection, netting 522 MB.
+with the trainable count, and the one that dominates at any model worth adapting.
 
-**Throughput drops 30%, and that is the honest cost.** 196 projections become 196 x 3 matmuls plus
-an add and a scale, so a forward records several hundred extra dispatches, and lever 1c's
-host-bound step is exactly where that hurts. LoRA here buys memory, not speed. If the adapters
-were fused into the base GEMM the picture would change, and that is not done.
+**Freeze everything, not just what you adapt.** The first version froze only the matrices being
+adapted and dropped the rest of the parameters from the optimizer without freezing them. They were
+untrained either way, but they kept their gradient accumulators, kept dispatching their backward
+kernels, and, for a tied 151936x1024 readout, kept `sync()` staging a 622 MB device-to-host copy of
+an embedding gradient nothing read, every step, into a staging buffer `residentBytes()` does not
+even count. Freezing the whole non-adapter set moved the measured numbers from 30 to 37 tok/s and
+7884 to 7554 MB, and it is the honest statement of what LoRA trains here: adapters only, with the
+embeddings, norms and readout held fixed.
+
+**Throughput still drops 14%, and that is the real cost.** 196 projections become 196 x 3 matmuls
+plus an add and a scale, so a forward records several hundred extra dispatches into lever 1c's
+host-bound step. LoRA here buys memory, not speed. Fusing the adapter into the base GEMM would
+change that, and is not done.
 
 Three design choices worth recording, because each had an alternative:
 
@@ -669,6 +676,15 @@ jump. Verified: an adapted forward and the base forward agree to the digit befor
 
 `--lora-rank` requires `--resume`. Adapters on a frozen random init are learning against noise, and
 the CLI refuses rather than letting the run discover that overnight.
+
+**A LoRA run neither reads nor writes the optimizer sidecar.** The sidecar holds moments for the
+full parameter set; a LoRA run trains 392 adapters instead, so reading one throws on the count
+mismatch before step 0, which is what `pretrain --resume --lora-rank` did at first (`finetune`
+escaped it only because that mode defaults to a cold optimizer). Beyond the count, a resumed LoRA
+run re-initializes `A` from the seed and `B` to zero while their learned product is already folded
+into the base, so those moments describe a parameterization that no longer exists. It does not
+write one either: a sidecar holding adapter moments beside a merged dense GGUF would break the next
+full fine-tune resuming from that checkpoint.
 
 ## Correctness / robustness
 

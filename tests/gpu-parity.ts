@@ -1428,13 +1428,35 @@ async function loraModelParity(gpu: WebGPUBackend) {
       gpu.uninstall();
     }
 
-    // The freeze: a frozen base must come back from the device with no gradient.
-    let frozen = 0;
-    for (const w of frozenBases) for (const g of w.grad) frozen = Math.max(frozen, Math.abs(g));
-    if (frozen !== 0) {
-      console.log(`    MISMATCH ${name} frozen base gradient ${frozen}`);
+    // The freeze, checked on the DEVICE. Reading `w.grad` on the host proves
+    // nothing: sync() only stages gradients for requiresGrad tensors, so a
+    // frozen base's host array stays zero whatever the kernels did. Two real
+    // properties instead: every frozen base shares ONE buffer (so no full-size
+    // accumulator was allocated for any of them), and zeroing that buffer and
+    // running another backward leaves it zero (so nothing writes through it).
+    // It has to be zeroed first, since a pooled buffer arrives dirty.
+    gpu.install();
+    let sharedStub = true;
+    let stubDirty = 0;
+    try {
+      const bases = model.paramGroups().muon;
+      const stubBuf = gpu.buffersFor(bases[0]).grad;
+      for (const w of bases) if (gpu.buffersFor(w).grad !== stubBuf) sharedStub = false;
+      gpu.writeStateBuffer(stubBuf, new Float32Array(64));
+      const l2 = crossEntropy(model.forward(ids), targets);
+      backward(l2, 1);
+      await gpu.sync([l2]);
+      const stub = await gpu.readStateBuffer(stubBuf, 64);
+      for (const v of stub) stubDirty = Math.max(stubDirty, Math.abs(v));
+    } finally {
+      gpu.uninstall();
+    }
+    if (!sharedStub || stubDirty !== 0) {
+      console.log(`    MISMATCH ${name} freeze: shared=${sharedStub} stub max=${stubDirty}`);
       ok = false;
     }
+    const frozen = stubDirty;
+    void frozenBases;
 
     // merge/unmerge must return the weights bit-close to where they started.
     const snapshot = model.paramGroups().muon.map((w) => w.data.slice());

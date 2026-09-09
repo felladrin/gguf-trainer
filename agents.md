@@ -65,8 +65,10 @@ Violating any of these wastes a run. They are checked where possible; a few cann
    base weights on every export and folded back out afterwards, so the GGUF is an ordinary dense
    checkpoint with the usual tensor names and resuming from it needs no adapter file and no extra
    flag. What it does change is the optimizer sidecar, which shrinks with the trainable count
-   (measured 4495 MB to 63 MB at rank 16 on a 293M qwen3), and throughput, which drops ~30%
-   because each adapted projection becomes three matmuls. Requires `--resume`. Lever 21.
+   (measured 4495 MB to 63 MB at rank 16 on a 293M qwen3), and throughput, which drops ~14%
+   because each adapted projection becomes three matmuls. It trains the adapters only: embeddings,
+   norms and the readout are frozen. Requires `--resume`, and neither reads nor writes an
+   `.optstate` sidecar, because that file describes the full parameter set. Lever 21.
 3. **The optimizer sidecar is `<model>.gguf.optstate`.** Same directory, exact name. Missing means a
    cold optimizer, which re-warms momentum over the first few hundred steps rather than failing.
 4. **Compute is f32.** f16 operands overflow to NaN at these sizes (it reproduced at exactly the
