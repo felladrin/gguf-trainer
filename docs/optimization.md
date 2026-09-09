@@ -567,8 +567,8 @@ the same denominator; `tests/gradcheck.ts` pins that against an independently co
 per-position `-log softmax`, not against either implementation, so a change moving BOTH to a
 different denominator fails it rather than cancelling out. Measured:
 `eval-loss --seq-len 4096` on a 151936-vocab checkpoint aborts dense and scores with
-`--loss-chunk 8192`, and both commands return identical numbers at seq 512 (val loss 3.6200, and
-piqa acc_norm 60.00% over 30 items).
+`--loss-chunk 8192`, and dense and chunked return identical numbers at seq 512 (val loss 3.6200 from
+`eval-loss`, piqa acc_norm 60.00% over 30 items from `eval-choice`).
 
 `generate` is the remaining dense forward: it builds `[T, vocab]` logits and reads only the last
 row, so it hits the same limit at long context and `--loss-chunk` cannot help. It needs a

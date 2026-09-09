@@ -25,7 +25,7 @@
 import { readFileBytes } from "../io.ts";
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
 import { mulberry32 } from "../model/autograd.ts";
-import { checkLossChunkModel, checkLossChunkValue, sequenceLoss } from "../train/loss.ts";
+import { lossChunkModelError, lossChunkValueError, sequenceLoss } from "../train/loss.ts";
 import { diskTokenSource, tokenBytes } from "../data/tokens.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -47,12 +47,12 @@ async function run(v: Values) {
   if (!(holdout > 0 && holdout <= 1)) die(`--holdout must be in (0, 1], got ${holdout}`);
   const lossChunk = v.num("loss-chunk");
   // Before the checkpoint read: a typo'd width should not cost a multi-GB load.
-  const badChunk = checkLossChunkValue(lossChunk);
+  const badChunk = lossChunkValueError(lossChunk);
   if (badChunk) die(badChunk);
 
   const { model, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
   if (seqLen > cfg.maxSeq) die(`--seqLen ${seqLen} exceeds model ctx ${cfg.maxSeq}`);
-  const badForModel = checkLossChunkModel(lossChunk, cfg.vocabSize, cfg.arch, model);
+  const badForModel = lossChunkModelError(lossChunk, cfg.vocabSize, cfg.arch, model);
   if (badForModel) die(badForModel);
 
   const src = await diskTokenSource(tokensPath, tokenBytes(cfg.vocabSize));
@@ -160,7 +160,7 @@ optimistic; pass a separate token file with --holdout 1 for a true generalizatio
       default: 0,
       placeholder: "N",
       describe:
-        "stream the readout and the loss in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way to score a large-vocab model at long context (0 = dense)",
+        "stream the readout and the loss in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way to score a large-vocab model at long context (0 = dense). Pointless with --cpu, where there is no binding limit and the chunked path costs an extra pass over the readout",
     },
     { name: "cpu", type: "boolean", describe: "force the CPU forward pass instead of WebGPU" },
   ],

@@ -2,6 +2,9 @@
 //   - parseQuantList  (src/gguf/quantize.ts): validated, de-duplicated, ordered
 //   - llamaRunScript  (src/export/export-gguf.ts): companion run script
 //   - guardBufferSize (src/backend/webgpu.ts): actionable over-limit error
+//   - lossChunkValueError / lossChunkModelError (src/train/loss.ts): the checks
+//     four commands share, whose entire justification is that they must not
+//     drift between callers
 // These carry the non-trivial logic of the export-ergonomics + OOM-guard work;
 // importing webgpu.ts here is safe (no top-level GPU access).
 // Run:  deno run tests/export-extras.ts
@@ -10,6 +13,8 @@ import { llamaRunScript } from "../src/export/export-gguf.ts";
 import { guardBufferSize } from "../src/backend/webgpu.ts";
 import { gemma3Config } from "../src/arch/gemma3.ts";
 import { stepCheckpointPath } from "../src/commands/pretrain.ts";
+import { lossChunkModelError, lossChunkValueError, MAX_LOSS_SPANS } from "../src/train/loss.ts";
+import type { LanguageModel } from "../src/model/arch.ts";
 
 function eq(got: string, want: string, msg: string): void {
   if (got !== want) throw new Error(`${msg}: got ${got}, want ${want}`);
@@ -72,6 +77,40 @@ for (
   ] as [string, number, string][]
 ) {
   eq(stepCheckpointPath(inp, step), want, `stepCheckpointPath(${inp}, ${step})`);
+}
+
+// --- --loss-chunk validation -------------------------------------------------
+// Four commands take the flag, and the first version of the eval work copied
+// only one of the two checks. The point of the shared pair is that a fifth
+// caller cannot repeat that, so pin both here rather than in a live run.
+{
+  // deno-lint-ignore no-explicit-any
+  const withReadout = { forwardToReadout: () => ({}) } as unknown as LanguageModel;
+  const withoutReadout = {} as unknown as LanguageModel;
+  const V = 151936;
+
+  ok(lossChunkValueError(0) === null, "loss-chunk 0 is the dense path, not an error");
+  ok(lossChunkValueError(8192) === null, "a whole positive width is accepted");
+  ok(`${lossChunkValueError(8192.5)}`.includes("whole number"), "a fractional width is refused");
+  ok(`${lossChunkValueError(-1)}`.includes("whole number"), "a negative width is refused");
+
+  ok(lossChunkModelError(0, V, "qwen3", withoutReadout) === null, "dense needs no readout split");
+  ok(
+    `${lossChunkModelError(8192, V, "qwen3", withoutReadout)}`.includes("forwardToReadout"),
+    "an arch without forwardToReadout is refused, and the message names why",
+  );
+
+  // The ceiling, at the boundary in both directions. 151936/1520 is exactly
+  // MAX_LOSS_SPANS, and the message's raise-to value has to be that same 1520,
+  // or the two arithmetic sites disagree and the advice sends you back here.
+  const exact = Math.ceil(V / MAX_LOSS_SPANS);
+  ok(
+    lossChunkModelError(exact, V, "qwen3", withReadout) === null,
+    `${exact} is exactly at the cap`,
+  );
+  const over = `${lossChunkModelError(exact - 1, V, "qwen3", withReadout)}`;
+  ok(over.includes(`${MAX_LOSS_SPANS + 1} spans`), "one under the cap is refused, counting spans");
+  ok(over.includes(`at least ${exact}`), "and the message's raise-to value is reachable");
 }
 
 console.log("export_extras: all assertions passed");

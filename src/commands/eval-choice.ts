@@ -22,7 +22,7 @@
 
 import { readFileBytes } from "../io.ts";
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
-import { checkLossChunkModel, checkLossChunkValue, sequenceLoss } from "../train/loss.ts";
+import { lossChunkModelError, lossChunkValueError, sequenceLoss } from "../train/loss.ts";
 import type { LanguageModel } from "../model/arch.ts";
 import type { BPETokenizer } from "../tokenizer/bpe.ts";
 import { initWebGPU } from "../backend/webgpu.ts";
@@ -257,10 +257,10 @@ async function run(v: Values) {
   console.log(`=== eval-choice: ${taskName} on ${modelPath.split("/").pop()} ===`);
   const lossChunk = v.num("loss-chunk");
   // Before the checkpoint read: a typo'd width should not cost a multi-GB load.
-  const badChunk = checkLossChunkValue(lossChunk);
+  const badChunk = lossChunkValueError(lossChunk);
   if (badChunk) die(badChunk);
   const { model, tokenizer: tok, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
-  const badForModel = checkLossChunkModel(lossChunk, cfg.vocabSize, cfg.arch, model);
+  const badForModel = lossChunkModelError(lossChunk, cfg.vocabSize, cfg.arch, model);
   if (badForModel) die(badForModel);
 
   let gpu: WebGPUBackend | null = null;
@@ -377,7 +377,7 @@ comparable to that board.`,
       default: 0,
       placeholder: "N",
       describe:
-        "stream the readout and the loss in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way to score a large-vocab model at long context (0 = dense)",
+        "stream the readout and the loss in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way to score a large-vocab model at long context (0 = dense). Pointless with --cpu, where there is no binding limit and the chunked path costs an extra pass over the readout",
     },
     { name: "cpu", type: "boolean", describe: "force the CPU forward pass instead of WebGPU" },
   ],

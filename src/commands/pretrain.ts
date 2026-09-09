@@ -23,7 +23,7 @@
 import { readGGUF } from "../gguf/gguf.ts";
 import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";
 import { lossTrend } from "../loss-trend.ts";
-import { checkLossChunkModel, checkLossChunkValue, sequenceLoss } from "../train/loss.ts";
+import { lossChunkModelError, lossChunkValueError, sequenceLoss } from "../train/loss.ts";
 import { applyLora } from "../train/lora.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
@@ -237,7 +237,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const lossChunk = v.num("loss-chunk");
   // A fractional width would reach WGSL as `const N: u32 = 8192.5u;` and fail as
   // a shader-compile error rather than a usage error.
-  const badChunk = checkLossChunkValue(lossChunk);
+  const badChunk = lossChunkValueError(lossChunk);
   if (badChunk) die(badChunk);
   const resumePath = v.opt("resume");
   const outPath = v.str("out");
@@ -345,7 +345,12 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     console.log(`Resumed weights from ${resumePath} (${g.tensors.length} tensors)`);
   }
 
-  const badForModel = checkLossChunkModel(lossChunk, cfg.vocabSize, arch.name, model);
+  // Both checks run BEFORE the parity probe below, and the shared validator
+  // cannot say why: the span ceiling has to fire before the probe compiles a
+  // pipeline per span on the way to reporting the cost, and the
+  // forwardToReadout check has to fire before the probe compares the dense path
+  // against itself and prints a green line for a path it never ran.
+  const badForModel = lossChunkModelError(lossChunk, cfg.vocabSize, arch.name, model);
   if (badForModel) die(badForModel);
 
   if (loraRank > 0 && !resumePath) {
@@ -404,8 +409,9 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   );
   if (drift > 1e-3 + 1e-3 * Math.abs(cpuLoss)) die("GPU/CPU parity probe failed");
   if (flags.has("recompute") && gpu.regionCount() === 0) {
-    // Matches how --loss-chunk refuses an architecture without forwardToReadout:
-    // the flag would otherwise print "recompute on" and change nothing.
+    // Matches how --loss-chunk refuses an architecture without forwardToReadout
+    // (lossChunkModelError in src/train/loss.ts): the flag would otherwise print
+    // "recompute on" and change nothing.
     die(
       `--recompute needs an architecture whose forward calls checkpoint(); ${arch.name} does not`,
     );
