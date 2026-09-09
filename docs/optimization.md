@@ -876,9 +876,11 @@ _extended_ the array rather than writing into it, nothing was kept, and `choiceN
 The boundary now comes from the window the model actually sees, `min(nCtx + nChoice, maxSeq) -
 nChoice - 1`, which scores the whole choice at every context length: a prompt that outgrows the
 context is trimmed from the left, so the choice always survives intact and only the oldest context
-goes. Solving `choiceMaskStart < 0` gives the refusal set exactly, and it is narrow: a single
+goes. Solving `choiceMaskStart < 0` gives the truncation refusals exactly, and they are narrow: a single
 candidate answer at least as long as the model's whole declared context, or a stem that rendered to
-nothing. Both are unscoreable, and a shortened score is not comparable to a full one. `choiceMaskStart` and
+nothing. A choice that itself rendered to nothing is refused by its own branch instead, since it
+never reaches that solution set: it has no tokens to score at all. None of the three is scoreable,
+and a shortened score is not comparable to a full one. `choiceMaskStart` and
 `choiceWindowError` are exported and swept in `tests/eval-tasks.ts` over every window shape the
 command accepts; restoring the old boundary fails them.
 
