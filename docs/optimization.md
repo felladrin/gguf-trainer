@@ -923,7 +923,8 @@ at the full model; moving it after `uploadParams` drops the readback but not the
 assertion is what pins the ordering.
 
 `generate` has the same defect and pays it per token rather than per window: 40.1% of its wall
-clock on the same checkpoint. It is #58, deliberately not fixed here. Freezing also leaves `sync()`
+clock on the same checkpoint, over two runs. It was #58, fixed in lever 27, where a three-run
+measurement put it at 39.0%. Freezing also leaves `sync()`
 re-queueing the shared stub for clearing once per frozen parameter per window, which is #60 and
 applies to LoRA training as much as to eval.
 
@@ -1006,6 +1007,50 @@ unguarded on both backends (#63), and it is worth knowing about because it fires
 scenario above, measured returning a NaN row on the CPU and a row of zeros on the GPU; and the
 refusal lands mid-run rather than at start-up (#64), which matters for `pretrain`, whose trust gate
 only reads the first 16 tokens.
+
+### 27. `generate` paid lever 25's cost per token, 39% of its wall clock (2026-09-09)
+
+Filed as #58 while fixing #53, which named the two eval commands only. `greedyComplete` syncs once
+per decoded token, and `sync()` stages the gradient of every touched external back to the host, so
+an unfrozen parameter was a whole model of gradients crossing the bus per token rather than per
+window. Nothing in generation runs backward, so those buffers were allocated, never written, and
+copied anyway.
+
+Measured on `littlelamb-base.f32.gguf` (293M f32), 40 tokens from a four-word prompt, three runs
+each on the Strix Halo APU:
+
+|        | wall clock            | completion                                              |
+| ------ | --------------------- | ------------------------------------------------------- |
+| before | 29.17, 30.34, 29.81 s | `, there was a small, red, and fluffy dog named Max...` |
+| after  | 18.19, 18.17, 18.28 s | identical, to the character                             |
+
+Median 29.81 s to 18.19 s, **39.0% faster**, and 46.9 GB of gradient copies that never happen. It is
+the same `freezeForScoring` call lever 25 added, in the same place, and it lands in
+`src/commands/generate.ts` rather than in `greedyComplete`. That helper is shared, and `pretrain`
+hands it the model it just trained on the backend it trained through; an irreversible mutation of a
+caller-owned model does not belong in a forward helper, whether or not it happens to be safe for
+today's callers.
+
+`generateFreezeGate` in `tests/gpu-parity.ts` pins it the way lever 25's gate does. The frozen arm's
+readback is exactly the last step's logits, `[ctx, vocab]` f32 and nothing else. That is safe to
+assert exactly, rather than as a bound, because no stop token is passed, so the loop always runs to
+`maxNew`; the context length carries `greedyComplete`'s own `maxSeq` clamp rather than assuming it
+does not bind. Making `freezeForScoring` a no-op leaves the readback at the full model;
+moving the call after `uploadParams` drops the readback but not the pool.
+
+The arm that compares the generated ids is a **canary, not a guard**. No read of `requiresGrad`
+feeds an output value: each one is `entryFor`'s buffer choice, `sync()`'s staging decision, or a
+gate on a dW accumulation, and that last kind is read in the closure on the GPU path but captured at
+forward time on the CPU one (`const wantsDW = w.requiresGrad`). None of them writes to `out.data`.
+So no regression in the freeze can move the text, and that assertion cannot be mutation-proved. It is there to catch a future forward-path read of the flag,
+which is a different thing from evidence that this change is safe.
+
+`generate` is the last forward-only COMMAND, but not the last forward-only workload. `pretrain`
+samples once when training is over, two prompts at 60 tokens through the same `greedyComplete`, and
+pays the same cost per token. It can be frozen, contrary to what this lever said first: the sample
+runs after `trainLMGpuResident` returns, and nothing after it reads a gradient. The mechanism there
+is different enough to want its own test, since the parameters already carry full accumulators from
+training, so freezing stops the copy without saving the allocation. That is #66.
 
 ## Quality levers
 
