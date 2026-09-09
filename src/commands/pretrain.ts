@@ -24,6 +24,7 @@ import { readGGUF } from "../gguf/gguf.ts";
 import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";
 import { lossTrend } from "../loss-trend.ts";
 import { sequenceLoss } from "../train/loss.ts";
+import { applyLora } from "../train/lora.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
 import { crossEntropy, mulberry32, setCheckpointing } from "../model/autograd.ts";
@@ -230,6 +231,19 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const headDim = v.num("head-dim");
   const startStep = v.num("start-step");
   const quant = v.str("checkpoint-precision") as QuantName;
+  const loraRank = v.num("lora-rank");
+  const loraAlpha = v.num("lora-alpha");
+  if (!Number.isInteger(loraRank) || loraRank < 0) {
+    die(`--lora-rank must be a whole number, 0 (full fine-tune) or positive, got ${loraRank}`);
+  }
+  if (loraRank > 0 && !(loraAlpha > 0)) {
+    // alpha 0 scales every adapter to nothing: the run would train adapters that
+    // cannot affect the loss, and look like it was working.
+    die(`--lora-alpha must be positive, got ${loraAlpha}`);
+  }
+  if (loraRank === 0 && v.given("lora-alpha")) {
+    die("--lora-alpha does nothing without --lora-rank");
+  }
   const lossChunk = v.num("loss-chunk");
   if (!Number.isInteger(lossChunk) || lossChunk < 0) {
     // A fractional width would reach WGSL as `const N: u32 = 8192.5u;` and fail
@@ -362,6 +376,25 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     die(`--loss-chunk needs an architecture with forwardToReadout; ${arch.name} has none`);
   }
 
+  if (loraRank > 0 && !resumePath) {
+    die("--lora-rank needs --resume: adapters on a frozen random init learn against noise");
+  }
+  // Placement matters twice. AFTER the resume has loaded the base weights, so
+  // `B = 0` makes the adapted model exactly the checkpoint at step 0. And BEFORE
+  // the trust gate below: the probe should exercise the graph the run will
+  // build, and the freeze has to be in place before any forward materializes the
+  // weights on device, or entryFor allocates a full-size gradient buffer for
+  // every one of them and the memory win never appears.
+  const lora = loraRank > 0 ? applyLora(model, loraRank, loraAlpha, mulberry32(4321)) : null;
+  if (lora) {
+    const total = arch.paramCount(cfg);
+    console.log(
+      `LoRA: rank ${loraRank}, alpha ${loraAlpha} over ${lora.adapted} projections, ` +
+        `${(lora.trainable / 1e6).toFixed(2)}M trainable of ${(total / 1e6).toFixed(1)}M ` +
+        `(${(100 * lora.trainable / total).toFixed(2)}%); ${lora.frozen} tensors frozen, ` +
+        `including the embeddings, norms and readout. Merged into the weights on export`,
+    );
+  }
   // Set before the probe, so the trust gate exercises the graph the run will
   // actually build rather than a different one.
   setCheckpointing(flags.has("recompute"));
@@ -415,7 +448,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     if (fdrift > 1e-3 + 1e-3 * Math.abs(gpuLoss)) die("chunked/dense loss probe failed");
   }
 
-  const groups = model.paramGroups();
+  const groups = lora ? lora.groups : model.paramGroups();
   const opt = new MuonGpu(gpu, groups.muon, groups.aux, {
     lr: muonLr,
     momentum: 0.95,
@@ -424,7 +457,15 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   // Restore optimizer state (Muon momentum + Adam moments + step) if a sidecar
   // sits next to the resume checkpoint: a warm resume instead of a cold restart.
   // Absent (e.g. a weights-only checkpoint) -> cold optimizer, exactly as before.
-  if (resumePath && !flags.has("coldOpt")) {
+  if (resumePath && lora) {
+    // The sidecar beside a checkpoint holds moments for the FULL parameter set,
+    // and this run trains 392 adapters instead. Beyond the count mismatch, a
+    // resumed LoRA run re-initializes A from the seed and B to zero while their
+    // learned product is already folded into the base, so those moments describe
+    // a parameterization that no longer exists. Cold both ways: see below for
+    // why no sidecar is written either.
+    console.log(`--lora-rank: ignoring any optimizer state (it belongs to the full parameter set)`);
+  } else if (resumePath && !flags.has("coldOpt")) {
     const optPath = `${resumePath}.optstate`;
     if (await fileExists(optPath)) {
       opt.importState(deserializeOptState(await readFileBytes(optPath)));
@@ -451,6 +492,10 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       flags.has("reclaim") ? "on" : "off"
     }, loss ${lossChunk > 0 ? `chunked x${lossChunk} (${lossSpans} spans)` : "dense"}, recompute ${
       flags.has("recompute") ? "on" : "off"
+    }, ${
+      loraRank > 0
+        ? `lora r${loraRank} a${loraAlpha} (adapters train at aux lr; muon lr is inert)`
+        : "full fine-tune"
     }`,
   );
 
@@ -481,17 +526,43 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     ? await readFileText(templatePath).catch(() => die(`cannot read --template ${templatePath}`))
     : undefined;
   if (chatTemplate) console.log(`Chat template: ${templatePath} (embedded in every export)`);
+  const optStatePath = `${outPath}.optstate`;
   const exportGGUF = async (): Promise<Uint8Array> => {
-    const b = arch.exportGGUF(model, tok.export(), cfg, { quant, name, chatTemplate });
+    // Fold the adapters in, write an ordinary dense checkpoint, fold them back
+    // out. Every checkpoint this run writes loads in llama.cpp with no adapter
+    // file beside it, and the run keeps training from where it was.
+    lora?.merge();
+    let b: Uint8Array;
+    try {
+      b = arch.exportGGUF(model, tok.export(), cfg, { quant, name, chatTemplate });
+    } finally {
+      lora?.unmerge(); // an export that throws must not leave the fold applied
+    }
     await writeFileBytes(`${outPath}.tmp`, b);
     const fs = await import("node:fs");
     fs.renameSync(`${outPath}.tmp`, outPath);
+    if (lora && fs.existsSync(optStatePath)) {
+      // Coupled to the rename, which is the event that invalidates the file: a
+      // sidecar beside a GGUF this run just rewrote is stale by construction.
+      // Deleting it at startup instead would destroy a valid, matching sidecar
+      // if the run died before its first checkpoint, and these files are
+      // sometimes hand-placed (agents.md, the publish recipe). Not written by a
+      // LoRA run either, so this only ever removes one an earlier run left.
+      // Gated on existence rather than on a once-flag so the log cannot claim a
+      // removal that did not happen; `force` is for the usual case of no file.
+      fs.rmSync(optStatePath, { force: true });
+      console.log(`Removed ${optStatePath.split("/").pop()} (stale: the weights were rewritten)`);
+    }
     return b;
   };
   // Optimizer-state sidecar next to the GGUF, so a resume continues with a warm
   // optimizer (Muon momentum + Adam moments) instead of cold-starting. Atomic.
-  const optStatePath = `${outPath}.optstate`;
   const writeOptState = async (): Promise<number> => {
+    // A LoRA run must not leave a sidecar: it would hold adapter moments beside
+    // a merged dense GGUF, and the next full fine-tune resuming from that
+    // checkpoint would find a sidecar for a parameter set that is not its own.
+    // Both directions of the mismatch are closed by simply not writing one.
+    if (lora) return 0;
     const bytes = serializeOptState(await opt.exportState());
     await writeFileBytes(`${optStatePath}.tmp`, bytes);
     (await import("node:fs")).renameSync(`${optStatePath}.tmp`, optStatePath);
@@ -556,7 +627,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       const rate = localStep / Math.max(1, el);
       console.log(
         `  [ckpt @ ${step}] ${outPath.split("/").pop()} ${(b.length / 1e6).toFixed(0)}MB ` +
-          `+ optstate ${(optBytes / 1e6).toFixed(0)}MB, ` +
+          `${lora ? "(no optstate: lora)" : `+ optstate ${(optBytes / 1e6).toFixed(0)}MB`}, ` +
           `loss ${lastLoss.toFixed(3)}, ${rate.toFixed(3)} st/s, eta ${
             fmtEta((steps - step) / rate)
           }, mem ${mem()}`,
@@ -604,8 +675,9 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   if (wroteArch !== arch.name) die(`exported arch ${wroteArch} != ${arch.name}`);
   console.log(
     `\nWrote ${outPath} (${(bytes.length / 1e6).toFixed(0)} MB, ${g.tensors.length} tensors, ` +
-      `${arch.name} ✓, ctx ${cfg.maxSeq}) + ${optStatePath.split("/").pop()} ` +
-      `(${(optBytes / 1e6).toFixed(0)} MB). Next stage resumes with --resume.`,
+      `${arch.name} ✓, ctx ${cfg.maxSeq})${
+        lora ? "" : ` + ${optStatePath.split("/").pop()} (${(optBytes / 1e6).toFixed(0)} MB)`
+      }. Next stage resumes with --resume.`,
   );
 
   // Companion run script + optional deployment-quant copies, so the step after
@@ -619,7 +691,13 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   for (const eq of exportQuants) {
     if (eq === quant) continue; // already the main artifact
     const variantPath = outPath.replace(/\.gguf$/i, `.${eq.toUpperCase()}.gguf`);
-    const vb = arch.exportGGUF(model, tok.export(), cfg, { quant: eq, name, chatTemplate });
+    lora?.merge(); // same fold as the main artifact: a quant variant is not a different model
+    let vb: Uint8Array;
+    try {
+      vb = arch.exportGGUF(model, tok.export(), cfg, { quant: eq, name, chatTemplate });
+    } finally {
+      lora?.unmerge();
+    }
     await writeFileBytes(variantPath, vb);
     console.log(
       `Wrote ${variantPath.split("/").pop()} (${(vb.length / 1e6).toFixed(0)} MB, ${eq})`,
@@ -749,6 +827,21 @@ const SHARED_FLAGS: Flag[] = [
     type: "boolean",
     describe:
       "free each micro-batch's activations at the micro-batch boundary: 5.6x less peak GPU memory for 23% less throughput (measured), and the way to fit batch>=2 at long context on a small GPU",
+  },
+  {
+    name: "lora-rank",
+    type: "number",
+    placeholder: "N",
+    default: 0,
+    describe:
+      "train rank-N LoRA adapters on the hidden projections and freeze everything else, including the embeddings, norms and readout, instead of full fine-tuning (0 = full). Adapters train at --aux-lr and are merged into the weights on export, so the GGUF stays an ordinary dense checkpoint",
+  },
+  {
+    name: "lora-alpha",
+    type: "number",
+    placeholder: "A",
+    default: 16,
+    describe: "LoRA scaling numerator; the update is (alpha/rank) * B*A",
   },
   {
     name: "recompute",

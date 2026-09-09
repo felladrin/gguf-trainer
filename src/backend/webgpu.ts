@@ -325,6 +325,7 @@ export class WebGPUBackend implements OpsBackend {
    */
   private regionFree: { buf: GpuBuffer; size: number }[] = [];
   private regionsOpened = 0;
+  private frozenStub: GpuBuffer | null = null;
   private enc: GpuCommandEncoder | null = null;
   private pass: GpuComputePass | null = null;
   private backwardBegun = false;
@@ -732,7 +733,10 @@ export class WebGPUBackend implements OpsBackend {
       this.ensureBackwardBegun();
       this.curLabel = "linear";
       this.gemm("NN", true, T, inDim, outDim, eo.grad, ew.data, ex.grad);
-      this.gemm("TN", true, outDim, inDim, T, eo.grad, ex.data, ew.grad);
+      // A frozen weight (LoRA base) has no gradient to accumulate, and this is
+      // the larger of the two products: skipping it saves the write and the
+      // work, and is why entryFor can hand frozen externals a shared stub.
+      if (w.requiresGrad) this.gemm("TN", true, outDim, inDim, T, eo.grad, ex.data, ew.grad);
     };
     return out;
   }
@@ -934,7 +938,10 @@ export class WebGPUBackend implements OpsBackend {
     out._backward = () => {
       this.ensureBackwardBegun();
       this.curLabel = "embedding";
-      this.dispatch(srcEmbeddingBwd(T, d, V), [idsBuf, eo.grad, ew.grad], ceilDiv(V * d, 256));
+      // Frozen (LoRA base): no accumulator to write, and this dispatch is V*d.
+      if (weight.requiresGrad) {
+        this.dispatch(srcEmbeddingBwd(T, d, V), [idsBuf, eo.grad, ew.grad], ceilDiv(V * d, 256));
+      }
     };
     return out;
   }
@@ -1096,7 +1103,7 @@ export class WebGPUBackend implements OpsBackend {
           g.y,
         );
         this.gemm("NN", true, T, H, vc, chunkBuf, ew.data, eh.grad, v0);
-        this.gemm("TN", true, vc, H, T, chunkBuf, eh.data, ew.grad, v0);
+        if (w.requiresGrad) this.gemm("TN", true, vc, H, T, chunkBuf, eh.data, ew.grad, v0);
       }
     };
     return loss;
@@ -1338,12 +1345,16 @@ export class WebGPUBackend implements OpsBackend {
       // (parameter or test input): upload its host data and give it a
       // persistent gradient accumulator.
       const bytes = t.size * 4;
+      // A frozen external never has a gradient written to it (every op that
+      // would guards on requiresGrad), so it shares one small stub instead of a
+      // full-size accumulator. At LoRA rank 16 on a 293M model that is the
+      // difference between 1.2 GB of gradient buffers and none.
       e = {
         data: this.acquirePersistent(bytes),
-        grad: this.acquirePersistent(bytes),
+        grad: t.requiresGrad ? this.acquirePersistent(bytes) : this.frozenGradStub(),
         bytes,
         external: true,
-        gradNeedsClear: true, // pool buffers arrive dirty
+        gradNeedsClear: t.requiresGrad, // pool buffers arrive dirty
       };
       this.entries.set(t, e);
       this.queue.writeBuffer(e.data, 0, t.data);
@@ -1379,6 +1390,16 @@ export class WebGPUBackend implements OpsBackend {
     this.pendingClears.push(e.grad);
     this.entries.set(t, e);
     return { t, e };
+  }
+
+  /**
+   * One shared, never-read gradient buffer for frozen externals. Bound where an
+   * `Entry.grad` is structurally required but nothing writes it; sharing is safe
+   * precisely because nothing writes it.
+   */
+  private frozenGradStub(): GpuBuffer {
+    if (!this.frozenStub) this.frozenStub = this.acquirePersistent(256);
+    return this.frozenStub;
   }
 
   private acquirePersistent(bytes: number): GpuBuffer {
@@ -1465,11 +1486,13 @@ export class WebGPUBackend implements OpsBackend {
       this.ensureBackwardBegun();
       this.curLabel = "rmsnorm";
       this.dispatch(srcRmsNormBwdX(rows, d), [ex.data, ew.data, eo.grad, rInv, ex.grad], rows);
-      this.dispatch(
-        srcRmsNormBwdW(rows, d),
-        [ex.data, eo.grad, rInv, ew.grad],
-        ceilDiv(d, 64),
-      );
+      if (weight.requiresGrad) {
+        this.dispatch(
+          srcRmsNormBwdW(rows, d),
+          [ex.data, eo.grad, rInv, ew.grad],
+          ceilDiv(d, 64),
+        );
+      }
     };
     return out;
   }

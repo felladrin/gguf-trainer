@@ -269,7 +269,42 @@ export function setOpsBackend(b: OpsBackend | null) {
 // ---------------------------------------------------------------------------
 
 /** y = x · Wᵀ, where x:[T,in], W:[out,in] -> y:[T,out]. (Linear, no bias.) */
+/**
+ * A LoRA adapter for one frozen weight: `W + (alpha/rank) * B*A`, with
+ * `A: [rank, in]` and `B: [out, rank]`.
+ */
+export interface LoraAdapter {
+  a: Tensor;
+  b: Tensor;
+  scale: number;
+}
+
+let loraAdapters: Map<Tensor, LoraAdapter> = new Map();
+
+/**
+ * Route `linear` through low-rank adapters for the listed weights.
+ *
+ * Registering here rather than in the architectures is what keeps adapters
+ * arch-agnostic: `linear` is the one call every projection already goes
+ * through, so nothing in `src/arch/` changes and a new architecture gets LoRA
+ * without knowing it exists. Pass an empty map to go back to full fine-tuning.
+ */
+export function setLoraAdapters(m: Map<Tensor, LoraAdapter>) {
+  loraAdapters = m;
+}
+
+/** y = x · Wᵀ, plus the low-rank update when `w` carries an adapter. */
 export function linear(x: Tensor, w: Tensor): Tensor {
+  if (loraAdapters.size > 0) {
+    const ad = loraAdapters.get(w);
+    // B·A·x rather than (B·A)·x: the point of the factorization is never
+    // materializing the [out, in] product.
+    if (ad) return add(linearRaw(x, w), scale(linearRaw(linearRaw(x, ad.a), ad.b), ad.scale));
+  }
+  return linearRaw(x, w);
+}
+
+function linearRaw(x: Tensor, w: Tensor): Tensor {
   if (opsBackend) return opsBackend.linear(x, w);
   const [T, inDim] = x.shape;
   const [outDim, inDim2] = w.shape;
@@ -285,6 +320,7 @@ export function linear(x: Tensor, w: Tensor): Tensor {
     }
   }
   out._prev = [x, w];
+  const wantsDW = w.requiresGrad; // a frozen LoRA base accumulates nothing
   out._backward = () => {
     for (let t = 0; t < T; t++) {
       for (let o = 0; o < outDim; o++) {
@@ -292,9 +328,13 @@ export function linear(x: Tensor, w: Tensor): Tensor {
         if (g === 0) continue;
         const xb = t * inDim;
         const wb = o * inDim;
-        for (let i = 0; i < inDim; i++) {
-          x.grad[xb + i] += g * w.data[wb + i];
-          w.grad[wb + i] += g * x.data[xb + i];
+        if (wantsDW) {
+          for (let i = 0; i < inDim; i++) {
+            x.grad[xb + i] += g * w.data[wb + i];
+            w.grad[wb + i] += g * x.data[xb + i];
+          }
+        } else {
+          for (let i = 0; i < inDim; i++) x.grad[xb + i] += g * w.data[wb + i];
         }
       }
     }
@@ -408,6 +448,7 @@ export function rmsNorm(x: Tensor, weight: Tensor, eps: number): Tensor {
     for (let j = 0; j < d; j++) out.data[b + j] = x.data[b + j] * r * weight.data[j];
   }
   out._prev = [x, weight];
+  const wantsDW = weight.requiresGrad; // frozen (LoRA base): nothing accumulates
   out._backward = () => {
     for (let t = 0; t < T; t++) {
       const b = t * d;
@@ -417,7 +458,7 @@ export function rmsNorm(x: Tensor, weight: Tensor, eps: number): Tensor {
       for (let j = 0; j < d; j++) {
         const g = out.grad[b + j];
         x.grad[b + j] += weight.data[j] * r * g - (x.data[b + j] / d) * r * r * r * S;
-        weight.grad[j] += g * x.data[b + j] * r;
+        if (wantsDW) weight.grad[j] += g * x.data[b + j] * r;
       }
     }
   };
@@ -448,6 +489,7 @@ export function rmsNormHeads(
     }
   }
   out._prev = [x, weight];
+  const wantsDW = weight.requiresGrad; // frozen (LoRA base): nothing accumulates
   out._backward = () => {
     for (let t = 0; t < T; t++) {
       for (let h = 0; h < H; h++) {
@@ -458,7 +500,7 @@ export function rmsNormHeads(
         for (let j = 0; j < hd; j++) {
           const g = out.grad[b + j];
           x.grad[b + j] += weight.data[j] * r * g - (x.data[b + j] / hd) * r * r * r * S;
-          weight.grad[j] += g * x.data[b + j] * r;
+          if (wantsDW) weight.grad[j] += g * x.data[b + j] * r;
         }
       }
     }
@@ -478,11 +520,12 @@ export function embedding(weight: Tensor, ids: number[]): Tensor {
     for (let j = 0; j < d; j++) out.data[dst + j] = weight.data[src + j];
   }
   out._prev = [weight];
+  const wantsDW = weight.requiresGrad; // frozen (LoRA base): nothing accumulates
   out._backward = () => {
     for (let t = 0; t < T; t++) {
       const src = ids[t] * d;
       const dst = t * d;
-      for (let j = 0; j < d; j++) weight.grad[src + j] += out.grad[dst + j];
+      if (wantsDW) { for (let j = 0; j < d; j++) weight.grad[src + j] += out.grad[dst + j]; }
     }
   };
   return out;
@@ -708,11 +751,25 @@ export function fusedCrossEntropy(
   targets: number[],
   chunk: number,
 ): Tensor {
-  if (opsBackend) return opsBackend.fusedCrossEntropy(hidden, w, targets, chunk);
+  // Validated ABOVE the backend dispatch, or these run on the CPU reference only
+  // and every real run installs the GPU backend first.
   const [T, H] = hidden.shape;
   const [V, H2] = w.shape;
   if (H !== H2) throw new Error(`fusedCrossEntropy dim mismatch ${H} vs ${H2}`);
   if (chunk <= 0) throw new Error(`fusedCrossEntropy chunk must be positive, got ${chunk}`);
+  // Adapters live inside `linear`, and this path deliberately does not go
+  // through it. An adapted readout would therefore be adapted in the dense
+  // forward and unadapted here, i.e. in training: a silent divergence between
+  // what the trust gate checks and what the run optimizes. It holds today only
+  // because all three architectures put the readout in the aux group, which is
+  // a convention, not a guarantee.
+  if (loraAdapters.has(w)) {
+    throw new Error(
+      "fusedCrossEntropy: the readout weight carries a LoRA adapter, which this " +
+        "path cannot apply. Put the readout in the aux param group, or use --loss-chunk 0.",
+    );
+  }
+  if (opsBackend) return opsBackend.fusedCrossEntropy(hidden, w, targets, chunk);
   const loss = Tensor.zeros([1]);
 
   // Online softmax over the chunked vocab: a chunk whose maximum beats the
@@ -764,7 +821,7 @@ export function fusedCrossEntropy(
           const d = scale * (p - (v === targets[t] ? 1 : 0));
           for (let i = 0; i < H; i++) {
             hidden.grad[t * H + i] += d * w.data[v * H + i];
-            w.grad[v * H + i] += d * hidden.data[t * H + i];
+            if (w.requiresGrad) w.grad[v * H + i] += d * hidden.data[t * H + i];
           }
         }
       }

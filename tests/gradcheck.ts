@@ -30,6 +30,7 @@ import {
   rope,
   scale,
   setCheckpointing,
+  setLoraAdapters,
   silu,
   softCrossEntropy,
   Tensor,
@@ -244,6 +245,60 @@ async function main() {
     const logits = randTensor([T, V], rng);
     const targets = [2, 7, 2, 0];
     fdCheck("crossEntropy", [logits], () => crossEntropy(logits, targets));
+  }
+  {
+    // LoRA. Four claims: the adapted product is what the factorization says it
+    // is, the gradient reaches A and B, the frozen base gets NOTHING (which is
+    // what lets the backend skip its gradient buffer entirely), and merging the
+    // adapters into the base reproduces the adapted function exactly.
+    const T = 4, inDim = 5, outDim = 6, rank = 2, alpha = 4;
+    const x = randTensor([T, inDim], rng);
+    const w = randTensor([outDim, inDim], rng);
+    const a = randTensor([rank, inDim], rng);
+    const b = randTensor([outDim, rank], rng);
+    const sc = alpha / rank;
+
+    setLoraAdapters(new Map([[w, { a, b, scale: sc }]]));
+    fdCheck("lora(linear)", [x, a, b], () => linear(x, w));
+
+    for (const t of [x, w, a, b]) t.zeroGrad();
+    w.requiresGrad = false;
+    const out = linear(x, w);
+    backwardFrom(out, new Float32Array(out.data.length).fill(1));
+    let frozen = 0;
+    for (const g of w.grad) frozen = Math.max(frozen, Math.abs(g));
+    let adapterGrad = 0;
+    for (const t of [a, b]) {
+      for (const g of t.grad) adapterGrad = Math.max(adapterGrad, Math.abs(g));
+    }
+    setLoraAdapters(new Map());
+    w.requiresGrad = true;
+
+    // Merge: fold B*A*scale into the base and check the plain product agrees.
+    const merged = new Float32Array(w.data);
+    for (let o = 0; o < outDim; o++) {
+      for (let i = 0; i < inDim; i++) {
+        let acc = 0;
+        for (let r = 0; r < rank; r++) acc += b.data[o * rank + r] * a.data[r * inDim + i];
+        merged[o * inDim + i] += sc * acc;
+      }
+    }
+    const wm = new Tensor(merged, [outDim, inDim], true);
+    const plain = linear(x, wm);
+    let mergeDelta = 0;
+    for (let i = 0; i < out.data.length; i++) {
+      mergeDelta = Math.max(mergeDelta, Math.abs(out.data[i] - plain.data[i]));
+    }
+
+    const ok = frozen === 0 && adapterGrad > 0 && mergeDelta < 1e-5;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"lora freeze + merge".padEnd(24)}        ` +
+        `frozen grad=${frozen.toExponential(1)} adapter grad=${
+          adapterGrad > 0 ? "nonzero" : "ZERO"
+        } ` +
+        `merge delta=${mergeDelta.toExponential(2)}`,
+    );
   }
   {
     // Activation recomputation. Two claims, and the second is the one that

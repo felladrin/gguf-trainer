@@ -61,8 +61,19 @@ Violating any of these wastes a run. They are checked where possible; a few cann
 2. **`--resume` requires an exact architecture match.** Every field the resume gate covers must
    equal the checkpoint's. A mismatch aborts before any compute and names the flag, and
    `inspect` prints the correct flags in its resume line.
+   2b. **`--lora-rank` changes what trains, not what a checkpoint is.** Adapters are folded into the
+   base weights on every export and folded back out afterwards, so the GGUF is an ordinary dense
+   checkpoint with the usual tensor names and resuming from it needs no adapter file and no extra
+   flag. What it does change is the optimizer state, which shrinks with the trainable count
+   (measured 4495 MB to 63 MB at rank 16 on a 293M qwen3), and throughput, which drops ~14%
+   because each adapted projection becomes three matmuls. It trains the adapters only: embeddings,
+   norms and the readout are frozen. Requires `--resume`, and neither reads nor writes an
+   `.optstate` sidecar, because that file describes the full parameter set. It also DELETES one
+   sitting beside `--out`, when it rewrites that checkpoint: the rewrite invalidates the sidecar,
+   whose parameter count would still match well enough to be accepted. Lever 21.
 3. **The optimizer sidecar is `<model>.gguf.optstate`.** Same directory, exact name. Missing means a
-   cold optimizer, which re-warms momentum over the first few hundred steps rather than failing.
+   cold optimizer, which re-warms momentum over the first few hundred steps rather than failing. A
+   `--lora-rank` run neither writes one nor keeps one: see 2b.
 4. **Compute is f32.** f16 operands overflow to NaN at these sizes (it reproduced at exactly the
    same step under two different learning rates), and they buy no wall-clock: measured, f16 compute
    is 0.98x on attention itself, so it is not a matter of which kernel dominates.
