@@ -984,8 +984,9 @@ not.
 A perplexity of 58421 from a completely mismatched pairing is a believable-looking number, and it is
 the reason the check runs on the host rather than being left to the device. Read the CPU's NaN there
 as a measurement, not as this mechanism: the input stream carries the same out-of-range ids as the
-target stream, so `embedding` poisons the CPU forward (it did then; lever 29) before the loss runs, and the loss's own
-last-row overrun only fires when the last target happens to be out of range.
+target stream, so `embedding` poisons the CPU forward before the loss runs (it did then; lever 29
+stops it first now), and the loss's own last-row overrun only fires when the last target happens to
+be out of range.
 
 `keptRowsInVocab` does the range check and returns the kept count, so it replaces the counting loop
 each of the four losses already ran and costs no extra pass. All four call it: the CPU and GPU

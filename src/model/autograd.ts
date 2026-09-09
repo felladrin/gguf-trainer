@@ -704,9 +704,10 @@ export function attention(
  *
  * Checked above the backend dispatch rather than in each backend, which is what
  * `fusedCrossEntropy` does with its dimension, chunk and LoRA guards, and which
- * makes the omission `keptRowsInVocab` invites unreachable: that one validates
- * below the dispatch, so every implementation needs its own call, and the one
- * nobody remembered is the GPU `softCrossEntropy` (#61).
+ * makes the omission the below-dispatch style invites unreachable: validate
+ * under the dispatch and every implementation needs its own call, which is how
+ * `softCrossEntropy` ended up checking its teacher ids on the CPU and not on
+ * the GPU (#61).
  */
 export function assertIdsInTable(ids: number[], V: number, where: string): void {
   for (let t = 0; t < ids.length; t++) {
