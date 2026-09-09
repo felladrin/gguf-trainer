@@ -81,7 +81,10 @@ async function run(v: Values) {
   // and a full pass over a FineWeb-scale file each time would evict more cache
   // than it warms.
   const scanned = assertCorpusFitsVocab(src, cfg.vocabSize, tokensPath, { from: lo });
-  console.log(`Corpus: ${(scanned / 1e6).toFixed(1)}M scored tokens fit vocab ${cfg.vocabSize} ✓`);
+  console.log(
+    `Corpus: ${(scanned / 1e6).toFixed(1)}M tokens in the scored region fit vocab ` +
+      `${cfg.vocabSize} ✓`,
+  );
 
   // FIXED windows: seeded once, so every checkpoint is scored on the same tokens.
   const rng = mulberry32(seed);

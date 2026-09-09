@@ -26,7 +26,7 @@ export const WRITE_CHUNK_BYTES = 1 << 30;
  */
 export function chunkSpans(
   total: number,
-  chunk: number = WRITE_CHUNK_BYTES,
+  chunk: number,
 ): { off: number; len: number }[] {
   // A positive INTEGER: a fractional chunk terminates but hands a caller a
   // fractional length, and a non-positive one never advances at all.

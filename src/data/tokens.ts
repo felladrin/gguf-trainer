@@ -90,6 +90,9 @@ export function assertCorpusFitsVocab(
   path: string,
   { from = 0, chunk = SCAN_CHUNK }: { from?: number; chunk?: number } = {},
 ): number {
+  if (!Number.isInteger(from) || from < 0 || from > src.length) {
+    throw new Error(`scan start ${from} is outside 0..${src.length}`);
+  }
   for (const { off, len } of chunkSpans(src.length - from, chunk)) {
     const start = from + off;
     const w = src.window(start, len);

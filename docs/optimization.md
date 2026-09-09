@@ -1422,7 +1422,8 @@ the eval itself touches 65,536 tokens.
 **It costs almost nothing.** Measured at **310M tokens/s** on this machine, so the 17.4M-token
 `lambrp.tokens` scans in 0.06 s and a FineWeb-scale 10B-token corpus would cost about 32 seconds,
 once, against a run of hours. End to end on `eval-loss --windows 4` over that corpus the difference
-is inside the noise, 17.97 s against 17.89 s.
+is inside the noise: 17.90 and 17.93 s against `main`'s 17.89 and 17.99 s, and that is with the scan
+narrowed to the scored region.
 
 The mismatched pair from lever 26 now stops in 5.9 s instead of after loading a model and running a
 forward:
@@ -1433,9 +1434,12 @@ tokenized with a different vocab than the checkpoint; retokenize it with the che
 own tokenizer.
 ```
 
-It catches a width mismatch too, for free: a 2-byte file read as 4-byte yields ids in the hundreds of
-millions, and one of this repo's own corpora reports `token 205291510 at position 0` when read
-against the wrong vocab.
+It catches a width mismatch in one direction, for free: a 2-byte file read as 4-byte yields ids in
+the hundreds of millions, and one of this repo's own corpora reports `token 205291510 at position 0`
+when read against the wrong vocab. **Not the other direction.** A 4-byte file read as 2-byte passes
+the size check, which is only `% 2`, and every id becomes a half-word, so the count silently doubles
+and every second one reads as 0. Nothing here catches that, and it belongs with the stale-`.tokens`
+class below rather than with what this closes.
 
 `memTokenSource.window` also gained the bounds check `diskTokenSource` always had. Without it a
 window past the end returned `undefined` per token, which the losses refuse as "not an integer" by an
@@ -1456,8 +1460,9 @@ asserts an absolute position, which is what a user needs to seek to.
 **Still open, and not closed by a range check.** In the `.txt` branch `pretrain` reuses an existing
 `${stem}.tokens` without rewriting it, while `sharedTokenizer` retrains the vocab whenever
 `${stem}.tokenizer.json` is missing. Delete that json and you train on a stale token file built from
-a vocab that no longer exists; this catches it only if the stale ids exceed the new vocab, and a
-same-size or larger vocab passes. Closing the class needs tokenizer identity, a hash beside the
+a vocab that no longer exists; this catches it only if the stale ids exceed the new vocab, so a
+same-size or larger vocab passes, and so does any narrower vocab that flips the file's id width, per
+the half-word case above. Closing the class needs tokenizer identity, a hash beside the
 `.tokens`, not a range check.
 
 ## Quality levers

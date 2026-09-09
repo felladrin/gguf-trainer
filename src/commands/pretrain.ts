@@ -393,7 +393,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   // thousands of steps in before some later window happens to hold a high id.
   // One sequential pass over a file this run is about to read thousands of times.
   const scanned = assertCorpusFitsVocab(src, cfg.vocabSize, srcPath);
-  console.log(`Corpus: ${(scanned / 1e6).toFixed(1)}M tokens fit vocab ${cfg.vocabSize} ✓`);
+  console.log(`Vocab fit: ${(scanned / 1e6).toFixed(1)}M tokens under ${cfg.vocabSize} ✓`);
 
   // Trust gate: GPU forward+loss must match the CPU reference at init.
   const probeIn = src.window(0, 16), probeTgt = src.window(1, 16);
