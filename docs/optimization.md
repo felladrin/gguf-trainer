@@ -1077,6 +1077,11 @@ where every parameter is frozen, and LoRA training, where the base weights are f
 run. On a 310-tensor checkpoint at `--windows 16` that is 4650 no-op commands: the first window
 does not queue them, because `entryFor` starts `gradNeedsClear` at `requiresGrad`.
 
+**Lever 32 has since subsumed the eval half of this.** A forward-only window issues no clears at
+all now, frozen or not, so those 4650 are gone whether or not this landed. What remains here is the
+LoRA and finetune half, where the window does run a backward and a frozen base weight's stub would
+still be re-armed, and that is the configuration `frozenClearGate` measures.
+
 `e.gradNeedsClear = e.grad !== this.frozenStub` is the whole fix, and which side of that predicate
 it sits on is the interesting part. `t.requiresGrad` is the obvious spelling and it is wrong in one
 ordering: freeze a parameter mid-window, after that window's `entryFor` and before its `sync()`, and
@@ -1243,6 +1248,73 @@ the gate exercises; loosening the rank test to `>= 1` fails all eight refusals, 
 point is the exact rank and not merely "has a shape"; and moving the `crossEntropy` call below the
 dispatch passes every CPU case and fails only the GPU arm, which is by now the recognisable signature
 of that mistake.
+
+### 32. A forward-only window asked the device to zero buffers nobody reads (2026-09-09)
+
+Filed as #67 while fixing #60, and filed with its own null measurement so nobody chases it as a
+speed-up. `makeOut` queues every intermediate's gradient buffer for a `clearBuffer` at creation,
+because a backward accumulates into it with `+=` and a pooled buffer arrives dirty. Its comment says
+"before this graph's backward pass runs". Eval, `generate` and `pretrain`'s trust gate never run
+one, so every one of those clears was zeroing a buffer nobody would read. On the toy model in
+`forwardOnlyClearGate` a forward-only window issues 139 clears, 85 intermediates and 54 parameter
+accumulators, and all 139 go: the 54 are the ones lever 28 attacked in the frozen case, and unlike
+those the intermediates are full-size buffers rather than a shared 256-byte stub.
+
+The 54 carry a semantic change worth stating, because it is the one thing here that is not pure
+waste removal. Their clear ran BEFORE the same sync's gradient staging, so a forward-only window used
+to leave zeros in the host `grad` arrays and now leaves whatever the last backward put there. No
+caller reads them, eval and `generate` freezing and training keeping gradients on device, and the
+gate pins it so that going back to zeros means someone reintroduced the accumulator clears.
+
+`sync()` drained the queue whether or not a backward had begun, which is what forced them. It now
+asks. **Dropping rather than deferring is what the recycling forces:** those buffers return to the
+pool at the end of the same `sync()`, so a clear held over would land on whatever reacquires them.
+The invariant that makes dropping safe is the one recycling already needs, that no backward may
+begin for a graph built before the sync, and `ensureBackwardBegun` drains the queue itself when one
+does.
+
+**It buys no measurable time, the second such entry in a row.** `eval-loss --windows 16 --seq-len
+512` on `littlelamb-base.f32.gguf` measures 26.62 s median against `main`'s 26.69 s, three runs each,
+inside the run-to-run spread, and a one-step `pretrain` on a 306M model moved 36.58 s against 37.25 s
+when probed. Both are the size of the noise. What the change buys is a command stream that says what it means.
+
+`forwardOnlyClearGate` counts rather than times: a window with a backward still issues 139 clears,
+one without issues 0, and the two losses are bit-equal. Removing the guard or inverting it makes the
+forward-only arm issue all 139.
+
+**It also invalidated a gate written four levers ago, and half of that lever's justification.**
+`frozenClearGate` compared clear counts across two forward-only windows, which now issue none at
+all, so it went red on a correct change. It runs a backward now, since a parameter's clear is only
+observable in a window that has one. Lever 28's headline saving, 4650 no-op commands per eval run,
+is likewise gone whether or not lever 28 had landed: what it still buys is the LoRA and finetune
+case, and that entry now says so. Worth noting as the failure mode of counting gates and of the
+levers that quote them: both pin a number a later, unrelated improvement is entitled to move.
+
+The drain in `sync()` is a safety net rather than a live path, measured by deleting it: every clear
+today is issued by `ensureBackwardBegun`, and no count moves. What it covers is a clear queued after
+the backward began, an external first materialized mid-backward. Not a second backward over one
+graph, which queues nothing at all: `ensureBackwardBegun` early-returns and `makeOut` is not called
+again.
+
+**The price is an invariant that used to be forgiving.** Dropping a clear is safe only while no
+backward runs over a graph built before a sync. That ordering was previously wasteful but survivable,
+since the buffers went back to the pool zeroed; now they go back dirty, so the same mistake would
+accumulate into pool garbage and report a believable number. `ensureBackwardBegun` throws on it, and
+the gate has an arm that builds a graph, syncs it, asks for a backward and expects the refusal.
+
+The throw is armed only by a dropped `makeOut` clear, not by any dropped clear. `entryFor`'s
+accumulators are persistent, never return to the pool, and are re-armed by the same `sync()`, so
+dropping theirs is free: an optimizer constructor queues one per parameter, and flagging the whole
+queue refused `new MuonGpu(...)` followed by a sync and a `seedGradFromHost` with no graph anywhere
+in the flow. The gate has an arm for that too, and for the re-arm itself, which `pretrain` depends
+on: its trust gate is a forward-only sync that drops every parameter's clear, and the training loop
+then accumulates into those same accumulators.
+
+The reset in `beginForwardOp` bounds what the throw catches to a backward with no forward op in
+between. Forward A, sync, forward B, backward A still slips through, as it did before this change:
+the flag narrows the window rather than closing it. Under `--recompute` that ordering is routine
+rather than exotic, since a checkpoint replay's own forward is that forward B, and it still throws on
+a real model only because the loss and readout backwards run before any checkpoint block.
 
 ## Quality levers
 

@@ -319,6 +319,18 @@ export class WebGPUBackend implements OpsBackend {
   private gradKeptOnDevice = new WeakSet<Tensor>();
   private transients: { buf: GpuBuffer; size: number }[] = [];
   private pendingClears: GpuBuffer[] = [];
+  // Set when a sync() discarded a queued clear for a GRAPH buffer because no
+  // backward had begun. Cleared by the next forward op, i.e. by the next graph.
+  private droppedClearsForGraph = false;
+  // Whether any makeOut clear has been queued since the last drain. Not "is in
+  // pendingClears": endRegion can filter one out without emptying the array, and
+  // that buffer reaches the pool through regionFree instead, so the flag staying
+  // set still describes a graph buffer recycled dirty.
+  //
+  // entryFor's accumulators are persistent, never reach the pool, and are
+  // re-armed on the drop path, so dropping theirs is free and must not arm the
+  // throw: an optimizer constructor queues one per parameter.
+  private pendingGraphClears = false;
   /**
    * Buffers released by endRegion, reusable ONLY by makeOut.
    *
@@ -396,9 +408,39 @@ export class WebGPUBackend implements OpsBackend {
   async sync(reads: Tensor[] = []): Promise<void> {
     this.endPass();
     if (!this.enc) this.enc = this.device.createCommandEncoder();
-    for (const b of this.pendingClears) this.enc.clearBuffer(b);
-    this.gradClearsIssued += this.pendingClears.length;
+    // Only if a backward actually began. makeOut queues every intermediate's
+    // gradient buffer at creation, because a backward accumulates into it with
+    // += and a pooled buffer arrives dirty. A forward-only window never runs
+    // one, so those clears zero buffers nobody reads: 139 per forward-only window
+    // on the toy model in forwardOnlyClearGate, 85 intermediates and 54
+    // accumulators.
+    //
+    // The 54 carry a semantic change worth knowing. Their clear ran BEFORE this
+    // sync's grad staging, so a forward-only window used to leave zeros in the
+    // host grad arrays; it now leaves whatever the last backward put there. No
+    // caller reads them: eval and generate freeze, and training keeps grads on
+    // device.
+    //
+    // Dropping rather than deferring is what the recycling below forces: these
+    // buffers return to the pool at the end of this sync, so a clear held over
+    // would land on whatever reacquires them. The invariant that makes it safe
+    // is the same one recycling already needs, that no backward may begin for a
+    // graph built before this sync, and ensureBackwardBegun throws if one tries.
+    //
+    // The drain itself is a safety net rather than a live path: measured by
+    // deleting it, every clear today is issued by ensureBackwardBegun and no
+    // count moves. What it covers is a clear queued after the backward began,
+    // i.e. an external first materialized mid-backward. A second backward over
+    // one graph would not need it: ensureBackwardBegun early-returns and makeOut
+    // is not called again, so nothing is queued.
+    if (this.backwardBegun) {
+      for (const b of this.pendingClears) this.enc.clearBuffer(b);
+      this.gradClearsIssued += this.pendingClears.length;
+    } else if (this.pendingGraphClears) {
+      this.droppedClearsForGraph = true;
+    }
     this.pendingClears = [];
+    this.pendingGraphClears = false;
 
     const stagings: { stage: GpuBuffer; dst: Float32Array }[] = [];
     const readSet = new Set(reads);
@@ -480,9 +522,11 @@ export class WebGPUBackend implements OpsBackend {
    * synced): parameter gradient accumulators are acquirePersistent buffers, NOT
    * transients, so they are never in `this.transients` and this cannot touch
    * them; grads keep accumulating across micro-batches exactly as before. We
-   * leave `touchedExternals`, `gradNeedsClear`, and `pendingClears` untouched
-   * (pendingClears is already empty at a micro-batch boundary: ensureBackwardBegun
-   * flushed it), so the deferred grad-clear timing and CPU/GPU parity are
+   * leave `touchedExternals`, `gradNeedsClear`, `pendingClears` and the two flags
+   * beside it untouched (pendingClears is already empty at a micro-batch
+   * boundary: ensureBackwardBegun flushed it, which also leaves
+   * pendingGraphClears false, and droppedClearsForGraph would already have
+   * thrown), so the deferred grad-clear timing and CPU/GPU parity are
    * unchanged. Buffers are returned to the pool only after onSubmittedWorkDone
    * proves the GPU finished the recorded work, so no in-flight pass still reads
    * them. `keep` names tensors whose DATA buffer must survive to the end-of-step
@@ -1235,6 +1279,7 @@ export class WebGPUBackend implements OpsBackend {
    */
   private beginForwardOp() {
     this.backwardBegun = false;
+    this.droppedClearsForGraph = false;
     if (this.deviceError) throw new Error(this.deviceError);
   }
 
@@ -1245,6 +1290,26 @@ export class WebGPUBackend implements OpsBackend {
    */
   private ensureBackwardBegun() {
     if (this.backwardBegun) return;
+    // The invariant recycling already needed, made loud for the one ordering the
+    // flag can see. Before the clears were conditional this was wrong but
+    // survivable: the buffers went back to the pool zeroed. Now they go back
+    // dirty, so a backward over a graph built before a sync would accumulate
+    // into whatever reacquired them and report a believable number.
+    //
+    // The reset in beginForwardOp bounds what this catches to a backward with no
+    // forward op in between. Forward A, sync, forward B, backward A slips
+    // through, as it did before this change; the flag narrows the window, it
+    // does not close it. Under --recompute that ordering is routine rather than
+    // exotic, a checkpoint replay's own forward being that forward B, and it
+    // still throws on a real model only because the loss and readout backwards
+    // run before any checkpoint block.
+    if (this.droppedClearsForGraph) {
+      throw new Error(
+        "backward over a graph built before a sync(): that sync recycled the graph's " +
+          "gradient buffers and discarded their clears, so this backward would " +
+          "accumulate into pool garbage",
+      );
+    }
     this.backwardBegun = true;
     this.endPass();
     if (this.pendingClears.length > 0) {
@@ -1252,6 +1317,7 @@ export class WebGPUBackend implements OpsBackend {
       for (const b of this.pendingClears) this.enc.clearBuffer(b);
       this.gradClearsIssued += this.pendingClears.length;
       this.pendingClears = [];
+      this.pendingGraphClears = false;
     }
     this.submit();
   }
@@ -1412,8 +1478,10 @@ export class WebGPUBackend implements OpsBackend {
       gradNeedsClear: false,
     };
     // Gradients accumulate with +=, so the (possibly recycled) buffer must be
-    // zeroed before this graph's backward pass runs.
+    // zeroed before this graph's backward pass runs, if one runs at all: sync()
+    // drops the queue when none began.
     this.pendingClears.push(e.grad);
+    this.pendingGraphClears = true;
     this.entries.set(t, e);
     return { t, e };
   }

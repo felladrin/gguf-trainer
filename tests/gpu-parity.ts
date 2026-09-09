@@ -681,6 +681,7 @@ async function main() {
   await generateFreezeGate();
   await residentReadbackGate();
   await frozenClearGate();
+  await forwardOnlyClearGate();
   await clearRearmPredicateGate();
   await flatOverflowGate(gpu);
   {
@@ -1646,16 +1647,16 @@ async function residentReadbackGate() {
  * The clear queue. `sync()` re-arms `gradNeedsClear` for every touched external,
  * and `entryFor` then queues that buffer for a `clearBuffer` on the next window.
  * A frozen external shares one 256-byte stub that nothing ever writes, so every
- * one of those clears was a no-op: a few hundred per window on a 293M model
- * under eval, and per step under LoRA, where the base weights are frozen for the
- * whole run.
+ * one of those clears was a no-op. Lever 32 has since taken the eval case away
+ * entirely, a forward-only window issuing no clears at all; what is left is a
+ * step that runs a backward with frozen weights, i.e. LoRA and finetune, which
+ * is the shape below.
  *
  * Waste has no symptom in a number, so the only way to see it is to count. The
  * second window is what matters: on the first, a frozen parameter is not queued
  * at all, because `entryFor` starts `gradNeedsClear` at `requiresGrad`. The
  * count does not go to zero, and should not: `makeOut` queues every
- * intermediate's gradient buffer unconditionally, which is a separate waste in a
- * forward-only run (#67).
+ * intermediate's gradient buffer, which a backward genuinely needs.
  */
 async function frozenClearGate() {
   const cfg = gemma3Config(64, 64, 4, 256, 16);
@@ -1672,6 +1673,11 @@ async function frozenClearGate() {
       // forward skipped would move the count for a reason unrelated to freezing.
       const window = async () => {
         const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+        // With a backward, since lever 32: a forward-only window issues no
+        // clears at all, so a parameter's is only observable in a window that
+        // runs one. That is LoRA and finetune, which is where lever 28 still
+        // pays.
+        backward(loss, 1);
         await gpu.sync([loss]);
         return loss.data[0];
       };
@@ -1687,9 +1693,8 @@ async function frozenClearGate() {
   const cold = await arm(true);
 
   // Exactly one clear per parameter goes away, and nothing else does. The rest
-  // of the count is the per-window intermediates, which makeOut queues
-  // unconditionally at creation; those are a separate waste in a forward-only
-  // run and are #67, not this.
+  // of the count is the intermediates, which a backward genuinely accumulates
+  // into.
   const savedTheParams = hot.second - cold.second === hot.params;
   // Weak on its own, since the intermediates alone satisfy it: what it catches
   // is makeOut's queue disappearing, which would make the assertion above pass
@@ -1707,6 +1712,157 @@ async function frozenClearGate() {
     `  ${ok ? "ok " : "FAIL"} frozen clears: second window issues ${hot.second} unfrozen ` +
       `and ${cold.second} frozen, a saving of exactly the ${hot.params} parameters, ` +
       `loss ${hot.loss.toFixed(6)} both`,
+  );
+}
+
+/**
+ * A forward-only window asks the device to zero nothing.
+ *
+ * `makeOut` queues every intermediate's gradient buffer for a clear at creation,
+ * because a backward accumulates into it with `+=` and a pooled buffer arrives
+ * dirty. Eval, `generate` and the trust gate never run one, so every one of
+ * those clears was zeroing a buffer nobody would read.
+ *
+ * Two of the six assertions count; the rest guard the invariant that dropping a
+ * clear depends on. This is not a speed fix, measuring 26.62 s against 26.69 s
+ * on `eval-loss --windows 16`, inside the run-to-run spread. What it buys is a
+ * command stream that says what it means.
+ *
+ * The last arm is the price. Dropping a clear is safe only while no backward
+ * runs over a graph built before a sync, and that ordering used to be merely
+ * wasteful, so it would now have been silently wrong.
+ */
+async function forwardOnlyClearGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const ids = Array.from({ length: 33 }, (_, i) => (i * 11 + 5) % cfg.vocabSize);
+  const arm = async (withBackward: boolean) => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    try {
+      gpu.install();
+      gpu.uploadParams(m.params());
+      const before = gpu.gradClearsIssued;
+      const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+      if (withBackward) backward(loss, 1);
+      await gpu.sync([loss]);
+      const clears = gpu.gradClearsIssued - before;
+      // On the same backend and the same graph, so the sync that dropped the
+      // clears is demonstrably the one whose backward is refused, rather than a
+      // second device that merely resembles it.
+      let refusedLateBackward = false;
+      if (!withBackward) {
+        try {
+          backward(loss, 1);
+          await gpu.sync([]);
+        } catch (e) {
+          refusedLateBackward = /graph built before a sync/.test((e as Error).message);
+        }
+      }
+      return { clears, loss: loss.data[0], refusedLateBackward };
+    } finally {
+      gpu.destroy();
+    }
+  };
+  const bwd = await arm(true);
+  const fwd = await arm(false);
+  const refusesLateBackward = fwd.refusedLateBackward;
+
+  // 1. A window with a backward still zeroes every buffer that backward will
+  //    accumulate into. Losing this is a correctness bug, not a tidiness one.
+  const stillClears = bwd.clears > 0;
+  // 2. A forward-only window issues none.
+  const noneWithoutBackward = fwd.clears === 0;
+  // 3. And the loss is identical. Weak on its own, since the loss is a forward
+  //    quantity and clears only ever touch gradient buffers, which makeOut
+  //    acquires separately from data. What carries the claim that nothing was
+  //    lost is the rest of this suite's gradient comparisons staying green.
+  const same = bwd.loss === fwd.loss;
+
+  // An optimizer constructor queues one entryFor clear per parameter. Those are
+  // persistent accumulators, not pool buffers, and the same sync re-arms them,
+  // so dropping theirs is free and must not arm the throw. Flagging the whole
+  // queue rather than makeOut's share refused this flow.
+  const allowsOptimizerOnly = await (async () => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    const g = m.paramGroups();
+    try {
+      gpu.install();
+      new MuonGpu(gpu, g.muon, g.aux, {
+        lr: 0.01,
+        momentum: 0.95,
+        aux: { lr: 3e-3, weightDecay: 0, clip: 1 },
+      });
+      await gpu.sync([]);
+      gpu.seedGradFromHost(g.muon[0]);
+      return true;
+    } catch (e) {
+      // Only the refusal this arm is about; anything else is a real failure and
+      // should not be reported as "optimizer-only allowed false".
+      if (/graph built before a sync/.test((e as Error).message)) return false;
+      throw e;
+    } finally {
+      // destroy() uninstalls, so an aborted arm cannot leave a dead backend
+      // installed for the gates after it.
+      gpu.destroy();
+    }
+  })();
+
+  // The re-arm on the DROP path, which pretrain depends on: its trust gate is a
+  // forward-only sync that drops every parameter's clear, and the training loop
+  // then accumulates into those same accumulators. Moving the re-arm inside the
+  // new backwardBegun branch reads like a tidy-up and would make step 0
+  // accumulate into an unzeroed buffer, reporting exactly 2x with nothing else
+  // failing.
+  const rearmsAcrossAForwardOnlySync = await (async () => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    try {
+      gpu.install();
+      gpu.uploadParams(m.params());
+      const step = async () => {
+        const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+        backward(loss, 1);
+        await gpu.sync([loss]);
+        return m.params().map((p) => Float32Array.from(p.grad));
+      };
+      const first = await step();
+      const stagedBytes = gpu.lastSyncReadbackBytes;
+      // The trust gate's shape: a forward, a sync, no backward.
+      await gpu.sync([sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0)]);
+      // Against step 1's own figure, so the arm does not have to assert which
+      // parameters the forward touches. Without it, `held` below would pass just
+      // as well if this sync had staged nothing at all.
+      const staged = gpu.lastSyncReadbackBytes === stagedBytes;
+      // The semantic this change moves: that sync no longer zeroes the
+      // accumulators before staging them, so the host grads still hold the last
+      // backward's rather than zeros. Nothing reads them, but pin it: going back
+      // to zeros means someone reintroduced the accumulator clears.
+      const afterForwardOnly = m.params().map((p) => Float32Array.from(p.grad));
+      const held = first.every((g, i) => g.every((v, j) => v === afterForwardOnly[i][j]));
+      const third = await step();
+      let worst = 0, n = 0;
+      for (let i = 0; i < first.length; i++) {
+        for (let j = 0; j < first[i].length; j++) {
+          if (Math.abs(first[i][j]) < 1e-6) continue;
+          worst = Math.max(worst, Math.abs(third[i][j] / first[i][j] - 1));
+          n++;
+        }
+      }
+      return staged && held && n > 0 && worst < 1e-4;
+    } finally {
+      gpu.destroy();
+    }
+  })();
+
+  const ok = stillClears && noneWithoutBackward && same && refusesLateBackward &&
+    allowsOptimizerOnly && rearmsAcrossAForwardOnlySync;
+  if (!ok) failures++;
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} forward-only clears: ${bwd.clears} issued with a backward, ` +
+      `${fwd.clears} without, loss ${bwd.loss.toFixed(6)} both, late backward refused ` +
+      `${refusesLateBackward}, optimizer-only allowed ${allowsOptimizerOnly}, ` +
+      `re-armed across a forward-only sync ${rearmsAcrossAForwardOnlySync}`,
   );
 }
 
