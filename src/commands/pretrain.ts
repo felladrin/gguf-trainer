@@ -527,8 +527,6 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     : undefined;
   if (chatTemplate) console.log(`Chat template: ${templatePath} (embedded in every export)`);
   const optStatePath = `${outPath}.optstate`;
-  // Logged once, not on every checkpoint.
-  let removedOptState = false;
   const exportGGUF = async (): Promise<Uint8Array> => {
     // Fold the adapters in, write an ordinary dense checkpoint, fold them back
     // out. Every checkpoint this run writes loads in llama.cpp with no adapter
@@ -543,19 +541,17 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     await writeFileBytes(`${outPath}.tmp`, b);
     const fs = await import("node:fs");
     fs.renameSync(`${outPath}.tmp`, outPath);
-    if (lora) {
+    if (lora && fs.existsSync(optStatePath)) {
       // Coupled to the rename, which is the event that invalidates the file: a
       // sidecar beside a GGUF this run just rewrote is stale by construction.
       // Deleting it at startup instead would destroy a valid, matching sidecar
       // if the run died before its first checkpoint, and these files are
       // sometimes hand-placed (agents.md, the publish recipe). Not written by a
       // LoRA run either, so this only ever removes one an earlier run left.
-      // force: no throw if a concurrent checkpoint already removed it.
-      if (removedOptState === false) {
-        fs.rmSync(optStatePath, { force: true });
-        removedOptState = true;
-        console.log(`Removed ${optStatePath.split("/").pop()} (stale: the weights were rewritten)`);
-      }
+      // Gated on existence rather than on a once-flag so the log cannot claim a
+      // removal that did not happen; `force` is for the usual case of no file.
+      fs.rmSync(optStatePath, { force: true });
+      console.log(`Removed ${optStatePath.split("/").pop()} (stale: the weights were rewritten)`);
     }
     return b;
   };

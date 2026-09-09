@@ -1415,6 +1415,7 @@ async function loraModelParity(gpu: WebGPUBackend) {
     // each block, so a double-counted adapter gradient would show up here as a
     // 2x against the CPU reference rather than as a plausible learning rate.
     setCheckpointing(true);
+    const regionsBefore = gpu.regionCount();
     let ok = true;
     try {
       const loss = crossEntropy(model.forward(ids), targets);
@@ -1427,6 +1428,12 @@ async function loraModelParity(gpu: WebGPUBackend) {
       }
       for (let i = 0; i < cpuGrads.length; i++) {
         ok = compare(`lora.${name}.dAdapter${i}`, h.groups.aux[i].grad, cpuGrads[i], BWD) && ok;
+      }
+      // "+ recompute" in the label has to be a claim, not a word: an arch that
+      // stopped calling checkpoint() would otherwise keep this green.
+      if (gpu.regionCount() === regionsBefore) {
+        console.log(`    MISMATCH ${name} opened no recompute regions`);
+        ok = false;
       }
     } finally {
       setCheckpointing(false);
