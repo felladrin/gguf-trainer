@@ -219,6 +219,8 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const headDim = v.num("head-dim");
   const startStep = v.num("start-step");
   const quant = v.str("checkpoint-precision") as QuantName;
+  const lossChunk = v.num("loss-chunk");
+  if (lossChunk < 0) die(`--loss-chunk must be 0 (dense) or positive, got ${lossChunk}`);
   const resumePath = v.opt("resume");
   const outPath = v.str("out");
   const name = v.opt("name") ?? (mode === "finetune" ? "finetune" : "pretrain-base");
@@ -378,7 +380,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       Math.round(steps * 0.1)
     } / cooldown ${Math.round(steps * 0.2)} steps, quant ${quant}, reclaim ${
       flags.has("reclaim") ? "on" : "off"
-    }`,
+    }, loss ${lossChunk > 0 ? `chunked x${lossChunk}` : "dense"}`,
   );
 
   // WSD decay-phase instruct injection (MiniCPM/Xmodel-2 trick): from the cooldown
@@ -464,6 +466,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     // boundary so batch>=2 fits at long context (e.g. Phase B seqLen 8192, where
     // it otherwise OOMs). Off unless asked; one GPU fence/micro-batch of overhead.
     reclaimTransients: flags.has("reclaim"),
+    lossChunk,
     logEvery: Math.max(1, Math.round(steps / 100)),
     rng: mulberry32(7 + startStep), // vary batches across resume segments
     checkpointEvery: ckptEvery,
@@ -672,6 +675,14 @@ const SHARED_FLAGS: Flag[] = [
     type: "boolean",
     describe:
       "free each micro-batch's activations at the micro-batch boundary: 5.6x less peak GPU memory for 23% less throughput (measured), and the way to fit batch>=2 at long context on a small GPU",
+  },
+  {
+    name: "loss-chunk",
+    type: "number",
+    placeholder: "N",
+    default: 0,
+    describe:
+      "stream the readout+cross-entropy in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way past the storage-buffer binding limit at a large vocab (0 = dense path)",
   },
 ];
 

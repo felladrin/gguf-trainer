@@ -10,7 +10,8 @@
 // Parameters stay authoritative on the host: the optimizer steps host arrays,
 // and uploadParams() pushes them to the GPU at the top of each step.
 
-import { backward, crossEntropy } from "../model/autograd.ts";
+import { backward } from "../model/autograd.ts";
+import { sequenceLoss } from "../train/loss.ts";
 import type { Tensor } from "../model/autograd.ts";
 import type { LanguageModel } from "../model/arch.ts";
 import { maskWindow, type TrainOpts } from "../train/trainer.ts";
@@ -48,7 +49,7 @@ export async function trainLMGpu(
         const inputIds = tokens.window(start, opts.seqLen);
         const targetIds = tokens.window(start + 1, opts.seqLen);
         if (opts.supervised) maskWindow(targetIds, opts.supervised, start + 1);
-        const loss = crossEntropy(model.forward(inputIds), targetIds);
+        const loss = sequenceLoss(model, inputIds, targetIds, opts.lossChunk);
         backward(loss, 1 / opts.batchPerStep); // average grads over the batch
         losses.push(loss);
       }
@@ -130,6 +131,16 @@ export interface TrainGpuResidentOpts {
    * only buffer-recycling timing changes (gated by tests/gpu-parity.ts).
    */
   reclaimTransients?: boolean;
+  /**
+   * Vocab chunk width for the fused readout+cross-entropy path. 0 (the default)
+   * keeps the dense path: `forward` materializes [seqLen, vocab] logits, whose
+   * data, gradient and softmax scratch are three buffers of that size. A
+   * positive value streams the vocab in chunks of that width instead, so the
+   * widest live buffer is [seqLen, chunk] and backward recomputes the readout
+   * matmul. Numerically equivalent, and the only way past the storage-buffer
+   * binding limit at a large vocab (see agents.md invariant 7).
+   */
+  lossChunk?: number;
 }
 
 /**
@@ -194,7 +205,7 @@ export async function trainLMGpuResident(
         const inputIds = src.window(start, opts.seqLen);
         const targetIds = src.window(start + 1, opts.seqLen);
         if (opts.supervised && !useInject) maskWindow(targetIds, opts.supervised, start + 1);
-        const loss = crossEntropy(model.forward(inputIds), targetIds);
+        const loss = sequenceLoss(model, inputIds, targetIds, opts.lossChunk);
         backward(loss, 1 / opts.batchPerStep); // average grads over the batch
         losses.push(loss);
         // Free this micro-batch's activations before the next one so peak VRAM

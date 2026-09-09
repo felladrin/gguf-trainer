@@ -74,9 +74,9 @@ Parked, measured but not acted on while the step is host-bound (kernels are ~330
 step): `srcEmbeddingBwd` scaling (~0.3% of the step at 32768x640, multi-percent at 2x vocab, so
 revisit if the vocab grows), `srcRmsNormBwdW`'s ~16x overfetch (~1% of the step), a RoPE table
 precompute, and sliding-window warmup (~2-3% of the run at T=2048, worse at T>=4096). Chunked online
-cross-entropy over the vocab axis, which would avoid materializing the `[T,V]` logits and buy
-headroom for bigger batches at 8K, is deferred rather than executed: see lever 3 for the 1 GiB
-logits tensor it targets. Two more stay open: 2D workgroup tiling for attention (a staged-forward
+cross-entropy over the vocab axis is no longer deferred: it shipped as `--loss-chunk`, and it had to
+fuse the readout matmul rather than only chunk the loss, because the `[T,V]` logits and their
+gradient belong to that matmul and outweigh the softmax scratch 2:1 (lever 19). Two more stay open: 2D workgroup tiling for attention (a staged-forward
 variant measured 17% SLOWER, `docs/notes/journal.md`), and cutting Newton-Schulz from five
 iterations to four, which needs an orthogonality-residual check to gate it.
 
@@ -510,6 +510,52 @@ from there out to 222,000. That measurement is at 0.9M params, so the ratio itse
 here. The direction is what matters, and it agrees with SmolLM2: the useful ratio for small models
 sits orders of magnitude above Chinchilla, with an eventual point of diminishing returns. We are at
 the opposite end of that range by more than a factor of a thousand.
+
+### 19. Chunked fused cross-entropy: 3.7 GB and the 4K context wall, for no measurable throughput (2026-09-09)
+
+Lever 3 named the per-micro-batch logits tensor as the largest single buffer and left chunking it as
+future work. Executed here, and the scoping in that note was one third of the problem: chunking the
+cross-entropy _op_ removes only `probs`. The `[T,V]` data and gradient buffers belong to the readout
+`linear`, so the readout matmul has to be fused into the loss to reach them. Three buffers, not one.
+
+`--loss-chunk N` streams the vocab N columns at a time: for each chunk, `hidden @ Wchunkᵀ` into one
+reused `[T,N]` scratch, an online-softmax update of the running (max, sum) with rescaling, and in
+backward the same matmul recomputed before the chunk's gradient is turned into `dHidden` and `dW`.
+The widest live buffer stops scaling with vocab. `srcGemm` grew a baked row offset so a chunk can
+address rows of a `[vocab, hidden]` weight without binding a sub-range (a pooled buffer is always
+bound whole); at offset 0 it emits byte-identical source, so no existing pipeline changed.
+
+Measured on qwen3 293M (vocab 151936, hidden 544, 28 layers), `--seq-len 2048 --batch 2 --reclaim`,
+6 steps, same seed:
+
+| `--loss-chunk` | throughput | peak GPU (pool + state) | loss (first 3 -> last 3) |
+| -------------- | ---------- | ----------------------- | ------------------------ |
+| off (dense)    | 73 tok/s   | 22548 MB (18053 + 4495) | 5.140 -> 6.884           |
+| 8192           | 73 tok/s   | 18881 MB (14386 + 4495) | 5.139 -> 6.881           |
+
+The pool drops 3667 MB. Predicted: three `[T,V]` buffers at 2048x151936x4 = 3735 MB, less the 67 MB
+`[T,8192]` scratch that replaces them, so 3668 MB. The loss agreeing to three decimals rather than
+four is the expected cost of reordering an f32 reduction over the vocab axis; the gpu-parity case
+compares the fused path against `crossEntropy(linear(...))` on the same inputs and holds to `BWD`
+tolerance.
+
+**The throughput column is the surprising one.** An extra full readout matmul per step should cost
+something, and it costs nothing measurable, because lever 1c already found the step host-bound
+(`gpu_busy_percent` ~52.5%): the added GPU work lands in a gap that was already idle. Do not
+generalize that to a GPU-bound shape.
+
+What it actually unlocks is context, not memory. At vocab 151936 the logits buffer is 1.16 GiB at
+T=2048 and 2.32 GiB at T=4096, against the 2048 MiB `maxStorageBufferBindingSize` Strix grants, so
+Qwen3-0.6B-shaped models at 4K did not train at any amount of free memory. Confirmed both ways:
+
+```
+--seq-len 4096            -> error: GPU storage buffer of 2374 MiB exceeds this device's limit of 2048 MiB
+--seq-len 4096 --loss-chunk 8192 -> trains, 74 tok/s, peak 30820 MB (pool 26325 + state 4495)
+```
+
+Not done here: `softCrossEntropy` (the Phase B KL anchor) still materializes `[T,V]` through the
+dense readout, so `--loss-chunk` does not apply to it. Chunking it means fusing the same readout
+into `srcSoftCeFwd`, and the sparse teacher makes the gradient `S·p − q` rather than `p − q`.
 
 ## Correctness / robustness
 

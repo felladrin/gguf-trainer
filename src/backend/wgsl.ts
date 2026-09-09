@@ -90,14 +90,28 @@ export function srcGemm(
   M: number,
   N: number,
   K: number,
+  off = 0,
 ): string {
   const [BM, BN, BK, TM, TN, WG] = [GEMM_BM, GEMM_BN, GEMM_BK, GEMM_TM, GEMM_TN, GEMM_WG];
   if (TM % 4 !== 0 || TN % 4 !== 0 || BM % 4 !== 0 || BN % 4 !== 0) {
     throw new Error(`srcGemm: BM/BN/TM/TN must be multiples of 4 (vec4 fragments)`);
   }
+  // `off` shifts the vocab-major operand by a whole number of rows, so a chunked
+  // readout can reach rows [off, off+N) of a [vocab, hidden] weight (or write
+  // rows [off, off+M) of its gradient) without binding a sub-range: a pooled
+  // buffer is always bound whole. Baked in rather than passed, so off=0 emits
+  // exactly the source it emitted before this existed and every cached pipeline
+  // is untouched.
+  const o = (expr: string) => (off ? `(${expr} + ${off}u)` : expr);
   // gr = global row (m), gc = global col (n), gk = global k index.
   const aLoad = kind === "TN" ? "AB[gk * M + gr]" : "AB[gr * K + gk]";
-  const bLoad = kind === "NT" ? "BB[gc * K + gk]" : "BB[gk * N + gc]";
+  // NT reads W rows by output column, NN reads them along K; TN's B is the
+  // hidden state (no vocab axis), so there the offset lands on the C store below.
+  const bLoad = kind === "NT"
+    ? `BB[${o("gc")} * K + gk]`
+    : kind === "NN"
+    ? `BB[${o("gk")} * N + gc]`
+    : "BB[gk * N + gc]";
   // Everything is f32: buffers, the shared tiles, the multiply, and the
   // K-length accumulation. (An f16-operand variant was removed: it gave no
   // wall-clock gain here since attention, not GEMM, dominates runtime, and
@@ -131,7 +145,8 @@ export function srcGemm(
     for (let j = 0; j < TN; j++) {
       decl += `  var acc${i}_${j} = 0.0;\n`;
       macs += `      acc${i}_${j} = acc${i}_${j} + a${i} * b${j};\n`;
-      const idx = `(blockRow + tRow + ${i}u) * N + (blockCol + tCol + ${j}u)`;
+      const rowOff = kind === "TN" && off ? ` + ${off}u` : "";
+      const idx = `(blockRow + tRow + ${i}u${rowOff}) * N + (blockCol + tCol + ${j}u)`;
       const rhs = accum ? `CB[ci] + acc${i}_${j}` : `acc${i}_${j}`;
       stores += `  if (blockRow + tRow + ${i}u < M && blockCol + tCol + ${j}u < N) ` +
         `{ let ci = ${idx}; CB[ci] = ${rhs}; }\n`;
@@ -1110,5 +1125,114 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var ind = 0.0;
   if (v == tgt) { ind = 1.0; }
   DLOG[i] = DLOG[i] + (LG[0] / DIV[0]) * (PROBS[i] * INV[t] - ind);
+}`;
+}
+
+// ---------------------------------------------------------------------------
+// Chunked fused cross-entropy. The dense path materializes three [T, vocab]
+// buffers (the readout's data and grad, plus `probs`), which is what caps
+// context: at vocab 151936 a single one of them passes a 2 GiB binding limit at
+// T=4096. These kernels stream the vocab axis in chunks instead, so the largest
+// live buffer is [T, chunk] and the readout matmul is recomputed in backward.
+// ---------------------------------------------------------------------------
+
+/**
+ * One chunk's contribution to the running softmax statistics, in the online
+ * (rescaling) form: a new chunk maximum rescales the sum accumulated so far
+ * rather than forcing a second pass over the vocab. `MX` starts at -3.0e38 and
+ * `SUM` at 0, so the first chunk's rescale factor is exp(-3.0e38 - m) == 0 and
+ * the seed contributes nothing.
+ *
+ * Also captures the target's own logit while the chunk holding it is live: it
+ * is the one value from [T, vocab] the loss needs and cannot recompute cheaply.
+ */
+export function srcCeChunkStats(T: number, Vc: number, voff: number): string {
+  const g = gridRows(T);
+  return `
+${bindF32(0, "CH", "read")}
+${bindU32(1, "TGT")}
+${bindF32(2, "MX", "read_write")}
+${bindF32(3, "SUM", "read_write")}
+${bindF32(4, "TL", "read_write")}
+const T: u32 = ${T}u; const VC: u32 = ${Vc}u; const VOFF: u32 = ${voff}u; const GX: u32 = ${g.x}u;
+var<workgroup> red: array<f32, ${CE_WG}>;
+@compute @workgroup_size(${CE_WG})
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let t = wg.y * GX + wg.x;
+  if (t >= T) { return; }                              // uniform: barriers stay legal
+  let base = t * VC;
+  var mx = -3.0e38;
+  for (var v = li; v < VC; v += ${CE_WG}u) { mx = max(mx, CH[base + v]); }
+  red[li] = mx;
+  workgroupBarrier();
+  for (var stride = ${CE_WG / 2}u; stride > 0u; stride = stride >> 1u) {
+    if (li < stride) { red[li] = max(red[li], red[li + stride]); }
+    workgroupBarrier();
+  }
+  let chunkMax = red[0];
+  workgroupBarrier();  // red is reused for the sum below
+  let mOld = MX[t];
+  let mNew = max(mOld, chunkMax);
+  var sum = 0.0;
+  for (var v = li; v < VC; v += ${CE_WG}u) { sum = sum + exp(CH[base + v] - mNew); }
+  red[li] = sum;
+  workgroupBarrier();
+  for (var stride = ${CE_WG / 2}u; stride > 0u; stride = stride >> 1u) {
+    if (li < stride) { red[li] = red[li] + red[li + stride]; }
+    workgroupBarrier();
+  }
+  if (li == 0u) {
+    SUM[t] = SUM[t] * exp(mOld - mNew) + red[0];
+    MX[t] = mNew;
+    let tgt = TGT[t];
+    if (tgt != 0xffffffffu && tgt >= VOFF && tgt < VOFF + VC) { TL[t] = CH[base + (tgt - VOFF)]; }
+  }
+}`;
+}
+
+/** Per-row loss from the streamed statistics: log(Σ exp(z-m)) + m - z_target. */
+export function srcCeLossFromStats(T: number): string {
+  return `
+${bindF32(0, "MX", "read")}
+${bindF32(1, "SUM", "read")}
+${bindF32(2, "TL", "read")}
+${bindU32(3, "TGT")}
+${bindF32(4, "LT", "read_write")}
+const T: u32 = ${T}u;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let t = gid.x;
+  if (t >= T) { return; }
+  if (TGT[t] == 0xffffffffu) { LT[t] = 0.0; return; }  // ignore-index: no loss
+  LT[t] = log(SUM[t]) + MX[t] - TL[t];
+}`;
+}
+
+/**
+ * dLogits for one chunk, written OVER the recomputed chunk in place: the chunk
+ * buffer is scratch that the caller re-fills from the readout matmul on the way
+ * into backward, so there is nothing in it left to preserve.
+ */
+export function srcCeChunkGrad(T: number, Vc: number, voff: number): string {
+  const n = T * Vc;
+  const g = grid2D(n);
+  return `
+${bindF32(0, "CH", "read_write")}
+${bindU32(1, "TGT")}
+${bindF32(2, "MX", "read")}
+${bindF32(3, "SUM", "read")}
+${bindF32(4, "LG", "read")}
+${bindF32(5, "DIV", "read")}
+const N: u32 = ${n}u; const VC: u32 = ${Vc}u; const VOFF: u32 = ${voff}u;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.y * ${g.roww}u + gid.x;
+  if (i >= N) { return; }
+  let t = i / VC;
+  let tgt = TGT[t];
+  if (tgt == 0xffffffffu) { CH[i] = 0.0; return; }     // ignore-index: no gradient
+  var ind = 0.0;
+  if (VOFF + (i % VC) == tgt) { ind = 1.0; }
+  CH[i] = (LG[0] / DIV[0]) * (exp(CH[i] - MX[t]) / SUM[t] - ind);
 }`;
 }

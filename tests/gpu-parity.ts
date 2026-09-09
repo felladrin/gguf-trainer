@@ -17,6 +17,7 @@ import {
   backward,
   crossEntropy,
   embedding,
+  fusedCrossEntropy,
   gelu,
   linear,
   mul,
@@ -146,6 +147,49 @@ async function profilerSmoke(gpu: WebGPUBackend) {
   }
   if (!ok) failures++;
   console.log(`  ${ok ? "ok " : "FAIL"} timestamp-query profiler (labels + times)`);
+}
+
+/**
+ * Fused readout + chunked cross-entropy, against the dense path it replaces
+ * (`crossEntropy(linear(...))`) rather than against its own CPU twin: the whole
+ * point of the op is that the two agree, and the dense side is already
+ * finite-difference-validated. Widths cover a ragged final chunk, an exact
+ * split and a single chunk wider than the vocab; the offset GEMM variants are
+ * only exercised when there is more than one chunk. Row 1 is ignore-index.
+ */
+async function fusedCeParity(gpu: WebGPUBackend) {
+  for (const [T, H, V, chunk] of [[4, 3, 9, 4], [8, 16, 40, 10], [6, 12, 32, 64]]) {
+    const targets = Array.from({ length: T }, (_, i) => (i === 1 ? -1 : (i * 7 + 3) % V));
+    const mk = () => {
+      const r = mulberry32(0xf00d);
+      return { h: randTensor([T, H], r), w: randTensor([V, H], r) };
+    };
+    const c = mk();
+    const cpuLoss = crossEntropy(linear(c.h, c.w), targets);
+    backward(cpuLoss, 1);
+
+    const g = mk();
+    gpu.install();
+    let ok = true;
+    try {
+      const loss = fusedCrossEntropy(g.h, g.w, targets, chunk);
+      backward(loss, 1);
+      await gpu.sync([loss]);
+      const dl = Math.abs(loss.data[0] - cpuLoss.data[0]);
+      if (dl > 1e-3 + 1e-3 * Math.abs(cpuLoss.data[0])) {
+        console.log(`    MISMATCH fusedCE loss: gpu=${loss.data[0]} cpu=${cpuLoss.data[0]}`);
+        ok = false;
+      }
+      ok = compare(`fusedCE.dHidden(chunk=${chunk})`, g.h.grad, c.h.grad, BWD) && ok;
+      ok = compare(`fusedCE.dReadout(chunk=${chunk})`, g.w.grad, c.w.grad, BWD) && ok;
+    } finally {
+      gpu.uninstall();
+    }
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} fused chunked CE vs dense (T=${T} V=${V} chunk=${chunk})`,
+    );
+  }
 }
 
 /**
@@ -530,6 +574,7 @@ async function main() {
   }
   await gpuMatmulFdCheck(gpu);
   await profilerSmoke(gpu);
+  await fusedCeParity(gpu);
   await flatOverflowGate(gpu);
   {
     // Row-per-workgroup 2-D fold: rmsNormHeads with rows = T*H past the cap.
