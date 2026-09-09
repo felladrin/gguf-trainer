@@ -680,6 +680,7 @@ async function main() {
   await evalFreezeGate();
   await generateFreezeGate();
   await frozenClearGate();
+  await clearRearmPredicateGate();
   await flatOverflowGate(gpu);
   {
     // Row-per-workgroup 2-D fold: rmsNormHeads with rows = T*H past the cap.
@@ -1625,6 +1626,70 @@ async function frozenClearGate() {
       `and ${cold.second} frozen, a saving of exactly the ${hot.params} parameters, ` +
       `loss ${hot.loss.toFixed(6)} both`,
   );
+}
+
+/**
+ * Which predicate re-arms the clear queue, pinned by the one ordering the two
+ * candidates disagree on.
+ *
+ * `e.grad !== frozenStub` and `t.requiresGrad` agree wherever the freeze came
+ * before the first `entryFor`, which is every caller today, so the counting gate
+ * above cannot tell them apart. They differ when a parameter is frozen
+ * mid-window, after that window's `entryFor` and before its `sync()`: keying on
+ * the flag records "no clear needed" while a full-size accumulator still holds
+ * that window's gradients, and the next backward after a thaw accumulates on top
+ * of them. Measured at exactly 2x when this was written.
+ *
+ * Nothing in the tree freezes mid-window. This is here so that simplifying the
+ * predicate to the flag, which reads like the same thing and passes every other
+ * check, fails something.
+ */
+async function clearRearmPredicateGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const ids = Array.from({ length: 33 }, (_, i) => (i * 11 + 5) % cfg.vocabSize);
+  const gpu = (await initWebGPU())!;
+  const m = new Gemma3Model(cfg, mulberry32(5));
+  try {
+    gpu.install();
+    gpu.uploadParams(m.params());
+    const step = async () => {
+      const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+      backward(loss, 1);
+      await gpu.sync([loss]);
+      return m.params().map((p) => Float32Array.from(p.grad));
+    };
+    const first = await step();
+
+    // The freeze lands between this window's backward and its sync, which is the
+    // only moment the two predicates disagree about.
+    const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+    backward(loss, 1);
+    freezeForScoring(m);
+    await gpu.sync([loss]);
+
+    for (const p of m.params()) p.requiresGrad = true;
+    const third = await step();
+
+    // Same inputs, same weights (nothing stepped an optimizer), so an accumulator
+    // that was properly zeroed gives the same gradients as the first step. A
+    // stale one gives twice them.
+    let worst = 0, n = 0;
+    for (let i = 0; i < first.length; i++) {
+      for (let j = 0; j < first[i].length; j++) {
+        if (Math.abs(first[i][j]) < 1e-6) continue;
+        worst = Math.max(worst, Math.abs(third[i][j] / first[i][j] - 1));
+        n++;
+      }
+    }
+    const ok = worst < 1e-4;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} clear re-arm survives a mid-window freeze: ` +
+        `worst |g3/g1 - 1| = ${worst.toExponential(2)} over ${n} elems`,
+    );
+  } finally {
+    gpu.destroy();
+  }
 }
 
 /**

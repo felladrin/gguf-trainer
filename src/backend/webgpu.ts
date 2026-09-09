@@ -413,16 +413,19 @@ export class WebGPUBackend implements OpsBackend {
         stagings.push({ stage: this.copyToStaging(e.grad, t.size * 4), dst: t.grad });
       }
       // Only a real accumulator needs zeroing. A frozen external shares the
-      // 256-byte stub and nothing ever writes to it, so re-arming this queued
-      // one no-op clearBuffer per frozen parameter per window: a few hundred of
-      // them on a 293M model, on every eval window and every LoRA step.
+      // 256-byte stub, which nothing ever writes, so re-arming it queued one
+      // no-op clearBuffer per frozen parameter per window: a few hundred on a
+      // 293M model, on every eval window and every LoRA step.
       //
-      // The one behaviour this drops: a parameter frozen AFTER it was given a
-      // full-size accumulator keeps its stale gradients, because nothing clears
-      // them again. Thawing it on this same backend would then accumulate on top
-      // of them, silently. freezeForScoring says so; a thaw wants a fresh
-      // backend.
-      e.gradNeedsClear = t.requiresGrad;
+      // The predicate is the buffer, not `t.requiresGrad`. They agree wherever
+      // the freeze came before the first entryFor, which is every caller today.
+      // They differ when a parameter is frozen mid-window, after this window's
+      // entryFor and before this sync: keying on the flag would leave that
+      // window's gradients in a full-size accumulator that nothing clears again,
+      // and a later thaw would accumulate on top of them. Measured at exactly
+      // 2x. Keying on the buffer cannot go stale in any ordering, and it still
+      // drops every clear that was measurably waste.
+      e.gradNeedsClear = e.grad !== this.frozenStub;
     }
     this.lastSyncReadbackBytes = stagings.reduce((a, s) => a + s.dst.length * 4, 0);
 

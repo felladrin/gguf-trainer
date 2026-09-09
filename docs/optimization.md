@@ -1060,9 +1060,16 @@ not: `entryFor` hands it the shared 256-byte stub precisely because nothing ever
 from the second window onward, every frozen parameter re-queued that one stub for a `clearBuffer`,
 and each of those cleared the same 256 bytes to no purpose. Two callers hit it: eval since lever 25,
 where every parameter is frozen, and LoRA training, where the base weights are frozen for the whole
-run. On a 310-tensor checkpoint at `--windows 16` that is 4960 no-op commands.
+run. On a 310-tensor checkpoint at `--windows 16` that is 4650 no-op commands: the first window
+does not queue them, because `entryFor` starts `gradNeedsClear` at `requiresGrad`.
 
-`e.gradNeedsClear = t.requiresGrad` is the whole fix.
+`e.gradNeedsClear = e.grad !== this.frozenStub` is the whole fix, and which side of that predicate
+it sits on is the interesting part. `t.requiresGrad` is the obvious spelling and it is wrong in one
+ordering: freeze a parameter mid-window, after that window's `entryFor` and before its `sync()`, and
+the flag records "no clear needed" while a full-size accumulator still holds that window's
+gradients. A later thaw then accumulates on top of them. Measured at exactly 2x, against 1.0000 on
+`main`, so that spelling would have been a real regression rather than a theoretical one. Keying on
+the buffer cannot go stale in any ordering and drops exactly the same clears.
 
 **It is worth no measurable time, and saying so is the point of this entry.** `eval-loss --windows 16
 --seq-len 512` on `littlelamb-base.f32.gguf`, three runs each:
@@ -1078,13 +1085,17 @@ Two reasons it is still worth having: the command stream now says what it means,
 it, because freezing `pretrain`'s end-of-run sample stops the copies while leaving the clears, and
 there the re-queued buffer is a full-size accumulator rather than the stub.
 
-**What it costs, and it is a documentation debt rather than a bug.** A parameter frozen after it was
-given a full-size accumulator now keeps its stale gradients, because nothing clears them again.
-`freezeForScoring` promised the thaw hazard was "a device validation error rather than a wrong
-number"; that promise now holds only for the stub path, i.e. when the freeze came before the first
-`entryFor`. Freeze a model that has already trained, thaw it on the same backend, and the next
-backward accumulates on top of pre-freeze gradients, silently. Unreachable today, and it is exactly
-#66's shape, so both the helper's docstring and the `sync()` comment now say it out loud.
+**It costs nothing, which took two wrong readings to establish.** I first wrote that a parameter
+frozen after it had a full-size accumulator would keep stale gradients forever. It does not: the
+last sync before the freeze already armed that clear while the parameter was trainable, and the
+armed clear still fires. A probe over three orderings on both branches settled it, and it also found
+the one ordering that does break, which is the mid-window freeze above. `clearRearmPredicateGate`
+pins that, because it is the only check that can tell the two candidate predicates apart: the
+counting gate passes for both.
+
+While measuring it, `freezeForScoring`'s docstring turned out to overstate its own hazard in a
+different way. "A device validation error rather than a wrong number" is true only for a tensor
+wider than 64 floats; the stub is 256 bytes, so a narrower one stages out of it without complaint.
 
 Waste has no symptom in a number, so `frozenClearGate` in `tests/gpu-parity.ts` counts instead:
 `gradClearsIssued` is a cumulative counter and the gate takes a delta around the second window,

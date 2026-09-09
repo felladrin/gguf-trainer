@@ -34,21 +34,20 @@ export const MAX_LOSS_SPANS = 100;
  * Call it before `uploadParams`: `entryFor` sizes the buffer on first use, and a
  * parameter frozen after that keeps the accumulator it already has.
  *
- * One-way, and deliberately without a thaw. Training a model that has been
- * through this needs both `requiresGrad = true` again AND a fresh backend, and
- * the two ways it breaks are not equally loud.
+ * One-way, and deliberately without a thaw, though the failure is narrower than
+ * it sounds. Measured: freeze a trained model, run any number of frozen windows,
+ * thaw it and train again, and the gradients come back correct (ratio 1.0000
+ * over 250757 elements). The last sync before the freeze already armed the
+ * accumulator's clear while the parameter was still trainable, and that armed
+ * clear still fires.
  *
- * If the freeze came first, `entryFor` handed each parameter the 256-byte stub,
- * and `sync()` would stage `t.size * 4` bytes out of it after a thaw: a device
- * validation error, which is the good case.
- *
- * If the parameters already had full-size accumulators when the freeze happened,
- * a thaw on that same backend is SILENT. `sync()` only re-arms the clear for a
- * tensor that requires grad, so the accumulator keeps whatever gradients it held
- * before the freeze and the next backward accumulates on top of them. That is
- * the shape a freeze after training has, which is why it wants a fresh backend
- * and not just a flag flip. No caller evals and trains the same model in one
- * process today.
+ * What does not survive is a THAW on the same backend after a freeze that came
+ * before the first `entryFor`. Every parameter then holds the shared 256-byte
+ * stub rather than an accumulator, and `sync()` stages `t.size * 4` bytes out of
+ * it: a device validation error for anything wider than 64 floats, and for a
+ * narrower tensor a silent read of a buffer shared with every other frozen one.
+ * So a trainable use afterwards wants a fresh backend, not just the flag back.
+ * No caller evals and trains the same model in one process today.
  */
 export function freezeForScoring(model: LanguageModel): void {
   for (const p of model.params()) p.requiresGrad = false;
