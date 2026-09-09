@@ -72,9 +72,14 @@ Violating any of these wastes a run. They are checked where possible; a few cann
 6. **The LR schedule is derived from `--steps`.** Warmup is 10% and cooldown 20% of the total, so
    resuming with a different `--steps` silently reshapes the schedule mid-run. Keep it constant
    across resumes and move `--start-step` instead.
-7. **`--seq-len` must fit `--max-seq`,** and context is capped by a WebGPU buffer limit before
-   compute: attention binds one `[heads, T, T]` buffer per layer. 8192 works on adapters that grant
-   their full buffer size; 2500-3000 on those that fall back to the 128 MiB default.
+7. **`--seq-len` must fit `--max-seq`,** and the WebGPU buffer limit caps context through the
+   logits, not attention. Attention routes on T: at `T >= 2048` the flash path allocates only a
+   per-row logsumexp (`Hq x T` floats), so the `[Hq, T, T]` buffer is allocated only BELOW 2048.
+   What `maxStorageBufferBindingSize` still caps is every single buffer that grows with context:
+   the per-micro-batch logits `[T, vocab]` and their gradient, and the embedding-weight gradients.
+   At vocab 32768 the logits are `T x 32768 x 4` bytes, so 8192 needs 1 GiB and fits an adapter
+   that grants its full limit (2 GiB measured); one that falls back to the WebGPU default of
+   128 MiB stops at 1024. The error names the buffer.
 
 ## Recipes
 
@@ -264,7 +269,7 @@ the round-trip test automatically: docs/adding-an-architecture.md.
 | `GPU/CPU parity probe failed`                                                                | the backend disagrees with the reference at init             | a real bug; stop and report it, do not train through it                                                                     |
 | NaN loss partway into a run                                                                  | f16 overflow, or a learning rate above 0.01                  | keep compute f32; `--lr 0.01` is the proven ceiling, 0.02 diverged                                                          |
 | a loss far worse than the checkpoint deserves, on a model that still generates readable text | this engine and llama.cpp disagree about the forward pass    | score one file with both before blaming the corpus: `docs/optimization.md` lever 17                                         |
-| OOM at long context                                                                          | the per-layer attention buffer                               | add `--reclaim` (5.6x less peak memory, 23% slower, lever 3b), or lower `--seq-len`                                         |
+| OOM at long context                                                                          | the activation pool, ~2.3 MB per token in flight (lever 3)   | add `--reclaim` (5.6x less peak memory, 23% slower, lever 3b), or lower `--seq-len` or `--batch`                            |
 
 ## Hardware reality
 
