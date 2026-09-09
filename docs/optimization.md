@@ -1413,6 +1413,12 @@ Everything written up to that point trained on whatever the guards were catching
 `assertCorpusFitsVocab` walks the source once when it opens, and `pretrain` calls it before the trust
 gate rather than after.
 
+`eval-loss` scans only `[lo, length)`, the region it actually scores, which at the default
+`--holdout 0.01` is a hundredth of the file. That is not a micro-optimization: this command's own
+header describes a watch loop re-running it every ten minutes against a live run's corpus, and a full
+sequential pass over a FineWeb-scale file each time would evict more page cache than it warms, while
+the eval itself touches 65,536 tokens.
+
 **It costs almost nothing.** Measured at **310M tokens/s** on this machine, so the 17.4M-token
 `lambrp.tokens` scans in 0.06 s and a FineWeb-scale 10B-token corpus would cost about 32 seconds,
 once, against a run of hours. End to end on `eval-loss --windows 4` over that corpus the difference
@@ -1435,10 +1441,24 @@ against the wrong vocab.
 window past the end returned `undefined` per token, which the losses refuse as "not an integer" by an
 odd route.
 
-Nine mutations in `tests/large-vocab.ts`. Two are worth naming: the scan stopping after its first
-chunk is caught only because the chunk size is a parameter, which is why it is one, and the chunk
-guard's removal does not fail the suite, it **hangs** it, since `start += 0` never advances. A
-hanging gate is worse than a failing one, which is the argument for the guard.
+The scan itself is `chunkSpans` from `src/io.ts`, which is `writeSpans` renamed and generalized: it
+already computed exactly this loop and already refused a bad chunk, and reusing it deletes a second
+copy of both. The rename also tightened it to a positive **integer**, since a fractional chunk
+terminates but hands the caller a fractional length. The circularity that removed is worth naming:
+the guard I had written existed only to protect the parameter I had just added, and the version in
+`io.ts` has its own test.
+
+Nine mutations in `tests/large-vocab.ts`, one in `tests/large-file-write.ts`. Two are worth naming:
+the scan stopping after its first chunk is caught only because the chunk size is a parameter, which
+is why it is one; and dropping `from` from the reported position is caught because the `from` case
+asserts an absolute position, which is what a user needs to seek to.
+
+**Still open, and not closed by a range check.** In the `.txt` branch `pretrain` reuses an existing
+`${stem}.tokens` without rewriting it, while `sharedTokenizer` retrains the vocab whenever
+`${stem}.tokenizer.json` is missing. Delete that json and you train on a stale token file built from
+a vocab that no longer exists; this catches it only if the stale ids exceed the new vocab, and a
+same-size or larger vocab passes. Closing the class needs tokenizer identity, a hash beside the
+`.tokens`, not a range check.
 
 ## Quality levers
 

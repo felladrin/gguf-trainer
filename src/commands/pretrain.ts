@@ -293,9 +293,14 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   // --- Tokens + tokenizer: pretokenized (.tokens) or raw (.txt) input ---
   let tok: BPETokenizer;
   let src: TokenSource;
+  // The file the source actually reads, which in the .txt branch is the derived
+  // .tokens beside it. An error naming the .txt would send you to retokenize
+  // when the fix is deleting the stale .tokens the branch below reuses.
+  let srcPath: string;
   if (inputPath.endsWith(".tokens")) {
     tok = await siblingTokenizer(inputPath);
     src = await diskTokenSource(inputPath, tokenBytes(tok.vocabSize));
+    srcPath = inputPath;
     console.log(`Tokens: ${inputPath} (${(src.length / 1e6).toFixed(1)}M, pretokenized)`);
   } else {
     const corpus = await readFileText(inputPath).catch(() =>
@@ -311,6 +316,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       await writeTokenFile(tokensPath, encodeCorpus(tok, corpus), bpt);
     }
     src = await diskTokenSource(tokensPath, bpt);
+    srcPath = tokensPath;
   }
   // Instruct/SFT stage (--mask): supervise only the assistant turns, using the
   // mask `chat-corpus` wrote beside the .tokens file. Without it every
@@ -386,7 +392,8 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   // built against a different vocab passes that and the run gets tens of
   // thousands of steps in before some later window happens to hold a high id.
   // One sequential pass over a file this run is about to read thousands of times.
-  assertCorpusFitsVocab(src, cfg.vocabSize, inputPath);
+  const scanned = assertCorpusFitsVocab(src, cfg.vocabSize, srcPath);
+  console.log(`Corpus: ${(scanned / 1e6).toFixed(1)}M tokens fit vocab ${cfg.vocabSize} ✓`);
 
   // Trust gate: GPU forward+loss must match the CPU reference at init.
   const probeIn = src.window(0, 16), probeTgt = src.window(1, 16);

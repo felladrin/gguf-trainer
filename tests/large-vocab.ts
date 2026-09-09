@@ -183,18 +183,26 @@ ok(
   // after the first chunk would pass everything above.
   for (const pos of [0, 63, 64, 65, 4095]) {
     throws(
-      () => assertCorpusFitsVocab(at(pos, V), V, "corpus.tokens", 64),
+      () => assertCorpusFitsVocab(at(pos, V), V, "corpus.tokens", { chunk: 64 }),
       `at position ${pos} is outside`,
       `a bad id at ${pos} is found with a 64-token chunk`,
     );
   }
-  assertCorpusFitsVocab(clean, V, "clean", 64);
-  assertCorpusFitsVocab(clean, V, "clean", 4096);
-  assertCorpusFitsVocab(clean, V, "clean", 9999);
+  assertCorpusFitsVocab(clean, V, "clean", { chunk: 64 });
+  assertCorpusFitsVocab(clean, V, "clean", { chunk: 4096 });
+  assertCorpusFitsVocab(clean, V, "clean", { chunk: 9999 });
   throws(
-    () => assertCorpusFitsVocab(clean, V, "clean", 0),
-    "chunk must be >= 1",
+    () => assertCorpusFitsVocab(clean, V, "clean", { chunk: 0 }),
+    "chunk must be a positive whole number",
     "a non-positive chunk is refused rather than looping forever",
+  );
+  // `from` is what keeps eval-loss from reading the part of the file it never
+  // scores: a bad id before it must not be reported.
+  assertCorpusFitsVocab(at(10, V), V, "clean", { from: 11 });
+  throws(
+    () => assertCorpusFitsVocab(at(3000, V), V, "corpus.tokens", { from: 2000 }),
+    "at position 3000 is outside",
+    "a bad id after `from` is still found, and still at its absolute position",
   );
 
   // memTokenSource had no bounds check, so a window past the end returned

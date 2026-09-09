@@ -13,7 +13,7 @@
 // when the vocab fits in u16, else 4. tokenBytes(vocabSize) picks the width;
 // the reader is told the width (the model's config carries the vocab size).
 
-import { openReader, writeFileBytes } from "../io.ts";
+import { chunkSpans, openReader, writeFileBytes } from "../io.ts";
 
 export interface TokenSource {
   /** Number of tokens in the corpus. */
@@ -79,20 +79,19 @@ const SCAN_CHUNK = 1 << 20;
  *
  * One sequential pass over a file the run is about to read thousands of times,
  * measured at 310M tokens/s on this machine, so a FineWeb-scale 10B-token corpus
- * costs about 32 seconds once. `chunk` exists so the chunking itself is
- * testable at a size a test can build.
+ * costs about 32 seconds once. `from` exists because `eval-loss` scores only the
+ * tail of its file and has no business reading the rest; `chunk` because the
+ * chunking is otherwise untestable at a size a test can build. Returns the
+ * number of tokens scanned, so a caller can say so.
  */
 export function assertCorpusFitsVocab(
   src: TokenSource,
   vocabSize: number,
   path: string,
-  chunk = SCAN_CHUNK,
-): void {
-  if (!Number.isInteger(chunk) || chunk < 1) {
-    throw new Error(`scan chunk must be >= 1, got ${chunk}`);
-  }
-  for (let start = 0; start < src.length; start += chunk) {
-    const len = Math.min(chunk, src.length - start);
+  { from = 0, chunk = SCAN_CHUNK }: { from?: number; chunk?: number } = {},
+): number {
+  for (const { off, len } of chunkSpans(src.length - from, chunk)) {
+    const start = from + off;
     const w = src.window(start, len);
     for (let i = 0; i < len; i++) {
       const id = w[i];
@@ -105,6 +104,7 @@ export function assertCorpusFitsVocab(
       }
     }
   }
+  return src.length - from;
 }
 
 /** number[] -> memTokenSource; an existing TokenSource passes through. Lets the

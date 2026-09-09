@@ -64,9 +64,6 @@ async function run(v: Values) {
   if (badForModel) die(badForModel);
 
   const src = await diskTokenSource(tokensPath, tokenBytes(cfg.vocabSize));
-  // Up front, not on whichever window happens to hold the bad id: the whole
-  // score is meaningless if the corpus and the checkpoint disagree.
-  assertCorpusFitsVocab(src, cfg.vocabSize, tokensPath);
   // Held-out region: the last `holdout` fraction of the stream. maxStart leaves
   // room for the input window plus its +1-shifted target.
   const regionStart = Math.floor(src.length * (1 - holdout));
@@ -75,6 +72,16 @@ async function run(v: Values) {
   if (hi <= lo) {
     die(`holdout region too small: need > ${seqLen + 1} tokens, have ${src.length - lo}`);
   }
+
+  // Up front, not on whichever window happens to hold the bad id: the whole
+  // score is meaningless if the corpus and the checkpoint disagree. Only over
+  // [lo, length), which is exactly what gets scored, since every window start is
+  // >= lo and every read ends by length. The command's own header describes a
+  // watch loop re-running this every ten minutes against a live run's corpus,
+  // and a full pass over a FineWeb-scale file each time would evict more cache
+  // than it warms.
+  const scanned = assertCorpusFitsVocab(src, cfg.vocabSize, tokensPath, { from: lo });
+  console.log(`Corpus: ${(scanned / 1e6).toFixed(1)}M scored tokens fit vocab ${cfg.vocabSize} ✓`);
 
   // FIXED windows: seeded once, so every checkpoint is scored on the same tokens.
   const rng = mulberry32(seed);
