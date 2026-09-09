@@ -749,6 +749,48 @@ a real dual-machine drift bug. A small sync script with `--delete` (excluding `c
 reading is far out; checkpoints every 500 steps are the only early signal. A `--logEvery` flag would
 give a tighter early-training view without touching the checkpoint cadence.
 
+### 22. `writeFileSync` wrote 1 TB for a 2.39 GB checkpoint (2026-09-09)
+
+Not a performance lever, recorded here because it is a measured runtime limit that silently caps
+what this repo can export. Exporting a Qwen3-0.6B-shaped checkpoint filled a 1.9 TB disk twice: the
+`.tmp` reached 1.19 TB and then 855 GB, still growing when killed.
+
+`exportGGUF` was innocent, and instrumenting it proved that: it returned exactly 2,390,146,560
+bytes. The inflation was entirely in `writeFileBytes`, a bare `fs.writeFileSync(path, data)`. On
+Deno 2.9.1 that call does not survive a buffer longer than 2^31 bytes, and rather than failing it
+writes without bound. Isolated:
+
+| buffer            | result                                         |
+| ----------------- | ---------------------------------------------- |
+| 1.90 GiB          | file matches                                   |
+| 2^31 - 1024 bytes | file matches                                   |
+| 2^31 + 1024 bytes | unbounded write, process killed by `ulimit -f` |
+
+Reads are unaffected on Deno: `readFileSync` returns a 2 GiB+ file correctly, so `--resume` was
+never at risk. Under Node it throws `ERR_FS_FILE_TOO_LARGE` past 2^31 - 1 (measured at both 2.2 GB
+and 4.4 GB on v26.8.1), which no shipped path reaches because the CLI is Deno-only, and which is why
+the large case below skips on Node rather than reporting a failure that is not this defect. `writeFileBytes` now writes through an open handle in 1 GiB spans.
+
+**What it was capping.** An f32 GGUF crosses 2^31 bytes at ~537M parameters, so the two largest
+rows of the readme's own base-model table could not be exported at all: Qwen3-0.6B-Base (2.22 GiB)
+and TinyLlama_v1.1 (4.10 GiB). Nothing had hit it because every model taken end to end here is
+smaller: LittleLamb-293M exports at 1.09 GiB.
+
+Every large writer in the tree goes through `writeFileBytes`, so one change covers all of them. The
+optimizer sidecar would have hit this before the weights did: it is 1504 MB for a 293M model, so a
+0.6B run's sidecar is ~3 GB. `chat-corpus` reaches it too, through `writeTokenFile`, past ~537M
+tokens.
+
+The regression test is `tests/large-file-write.ts`. Its cheap half checks the span arithmetic and
+byte-exact round trips at chunk sizes small enough to cross several spans in milliseconds, which is
+the part an edit is likely to break; a 5000-byte write at the production 1 GiB chunk is one span and
+would exercise none of it. The real 4.10 GiB write is behind `GGUF_TRAINER_BIG_IO=1` (~4.6 GB of RAM
+and disk) and runs in a child process under `ulimit -f`, because a regression there does not fail an
+assertion, it runs away: bounded, it dies on SIGXFSZ and the parent reports an ordinary FAIL and
+removes the temp directory the killed child could not. What
+no test here can reach is the partial-write drain, since `writeSync` never returns short for a
+regular file.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
