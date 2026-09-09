@@ -1884,7 +1884,7 @@ async function targetRangeGate(gpu: WebGPUBackend) {
     const ok = dense && fused && embed && scores;
     if (!ok) failures++;
     console.log(
-      `  ${ok ? "ok " : "FAIL"} GPU refuses a target outside the vocab ` +
+      `  ${ok ? "ok " : "FAIL"} GPU refuses an index outside its table ` +
         `(dense ${dense}, fused ${fused}, embedding ${embed}, ` +
         `V-1 scores ${good.data[0].toFixed(4)})`,
     );

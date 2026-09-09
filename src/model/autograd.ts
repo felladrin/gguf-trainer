@@ -109,6 +109,7 @@ export interface OpsBackend {
   scale(x: Tensor, c: number): Tensor;
   rmsNorm(x: Tensor, weight: Tensor, eps: number): Tensor;
   rmsNormHeads(x: Tensor, weight: Tensor, T: number, H: number, hd: number, eps: number): Tensor;
+  /** Ids are validated by the `embedding` wrapper, above this dispatch. */
   embedding(weight: Tensor, ids: number[]): Tensor;
   rope(x: Tensor, T: number, H: number, hd: number, base: number, posOffset: number): Tensor;
   attention(

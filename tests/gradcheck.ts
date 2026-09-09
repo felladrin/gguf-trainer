@@ -372,7 +372,8 @@ async function main() {
       }
     };
     const range = /is not an integer in \[0,6\)/;
-    const refuses = (ids: number[]) => range.test(message(() => embedding(w, ids)));
+    const refuses = (ids: number[], pattern: RegExp = range) =>
+      pattern.test(message(() => embedding(w, ids)));
     const accepts = (ids: number[]) => {
       const out = embedding(w, ids);
       for (let t = 0; t < ids.length; t++) {
@@ -383,7 +384,12 @@ async function main() {
       return true;
     };
     const cases: [string, boolean][] = [
-      ["id == V", refuses([0, V, 1])],
+      // The position is asserted on one case, and one bad id sits FIRST. Without
+      // either, a loop starting at t = 1 or reporting t + 1 passes everything,
+      // and lever 29's "position 20 against position 19" argument rests on that
+      // number.
+      ["id == V", refuses([0, V, 1], /id 6 at position 1 is not an integer in \[0,6\)/)],
+      ["id == V in the first position", refuses([V, 0, 1])],
       ["id far past V", refuses([0, 1, 999])],
       ["a negative id", refuses([0, -1, 1])],
       ["a non-integer id", refuses([0, 1.5, 1])],

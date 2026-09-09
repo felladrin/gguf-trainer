@@ -972,15 +972,18 @@ the digits move with pool state, which is the argument for checking on the host 
 That shows in the end-to-end symptom too. Scoring `smolrp.gguf` (vocab 49152) against a corpus
 tokenized with the 151936-entry Qwen3 vocab, `eval-loss --windows 1 --seq-len 128`:
 
-|         | before                           | after                                                                                     |
-| ------- | -------------------------------- | ----------------------------------------------------------------------------------------- |
-| `--cpu` | `val loss NaN  ppl NaN`          | `crossEntropy: target 49751 at position 19 is not -1 (ignore) or an integer in [0,49152)` |
-| GPU     | `val loss 10.9754  ppl 58420.99` | the same message                                                                          |
+|         | before                           | after this lever                                                                          | after lever 29                           |
+| ------- | -------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------- |
+| `--cpu` | `val loss NaN  ppl NaN`          | `crossEntropy: target 49751 at position 19 is not -1 (ignore) or an integer in [0,49152)` | `embedding: id 49751 at position 20 ...` |
+| GPU     | `val loss 10.9754  ppl 58420.99` | the same message                                                                          | the same message                         |
+
+The third column is what you see today. Lever 29 guards the input side, which the same corpus reaches
+one step earlier, so this check now fires only when the inputs are in range and a target is not.
 
 A perplexity of 58421 from a completely mismatched pairing is a believable-looking number, and it is
 the reason the check runs on the host rather than being left to the device. Read the CPU's NaN there
 as a measurement, not as this mechanism: the input stream carries the same out-of-range ids as the
-target stream, so `embedding` poisons the CPU forward (#63) before the loss runs, and the loss's own
+target stream, so `embedding` poisons the CPU forward (it did then; lever 29) before the loss runs, and the loss's own
 last-row overrun only fires when the last target happens to be out of range.
 
 `keptRowsInVocab` does the range check and returns the kept count, so it replaces the counting loop
@@ -1004,8 +1007,7 @@ count. Making the helper count ignored rows fails `-1 still means ignore`.
 Not covered here, and neighbours of the same mistake: the GPU `softCrossEntropy` still does not
 validate its teacher ids where the CPU one does (#61), and the refusal lands mid-run rather than at
 start-up (#64), which matters for `pretrain`, whose trust gate only reads the first 16 tokens.
-`embedding`, the input-side twin, was #63 and is now lever 29; it fires before this check, so the
-end-to-end message quoted above is what you saw only until that landed.
+`embedding`, the input-side twin, was #63 and is now lever 29.
 
 ### 27. `generate` paid lever 25's cost per token, 39% of its wall clock (2026-09-09)
 
