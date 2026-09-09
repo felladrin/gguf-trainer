@@ -923,7 +923,8 @@ at the full model; moving it after `uploadParams` drops the readback but not the
 assertion is what pins the ordering.
 
 `generate` has the same defect and pays it per token rather than per window: 40.1% of its wall
-clock on the same checkpoint. It is #58, deliberately not fixed here. Freezing also leaves `sync()`
+clock on the same checkpoint, over two runs. It was #58, fixed in lever 27, where a three-run
+measurement put it at 39.0%. Freezing also leaves `sync()`
 re-queueing the shared stub for clearing once per frozen parameter per window, which is #60 and
 applies to LoRA training as much as to eval.
 
@@ -1031,15 +1032,17 @@ caller-owned model does not belong in a forward helper, whether or not it happen
 today's callers.
 
 `generateFreezeGate` in `tests/gpu-parity.ts` pins it the way lever 25's gate does. The frozen arm's
-readback is exactly the last step's logits, `[ctx, vocab]` f32 and nothing else, which is safe to
-assert exactly because no stop token is passed (so the loop always runs to `maxNew`) and the context
-never reaches `maxSeq`. Making `freezeForScoring` a no-op leaves the readback at the full model;
+readback is exactly the last step's logits, `[ctx, vocab]` f32 and nothing else. That is safe to
+assert exactly, rather than as a bound, because no stop token is passed, so the loop always runs to
+`maxNew`; the context length carries `greedyComplete`'s own `maxSeq` clamp rather than assuming it
+does not bind. Making `freezeForScoring` a no-op leaves the readback at the full model;
 moving the call after `uploadParams` drops the readback but not the pool.
 
-The arm that compares the generated ids is a **canary, not a guard**. Nothing in the forward reads
-`requiresGrad`: every read is `entryFor`'s buffer choice, `sync()`'s staging decision, or a dW
-dispatch inside a `_backward` closure. So no regression in the freeze can move the text, and that
-assertion cannot be mutation-proved. It is there to catch a future forward-path read of the flag,
+The arm that compares the generated ids is a **canary, not a guard**. No read of `requiresGrad`
+feeds an output value: each one is `entryFor`'s buffer choice, `sync()`'s staging decision, or a
+gate on a dW accumulation, and that last kind is read in the closure on the GPU path but captured at
+forward time on the CPU one (`const wantsDW = w.requiresGrad`). None of them writes to `out.data`.
+So no regression in the freeze can move the text, and that assertion cannot be mutation-proved. It is there to catch a future forward-path read of the flag,
 which is a different thing from evidence that this change is safe.
 
 `generate` is the last forward-only COMMAND, but not the last forward-only workload. `pretrain`

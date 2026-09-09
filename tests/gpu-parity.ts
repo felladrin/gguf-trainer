@@ -1540,9 +1540,12 @@ async function generateFreezeGate() {
   const wasCopying = hot.readback >= paramBytes;
   const stopped = cold.readback === lastLogits;
   const smaller = cold.pool < hot.pool - 0.9 * paramBytes;
-  // A canary, not a guard: nothing in the forward reads requiresGrad, so no
-  // regression in the freeze can move the text and this cannot be
-  // mutation-proved. It is here to catch a future forward-path read of it.
+  // A canary, not a guard. No read of requiresGrad feeds an output value: each
+  // is entryFor's buffer choice, sync()'s staging decision, or a gate on a dW
+  // accumulation (read in the closure on the GPU path, captured as wantsDW at
+  // forward time on the CPU one). So no regression in the freeze can move the
+  // text and this cannot be mutation-proved. It is here for a future forward
+  // read of the flag.
   const same = hot.ids === cold.ids;
 
   const ok = wasCopying && stopped && smaller && same;
