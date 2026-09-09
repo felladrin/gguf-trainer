@@ -679,6 +679,8 @@ async function main() {
   await recomputeMemoryGate();
   await evalFreezeGate();
   await generateFreezeGate();
+  await frozenClearGate();
+  await clearRearmPredicateGate();
   await flatOverflowGate(gpu);
   {
     // Row-per-workgroup 2-D fold: rmsNormHeads with rows = T*H past the cap.
@@ -1556,6 +1558,145 @@ async function generateFreezeGate() {
       `${cold.readback} B (logits alone ${lastLogits} B, params ${mb(paramBytes)} MB), ` +
       `pool ${mb(hot.pool)} -> ${mb(cold.pool)} MB, ids ${cold.ids}`,
   );
+}
+
+/**
+ * The clear queue. `sync()` re-arms `gradNeedsClear` for every touched external,
+ * and `entryFor` then queues that buffer for a `clearBuffer` on the next window.
+ * A frozen external shares one 256-byte stub that nothing ever writes, so every
+ * one of those clears was a no-op: a few hundred per window on a 293M model
+ * under eval, and per step under LoRA, where the base weights are frozen for the
+ * whole run.
+ *
+ * Waste has no symptom in a number, so the only way to see it is to count. The
+ * second window is what matters: on the first, a frozen parameter is not queued
+ * at all, because `entryFor` starts `gradNeedsClear` at `requiresGrad`. The
+ * count does not go to zero, and should not: `makeOut` queues every
+ * intermediate's gradient buffer unconditionally, which is a separate waste in a
+ * forward-only run (#67).
+ */
+async function frozenClearGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const ids = Array.from({ length: 33 }, (_, i) => (i * 11 + 5) % cfg.vocabSize);
+  const arm = async (freeze: boolean) => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    try {
+      if (freeze) freezeForScoring(m);
+      gpu.install();
+      gpu.uploadParams(m.params());
+      // params().length stands in for "externals this forward touches", which
+      // holds because this forward touches every parameter. A parameter a future
+      // forward skipped would move the count for a reason unrelated to freezing.
+      const window = async () => {
+        const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+        await gpu.sync([loss]);
+        return loss.data[0];
+      };
+      await window();
+      const before = gpu.gradClearsIssued;
+      const loss = await window();
+      return { second: gpu.gradClearsIssued - before, params: m.params().length, loss };
+    } finally {
+      gpu.destroy();
+    }
+  };
+  const hot = await arm(false);
+  const cold = await arm(true);
+
+  // Exactly one clear per parameter goes away, and nothing else does. The rest
+  // of the count is the per-window intermediates, which makeOut queues
+  // unconditionally at creation; those are a separate waste in a forward-only
+  // run and are #67, not this.
+  const savedTheParams = hot.second - cold.second === hot.params;
+  // Weak on its own, since the intermediates alone satisfy it: what it catches
+  // is makeOut's queue disappearing, which would make the assertion above pass
+  // for the wrong reason. That a TRAINABLE accumulator still gets zeroed is
+  // proved elsewhere, by the 16 parity checks that fail if the re-arm is dropped
+  // rather than narrowed.
+  const stillClears = hot.second > hot.params;
+  // And the loss does not move, which is the claim that the removed clears were
+  // doing nothing in the first place.
+  const same = hot.loss === cold.loss;
+
+  const ok = savedTheParams && stillClears && same;
+  if (!ok) failures++;
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} frozen clears: second window issues ${hot.second} unfrozen ` +
+      `and ${cold.second} frozen, a saving of exactly the ${hot.params} parameters, ` +
+      `loss ${hot.loss.toFixed(6)} both`,
+  );
+}
+
+/**
+ * Which predicate re-arms the clear queue, pinned by the one ordering the two
+ * candidates disagree on.
+ *
+ * `e.grad !== frozenStub` and `t.requiresGrad` agree wherever the freeze came
+ * before the first `entryFor`, which is every caller today, so the counting gate
+ * above cannot tell them apart. They differ when a parameter is frozen
+ * mid-window, after that window's `entryFor` and before its `sync()`: keying on
+ * the flag records "no clear needed" while a full-size accumulator still holds
+ * that window's gradients, and the next backward after a thaw accumulates on top
+ * of them. Measured at exactly 2x when this was written.
+ *
+ * Nothing in the tree freezes mid-window. This is here so that simplifying the
+ * predicate to the flag, which reads like the same thing and passes every other
+ * check, fails something.
+ *
+ * It reads host `p.grad`, which `sync()` refreshes only while the tensor
+ * requires grad and is not in `gradKeptOnDevice`. Construct an optimizer here,
+ * or call `keepGradOnDevice`, and the staging stops: `third` would be a copy of
+ * the step-1 host array and the gate would pass against any device state.
+ */
+async function clearRearmPredicateGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const ids = Array.from({ length: 33 }, (_, i) => (i * 11 + 5) % cfg.vocabSize);
+  const gpu = (await initWebGPU())!;
+  const m = new Gemma3Model(cfg, mulberry32(5));
+  try {
+    gpu.install();
+    gpu.uploadParams(m.params());
+    const step = async () => {
+      const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+      backward(loss, 1);
+      await gpu.sync([loss]);
+      return m.params().map((p) => Float32Array.from(p.grad));
+    };
+    const first = await step();
+
+    // The freeze lands between this window's backward and its sync, which is the
+    // only moment the two predicates disagree about.
+    const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+    backward(loss, 1);
+    freezeForScoring(m);
+    await gpu.sync([loss]);
+
+    for (const p of m.params()) p.requiresGrad = true;
+    const third = await step();
+
+    // Same inputs, same weights (nothing stepped an optimizer), so an accumulator
+    // that was properly zeroed gives the same gradients as the first step. A
+    // stale one gives twice them.
+    let worst = 0, n = 0;
+    for (let i = 0; i < first.length; i++) {
+      for (let j = 0; j < first[i].length; j++) {
+        if (Math.abs(first[i][j]) < 1e-6) continue;
+        worst = Math.max(worst, Math.abs(third[i][j] / first[i][j] - 1));
+        n++;
+      }
+    }
+    // n > 0 or this passes on an all-zero gradient: every element below the
+    // threshold is skipped, so an empty comparison leaves `worst` at 0.
+    const ok = n > 0 && worst < 1e-4;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} clear re-arm survives a mid-window freeze: ` +
+        `worst |g3/g1 - 1| = ${worst.toExponential(2)} over ${n} elems`,
+    );
+  } finally {
+    gpu.destroy();
+  }
 }
 
 /**

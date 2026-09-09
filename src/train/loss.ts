@@ -34,12 +34,20 @@ export const MAX_LOSS_SPANS = 100;
  * Call it before `uploadParams`: `entryFor` sizes the buffer on first use, and a
  * parameter frozen after that keeps the accumulator it already has.
  *
- * One-way, and deliberately without a thaw. Training a model that has been
- * through this needs both `requiresGrad = true` again AND a fresh backend:
- * `entryFor` has already handed each parameter the 256-byte stub, and `sync()`
- * would then stage `t.size * 4` bytes out of it, which is a device validation
- * error rather than a wrong number. No caller evals and trains the same model
- * in one process today.
+ * One-way, and deliberately without a thaw, though the failure is narrower than
+ * it sounds. Measured: freeze a trained model, run any number of frozen windows,
+ * thaw it and train again, and the gradients come back correct (ratio 1.0000
+ * over 250757 elements). The last sync before the freeze already armed the
+ * accumulator's clear while the parameter was still trainable, and that armed
+ * clear still fires.
+ *
+ * What does not survive is a THAW on the same backend after a freeze that came
+ * before the first `entryFor`. Every parameter then holds the shared 256-byte
+ * stub rather than an accumulator, and `sync()` stages `t.size * 4` bytes out of
+ * it: a device validation error for anything wider than 64 floats, and for a
+ * narrower tensor a silent read of a buffer shared with every other frozen one.
+ * So a trainable use afterwards wants a fresh backend, not just the flag back.
+ * No caller evals and trains the same model in one process today.
  */
 export function freezeForScoring(model: LanguageModel): void {
   for (const p of model.params()) p.requiresGrad = false;
