@@ -1857,12 +1857,15 @@ async function targetRangeGate(gpu: WebGPUBackend) {
   const w = randTensor([V, H], mulberry32(37));
   gpu.install();
   try {
-    const refused = (fn: () => unknown) => {
+    const refused = (
+      fn: () => unknown,
+      pattern = /is not -1 \(ignore\) or an integer in \[0,/,
+    ) => {
       try {
         fn();
         return false;
       } catch (e) {
-        return /is not -1 \(ignore\) or an integer in \[0,/.test((e as Error).message);
+        return pattern.test((e as Error).message);
       }
     };
     // The legal arm first, and read back: on the device `loss.data` holds zeros
@@ -1874,11 +1877,16 @@ async function targetRangeGate(gpu: WebGPUBackend) {
     const logits = linear(hid, w);
     const dense = refused(() => crossEntropy(logits, [0, V, 1]));
     const fused = refused(() => fusedCrossEntropy(hid, w, [0, V, 1], 2));
-    const ok = dense && fused && scores;
+    // The input side too. Its guard sits above the backend dispatch, so this
+    // fails if someone moves it below, where an installed backend skips it.
+    const table = randTensor([V, H], mulberry32(41));
+    const embed = refused(() => embedding(table, [0, V, 1]), /is not an integer in \[0,/);
+    const ok = dense && fused && embed && scores;
     if (!ok) failures++;
     console.log(
       `  ${ok ? "ok " : "FAIL"} GPU refuses a target outside the vocab ` +
-        `(dense ${dense}, fused ${fused}, V-1 scores ${good.data[0].toFixed(4)})`,
+        `(dense ${dense}, fused ${fused}, embedding ${embed}, ` +
+        `V-1 scores ${good.data[0].toFixed(4)})`,
     );
   } finally {
     // The legal arm above recorded work; draining here keeps the gate

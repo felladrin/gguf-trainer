@@ -510,6 +510,7 @@ export function rmsNormHeads(
 
 /** Embedding lookup: weight:[V,d], ids:number[T] -> [T,d]. */
 export function embedding(weight: Tensor, ids: number[]): Tensor {
+  assertIdsInTable(ids, weight.shape[0], "embedding");
   if (opsBackend) return opsBackend.embedding(weight, ids);
   const [, d] = weight.shape;
   const T = ids.length;
@@ -685,6 +686,33 @@ export function attention(
     }
   };
   return out;
+}
+
+/**
+ * Every embedding id must be a row of the table.
+ *
+ * `weight.data[id * d + j]` with `id >= V` reads into the next row, or past the
+ * array on the last one. Measured at V=4, d=3 with an id of `V + 2`: the CPU
+ * returns `[NaN, NaN, NaN]`, which poisons the whole forward, and the GPU
+ * returns `[0, 0, 0]`, because the bound buffer discards the read. Neither
+ * stops, and the GPU's substituted zero row is the worse of the two, since the
+ * run continues on a number that looks fine.
+ *
+ * Unlike a loss target there is no ignore marker: every position of a batch is
+ * a real token. Checked above the backend dispatch rather than in each backend,
+ * which is this file's convention for a guard both paths need and neither can
+ * fold into work it already does.
+ */
+export function assertIdsInTable(ids: number[], V: number, where: string): void {
+  for (let t = 0; t < ids.length; t++) {
+    const id = ids[t];
+    if (!Number.isInteger(id) || id < 0 || id >= V) {
+      throw new Error(
+        `${where}: id ${id} at position ${t} is not an integer in [0,${V}). ` +
+          `A corpus tokenized with a different vocab than the checkpoint is the usual cause.`,
+      );
+    }
+  }
 }
 
 /**
