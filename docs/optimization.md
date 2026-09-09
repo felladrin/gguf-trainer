@@ -948,8 +948,9 @@ were inconsistent and the one without a check was the one on every training path
 **The GPU was not safer, which is what the issue assumed and what this lever said first.** The claim
 was that WGSL's robust buffer access clamps or discards an out-of-range read. It does not apply:
 `bindGroup` passes no offset and no size, so the logits buffer is bound whole and `LOG[t * V + tgt]`
-with `tgt >= V` is a perfectly in-bounds read of the next row. Measured at `T=3, V=6` with rows 0
-and 2 ignored, so the loss IS the kept row's term:
+with `tgt >= V` is a perfectly in-bounds read of the next row. Measured at `T=3, V=6`, one kept row
+per configuration so the reported mean IS that row's term, with the out-of-range target on the row
+named:
 
 |                                                                      | CPU               | GPU               |
 | -------------------------------------------------------------------- | ----------------- | ----------------- |
@@ -962,7 +963,8 @@ CPU reads past its array and announces itself with NaN, while the GPU returns a 
 number. Where that number comes from depends on the size, and neither source is stable: at `V=6` the
 overrun stays inside the 256-byte bucket `BufferPool` rounds every allocation up to, and pooled
 buffers come back dirty, so it is whatever the last tenant left; at a real vocab the read lands well
-past the end of the buffer and WebGPU's bounds checking supplies a defined value instead. Either way
+past the end of the buffer, where WGSL promises memory safety and some in-bounds value of its
+choosing, not a particular one. Either way
 the digits move with pool state, which is the argument for checking on the host rather than quoting
 2.1300957 as if it were a constant.
 
@@ -975,7 +977,10 @@ tokenized with the 151936-entry Qwen3 vocab, `eval-loss --windows 1 --seq-len 12
 | GPU     | `val loss 10.9754  ppl 58420.99` | the same message                                                                          |
 
 A perplexity of 58421 from a completely mismatched pairing is a believable-looking number, and it is
-the reason the check runs on the host rather than being left to the device.
+the reason the check runs on the host rather than being left to the device. Read the CPU's NaN there
+as a measurement, not as this mechanism: the input stream carries the same out-of-range ids as the
+target stream, so `embedding` poisons the CPU forward (#63) before the loss runs, and the loss's own
+last-row overrun only fires when the last target happens to be out of range.
 
 `keptRowsInVocab` does the range check and returns the kept count, so it replaces the counting loop
 each of the four losses already ran and costs no extra pass. All four call it: the CPU and GPU
