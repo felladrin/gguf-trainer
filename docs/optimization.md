@@ -1048,12 +1048,14 @@ forward time on the CPU one (`const wantsDW = w.requiresGrad`). None of them wri
 So no regression in the freeze can move the text, and that assertion cannot be mutation-proved. It is there to catch a future forward-path read of the flag,
 which is a different thing from evidence that this change is safe.
 
-`generate` is the last forward-only COMMAND, but not the last forward-only workload. `pretrain`
-samples once when training is over, two prompts at 60 tokens through the same `greedyComplete`, and
-pays the same cost per token. It can be frozen, contrary to what this lever said first: the sample
-runs after `trainLMGpuResident` returns, and nothing after it reads a gradient. The mechanism there
-is different enough to want its own test, since the parameters already carry full accumulators from
-training, so freezing stops the copy without saving the allocation. That is #66.
+`generate` is the last forward-only workload that pays this. `pretrain` samples once when training
+is over, two prompts at 60 tokens through the same `greedyComplete`, and it looked like the same
+bug: that was #66, and it is not one. Every GPU optimizer calls `keepGradOnDevice` on the parameters
+it owns while building its state (`muon-gpu.ts`, `adamw-gpu.ts`), and `paramGroups()` covers every
+parameter, so by the time the sample runs each one is already exempt from staging. Measured on the
+real sequence, a resident training step with `MuonGpu` followed by a sample: the last sync reads back
+1280 bytes, the logits alone, with or without a `keepGradOnDevice` call of our own. A LoRA run
+reaches the same place by the other route, its base weights being frozen.
 
 ### 28. The clear queue re-armed itself for frozen parameters, and it buys no time (2026-09-09)
 
