@@ -9,6 +9,9 @@
 // importing webgpu.ts here is safe (no top-level GPU access).
 // Run:  deno run tests/export-extras.ts
 import { parseQuantList } from "../src/gguf/quantize.ts";
+import { addMatrix, addVector, tensorLoader } from "../src/arch/common.ts";
+import { GGUFWriter, readGGUF } from "../src/gguf/gguf.ts";
+import { Tensor } from "../src/model/autograd.ts";
 import { llamaRunScript } from "../src/export/export-gguf.ts";
 import { guardBufferSize } from "../src/backend/webgpu.ts";
 import { gemma3Config } from "../src/arch/gemma3.ts";
@@ -110,6 +113,86 @@ for (
   const over = `${lossChunkModelError(exact - 1, V, "qwen3", withReadout)}`;
   ok(over.includes(`${MAX_LOSS_SPANS + 1} spans`), "one under the cap is refused, counting spans");
   ok(over.includes(`at least ${exact}`), "and the message's raise-to value is reachable");
+}
+
+// The GGUF tensor boundary, in both directions. The destination shape comes from
+// the metadata config rather than from the file, so nothing was comparing the
+// two: a stored dim that disagreed loaded silently, and a tensor of the wrong
+// rank was written out with an `undefined` in its ne.
+{
+  const mat = () => {
+    const t = Tensor.zeros([3, 4]);
+    for (let i = 0; i < t.data.length; i++) t.data[i] = i + 1;
+    return t;
+  };
+
+  // ggml writes ne fastest-moving first, so a [3, 4] here goes out as [4, 3].
+  const w = new GGUFWriter();
+  w.meta_string("general.architecture", "test");
+  addMatrix(w, "m.weight", mat(), "f32");
+  addVector(w, "n.weight", Tensor.zeros([5]));
+  const g = readGGUF(w.build());
+  const load = tensorLoader(g);
+  eq(
+    g.tensors.find((t) => t.name === "m.weight")!.dims.join(","),
+    "4,3",
+    "ne is the shape reversed",
+  );
+
+  const dst = Tensor.zeros([3, 4]);
+  load("m.weight", dst);
+  eq(Array.from(dst.data.slice(0, 3)).join(","), "1,2,3", "a matching tensor still loads");
+  load("n.weight", Tensor.zeros([5]));
+
+  // The transpose is the case with no other symptom: same element count, so
+  // dequantize fills the buffer and the weight is merely scrambled.
+  throws(
+    () => load("m.weight", Tensor.zeros([4, 3])),
+    "has dims [4, 3]",
+    "a transposed destination is refused",
+  );
+  throws(
+    () => load("m.weight", Tensor.zeros([2, 6])),
+    "has dims [4, 3]",
+    "a reshaped destination is refused",
+  );
+  throws(
+    () => load("m.weight", Tensor.zeros([12])),
+    "has dims [4, 3]",
+    "a flattened destination is refused",
+  );
+  // The rank comparison earns its place: [4] reversed is a PREFIX of [4, 3], so
+  // an element-wise check alone accepts it and dequantize happily returns the
+  // first four values.
+  throws(
+    () => load("m.weight", Tensor.zeros([4])),
+    "has dims [4, 3]",
+    "a destination whose shape is a prefix of the dims is refused",
+  );
+  throws(
+    () => load("n.weight", Tensor.zeros([4])),
+    "has dims [5]",
+    "a short vector destination is refused",
+  );
+
+  // The writer side. A 1-D tensor left inDim undefined, so `inDim % 32 !== 0`
+  // was NaN !== 0 and the quant silently became f16, with [undefined, outDim]
+  // written as the ne.
+  throws(
+    () => addMatrix(new GGUFWriter(), "bad", Tensor.zeros([12]), "q8_0"),
+    "addMatrix: bad must be 2-D, got [12]",
+    "a 1-D tensor is refused by addMatrix",
+  );
+  throws(
+    () => addMatrix(new GGUFWriter(), "bad", Tensor.zeros([2, 3, 4]), "f32"),
+    "must be 2-D",
+    "a 3-D tensor is refused by addMatrix",
+  );
+  throws(
+    () => addVector(new GGUFWriter(), "bad", Tensor.zeros([3, 4])),
+    "addVector: bad must be 1-D, got [3, 4]",
+    "a 2-D tensor is refused by addVector",
+  );
 }
 
 console.log("export_extras: all assertions passed");

@@ -792,10 +792,15 @@ export function assertIdsInTable(ids: number[], V: number, where: string): void 
  * buffer. Checked above the backend dispatch, so neither implementation can be
  * the one that skips it.
  */
-export function assertMatrix(t: Tensor, name: string, where: string): void {
-  if (t.shape.length !== 2) {
-    throw new Error(`${where}: ${name} must be 2-D, got [${t.shape.join(", ")}]`);
+export function assertRank(t: Tensor, rank: number, name: string, where: string): void {
+  if (t.shape.length !== rank) {
+    throw new Error(`${where}: ${name} must be ${rank}-D, got [${t.shape.join(", ")}]`);
   }
+}
+
+/** `assertRank` at 2, which is what every caller in this file wants. */
+export function assertMatrix(t: Tensor, name: string, where: string): void {
+  assertRank(t, 2, name, where);
 }
 
 /**

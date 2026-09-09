@@ -1316,6 +1316,44 @@ the flag narrows the window rather than closing it. Under `--recompute` that ord
 rather than exotic, since a checkpoint replay's own forward is that forward B, and it still throws on
 a real model only because the loss and readout backwards run before any checkpoint block.
 
+### 33. The GGUF tensor boundary checked shapes in neither direction (2026-09-09)
+
+Filed as #73 and #74 while reviewing lever 31, and fixed together because they are one boundary seen
+from its two sides. Neither is reachable today, which is why both are worth naming: the failure mode
+on each side is a plausible artifact rather than an error.
+
+**Writing.** `addMatrix` destructures `const [outDim, inDim] = t.shape`. A 1-D tensor leaves `inDim`
+undefined, so `inDim % 32 !== 0` is `NaN !== 0` and every such tensor silently becomes f16 whatever
+the requested quant, and the ggml `ne` goes out as `[undefined, outDim]`. That is a corrupt file
+produced without a word. `addVector` had the mirror hole.
+
+**Reading.** `tensorLoader` never looked at `t.dims` at all:
+
+```ts
+const de = dequantize(t.type, t.data, dst.size);
+dst.data.set(de);
+```
+
+The destination shape comes from `arch.build(cfg, ...)`, allocated from the metadata scalars before
+any bytes are read, so the file's own dims were pure decoration. A tensor whose stored dims disagree
+with the metadata loaded silently: transposed with the same element count gives a scrambled weight
+and a model that generates noise, and a short one leaves `de.length < dst.data.length` so `set` fills
+a prefix and leaves the rest at whatever the allocation held. The only guard anywhere was the
+`token_embd.weight` round-trip check in `demo.ts`, one tensor in one command.
+
+The loader now compares `t.dims` against the destination shape reversed, ggml writing `ne`
+fastest-moving first, which is exactly what `addMatrix` does when it sends `[outDim, inDim]` out as
+`[inDim, outDim]`.
+
+The rank half of that comparison is not decoration either. `[4]` reversed is a PREFIX of `[4, 3]`,
+so an element-wise check alone accepts a 1-D destination against a 2-D tensor and `dequantize`
+returns the first four values quite happily. That case is what the length clause is for, and it is
+the one mutation that survived the first version of the test.
+
+`assertRank` is `assertMatrix` from lever 31 with the rank as an argument, since the writer needs 2
+for a matrix and 1 for a vector. Six mutations in `tests/export-extras.ts`, one per clause on each
+side.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

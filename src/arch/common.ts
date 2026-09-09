@@ -8,7 +8,7 @@ import { GGUFWriter } from "../gguf/gguf.ts";
 import type { GGUFFile } from "../gguf/gguf.ts";
 import { dequantize, serialize } from "../gguf/quantize.ts";
 import type { QuantName } from "../gguf/quantize.ts";
-import { Tensor } from "../model/autograd.ts";
+import { assertRank, Tensor } from "../model/autograd.ts";
 import type { TokenizerData } from "../tokenizer/bpe.ts";
 import type { ExportOpts } from "../model/arch.ts";
 
@@ -30,6 +30,11 @@ export function ones(shape: number[]): Tensor {
  * 32 the tensor falls back to f16 rather than silently mis-encoding.
  */
 export function addMatrix(w: GGUFWriter, name: string, t: Tensor, quant: QuantName) {
+  // Before the destructure, which is where a wrong rank stops being visible: a
+  // 1-D tensor leaves inDim undefined, so `inDim % 32 !== 0` is NaN !== 0 and
+  // every such tensor silently becomes f16, and the ggml ne goes out as
+  // [undefined, outDim]. A file, not an error.
+  assertRank(t, 2, name, "addMatrix");
   const [outDim, inDim] = t.shape;
   let q = quant;
   if ((quant === "q8_0" || quant === "q4_0") && inDim % 32 !== 0) q = "f16";
@@ -38,6 +43,7 @@ export function addMatrix(w: GGUFWriter, name: string, t: Tensor, quant: QuantNa
 
 /** Norm and other 1-D tensors stay f32; llama.cpp expects that. */
 export function addVector(w: GGUFWriter, name: string, t: Tensor) {
+  assertRank(t, 1, name, "addVector");
   w.addTensor(name, [t.shape[0]], serialize(t.data, "f32"));
 }
 
@@ -124,6 +130,20 @@ export function tensorLoader(g: GGUFFile): (name: string, dst: Tensor) => void {
   return (name, dst) => {
     const t = byName.get(name);
     if (!t) throw new Error(`GGUF missing tensor "${name}"`);
+    // ggml writes ne fastest-moving first, so a file's dims are this repo's
+    // shape reversed: addMatrix sends [outDim, inDim] out as [inDim, outDim].
+    // Nothing compared them before, and the destination shape comes from the
+    // metadata config rather than from the file, so a tensor whose stored dims
+    // disagree loaded without a word: a transposed pair with the same element
+    // count scrambled the weight, and a short one filled a prefix and left the
+    // rest at whatever the allocation held.
+    const want = [...dst.shape].reverse();
+    if (t.dims.length !== want.length || want.some((d, i) => d !== t.dims[i])) {
+      throw new Error(
+        `GGUF tensor "${name}" has dims [${t.dims.join(", ")}], but this model wants ` +
+          `[${want.join(", ")}] (shape [${dst.shape.join(", ")}] in this repo's order)`,
+      );
+    }
     const de = dequantize(t.type, t.data, dst.size);
     dst.data.set(de);
   };
