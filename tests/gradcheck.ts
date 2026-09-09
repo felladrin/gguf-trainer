@@ -353,6 +353,64 @@ async function main() {
     );
   }
   {
+    // An embedding id outside the table. The input-side twin of the target
+    // check below, and it fires first when a corpus and a checkpoint disagree
+    // about the vocab, because the inputs go through the table before the
+    // targets reach the loss. Measured before the guard, at V=4, d=3 with an id
+    // of V+2: [NaN, NaN, NaN] on the CPU, [0, 0, 0] on the GPU, neither of which
+    // stops. There is no ignore marker here, unlike a target: every position of
+    // a batch is a real token, so a negative is refused too.
+    const V = 6, d = 4;
+    const r = mulberry32(0x1d3a);
+    const w = randTensor([V, d], r);
+    const message = (fn: () => unknown): string => {
+      try {
+        fn();
+        return "";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    };
+    const range = /is not an integer in \[0,6\)/;
+    const refuses = (ids: number[], pattern: RegExp = range) =>
+      pattern.test(message(() => embedding(w, ids)));
+    const accepts = (ids: number[]) => {
+      const out = embedding(w, ids);
+      for (let t = 0; t < ids.length; t++) {
+        for (let j = 0; j < d; j++) {
+          if (out.data[t * d + j] !== w.data[ids[t] * d + j]) return false;
+        }
+      }
+      return true;
+    };
+    const cases: [string, boolean][] = [
+      // The position is asserted on one case, and one bad id sits FIRST. Without
+      // either, a loop starting at t = 1 or reporting t + 1 passes everything,
+      // and lever 29's "position 20 against position 19" argument rests on that
+      // number.
+      // Anchored on the label too: "embedding:" against "crossEntropy:" is how a
+      // reader tells which of the two guards fired, and lever 29's ordering
+      // argument is quoted from those prefixes.
+      [
+        "id == V",
+        refuses([0, V, 1], /^embedding: id 6 at position 1 is not an integer in \[0,6\)/),
+      ],
+      ["id == V in the first position", refuses([V, 0, 1])],
+      ["id far past V", refuses([0, 1, 999])],
+      ["a negative id", refuses([0, -1, 1])],
+      ["a non-integer id", refuses([0, 1.5, 1])],
+      ["V-1 still reads its row", accepts([0, V - 1, 1])],
+      ["a repeated id still reads its row", accepts([2, 2, 0])],
+    ];
+    const bad = cases.filter(([, ok]) => !ok).map(([name]) => name);
+    const ok = bad.length === 0;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"embedding id range".padEnd(24)}        ` +
+        `V=${V}, ${cases.length} cases${bad.length ? `, failed: ${bad.join(", ")}` : ""}`,
+    );
+  }
+  {
     // A target outside the vocab. `logits.data[t * V + target]` lands in the
     // NEXT row, so the loss comes back finite and plausible rather than
     // stopping; only the last row reads past the array and gives NaN. The

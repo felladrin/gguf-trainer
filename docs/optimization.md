@@ -972,16 +972,21 @@ the digits move with pool state, which is the argument for checking on the host 
 That shows in the end-to-end symptom too. Scoring `smolrp.gguf` (vocab 49152) against a corpus
 tokenized with the 151936-entry Qwen3 vocab, `eval-loss --windows 1 --seq-len 128`:
 
-|         | before                           | after                                                                                     |
-| ------- | -------------------------------- | ----------------------------------------------------------------------------------------- |
-| `--cpu` | `val loss NaN  ppl NaN`          | `crossEntropy: target 49751 at position 19 is not -1 (ignore) or an integer in [0,49152)` |
-| GPU     | `val loss 10.9754  ppl 58420.99` | the same message                                                                          |
+|         | before                           | after this lever                                                                          | after lever 29                           |
+| ------- | -------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------- |
+| `--cpu` | `val loss NaN  ppl NaN`          | `crossEntropy: target 49751 at position 19 is not -1 (ignore) or an integer in [0,49152)` | `embedding: id 49751 at position 20 ...` |
+| GPU     | `val loss 10.9754  ppl 58420.99` | the same message                                                                          | the same message                         |
+
+The third column is what you see today. Lever 29 guards the input side, which the same corpus
+reaches one step earlier, so this check now fires only when the inputs are in range and a target is
+not.
 
 A perplexity of 58421 from a completely mismatched pairing is a believable-looking number, and it is
 the reason the check runs on the host rather than being left to the device. Read the CPU's NaN there
 as a measurement, not as this mechanism: the input stream carries the same out-of-range ids as the
-target stream, so `embedding` poisons the CPU forward (#63) before the loss runs, and the loss's own
-last-row overrun only fires when the last target happens to be out of range.
+target stream, so `embedding` poisons the CPU forward before the loss runs (it did then; lever 29
+stops it first now), and the loss's own last-row overrun only fires when the last target happens to
+be out of range.
 
 `keptRowsInVocab` does the range check and returns the kept count, so it replaces the counting loop
 each of the four losses already ran and costs no extra pass. All four call it: the CPU and GPU
@@ -1001,12 +1006,10 @@ The accepting cases carry an oracle computed in the test rather than a compariso
 losses, because both now draw their denominator from the same helper and would agree on a wrong
 count. Making the helper count ignored rows fails `-1 still means ignore`.
 
-Not covered, and all three are neighbours of the same mistake: the GPU `softCrossEntropy` still does
-not validate its teacher ids where the CPU one does (#61); `embedding` is the input-side twin,
-unguarded on both backends (#63), and it is worth knowing about because it fires first in the
-scenario above, measured returning a NaN row on the CPU and a row of zeros on the GPU; and the
-refusal lands mid-run rather than at start-up (#64), which matters for `pretrain`, whose trust gate
-only reads the first 16 tokens.
+Not covered here, and neighbours of the same mistake: the GPU `softCrossEntropy` still does not
+validate its teacher ids where the CPU one does (#61), and the refusal lands mid-run rather than at
+start-up (#64), which matters for `pretrain`, whose trust gate only reads the first 16 tokens.
+`embedding`, the input-side twin, was #63 and is now lever 29.
 
 ### 27. `generate` paid lever 25's cost per token, 39% of its wall clock (2026-09-09)
 
@@ -1112,6 +1115,37 @@ intermediate's gradient buffer unconditionally, 85 per window against 54 paramet
 in the gate, and those are full-size rather than a shared stub. Nothing reads them in a forward-only
 run either. That is #67, and it measured as noise too (26.53 s against 26.69 s), so it is filed with
 the measurement attached and no speed claim.
+
+### 29. An embedding id outside the table read the next row, or returned zeros (2026-09-09)
+
+Filed as #63 while fixing #55, which guarded the loss side only. `embedding` never checked that an
+id indexes a row of the table, so `weight.data[id * d + j]` with `id >= V` read into the next row,
+or past the array on the last one. The two backends then failed differently, which is the divergence
+the parity suite exists to prevent. Measured at `V=4, d=3` with an id of `V + 2`:
+
+|     | row returned for the bad id |
+| --- | --------------------------- |
+| CPU | `[NaN, NaN, NaN]`           |
+| GPU | `[0, 0, 0]`                 |
+
+Neither stops. The CPU poisons the forward with NaN, which at least announces itself; the GPU's
+bound buffer discards the read and substitutes a zero row, so the run continues on a number that
+looks fine.
+
+`assertIdsInTable` refuses anything that is not an integer in `[0, V)`. There is no ignore marker
+here, unlike a loss target: every position of a batch is a real token, so a negative is refused too.
+
+It sits ABOVE the backend dispatch in `embedding` rather than in each backend, which is this file's
+existing convention for a guard both paths need and neither can fold into work it already does
+(`fusedCrossEntropy`'s dimension and chunk checks are there for the same reason). That placement is
+the thing worth pinning, and it is: moving the call below the dispatch still passes the CPU cases in
+`tests/gradcheck.ts` and fails `targetRangeGate`, because an installed backend then skips it.
+
+**It fires before lever 26's check, which is what the ordering predicts.** The inputs go through the
+table before the targets reach the loss. Scoring `smolrp.gguf` (vocab 49152) against a corpus
+tokenized with the 151936-entry Qwen3 vocab now stops at `embedding: id 49751 at position 20`, where
+before this it ran on to `crossEntropy: target 49751 at position 19`. Same token, one position
+apart, because the targets are the inputs shifted by one.
 
 ## Quality levers
 
