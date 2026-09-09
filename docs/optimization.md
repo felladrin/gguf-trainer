@@ -563,10 +563,16 @@ property at `off = 0` is worth keeping, so this is the lever that removes the ca
 `eval-loss` and `eval-choice` took the flag later, in the same shape: both build the same
 `crossEntropy(model.forward(...), targets)` and both now call `sequenceLoss`. `eval-choice` needed
 no other change, because it recovers a summed NLL as mean-times-kept-count and the chunked path uses
-the same denominator; `tests/gradcheck.ts` pins that identity on the shape it builds. Measured:
+the same denominator; `tests/gradcheck.ts` pins that against an independently computed sum of
+per-position `-log softmax`, not against either implementation, so a change moving BOTH to a
+different denominator fails it rather than cancelling out. Measured:
 `eval-loss --seq-len 4096` on a 151936-vocab checkpoint aborts dense and scores with
 `--loss-chunk 8192`, and both commands return identical numbers at seq 512 (val loss 3.6200, and
 piqa acc_norm 60.00% over 30 items).
+
+`generate` is the remaining dense forward: it builds `[T, vocab]` logits and reads only the last
+row, so it hits the same limit at long context and `--loss-chunk` cannot help. It needs a
+last-row-only readout, which is a different change.
 
 Not done here: `softCrossEntropy` (the Phase B KL anchor) still materializes `[T,V]` through the
 dense readout, so `--loss-chunk` does not apply to it. Chunking it means fusing the same readout

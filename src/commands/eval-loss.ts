@@ -25,7 +25,7 @@
 import { readFileBytes } from "../io.ts";
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
 import { mulberry32 } from "../model/autograd.ts";
-import { sequenceLoss } from "../train/loss.ts";
+import { checkLossChunkModel, checkLossChunkValue, sequenceLoss } from "../train/loss.ts";
 import { diskTokenSource, tokenBytes } from "../data/tokens.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -45,18 +45,15 @@ async function run(v: Values) {
   const seed = v.num("seed");
   const useCpu = v.bool("cpu");
   if (!(holdout > 0 && holdout <= 1)) die(`--holdout must be in (0, 1], got ${holdout}`);
+  const lossChunk = v.num("loss-chunk");
+  // Before the checkpoint read: a typo'd width should not cost a multi-GB load.
+  const badChunk = checkLossChunkValue(lossChunk);
+  if (badChunk) die(badChunk);
 
   const { model, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
   if (seqLen > cfg.maxSeq) die(`--seqLen ${seqLen} exceeds model ctx ${cfg.maxSeq}`);
-  const lossChunk = v.num("loss-chunk");
-  if (!Number.isInteger(lossChunk) || lossChunk < 0) {
-    die(`--loss-chunk must be a whole number, 0 (dense) or positive, got ${lossChunk}`);
-  }
-  if (lossChunk > 0 && !model.forwardToReadout) {
-    // Same stance as pretrain: the only reason to pass the flag is to get past
-    // the binding limit, and a silent dense fallback walks back into it.
-    die(`--loss-chunk needs an architecture with forwardToReadout; ${cfg.arch} has none`);
-  }
+  const badForModel = checkLossChunkModel(lossChunk, cfg.vocabSize, cfg.arch, model);
+  if (badForModel) die(badForModel);
 
   const src = await diskTokenSource(tokensPath, tokenBytes(cfg.vocabSize));
   // Held-out region: the last `holdout` fraction of the stream. maxStart leaves

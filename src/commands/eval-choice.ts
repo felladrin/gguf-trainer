@@ -22,7 +22,7 @@
 
 import { readFileBytes } from "../io.ts";
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
-import { sequenceLoss } from "../train/loss.ts";
+import { checkLossChunkModel, checkLossChunkValue, sequenceLoss } from "../train/loss.ts";
 import type { LanguageModel } from "../model/arch.ts";
 import type { BPETokenizer } from "../tokenizer/bpe.ts";
 import { initWebGPU } from "../backend/webgpu.ts";
@@ -255,16 +255,13 @@ async function run(v: Values) {
   const useCpu = v.bool("cpu");
 
   console.log(`=== eval-choice: ${taskName} on ${modelPath.split("/").pop()} ===`);
-  const { model, tokenizer: tok, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
   const lossChunk = v.num("loss-chunk");
-  if (!Number.isInteger(lossChunk) || lossChunk < 0) {
-    die(`--loss-chunk must be a whole number, 0 (dense) or positive, got ${lossChunk}`);
-  }
-  if (lossChunk > 0 && !model.forwardToReadout) {
-    // Same stance as pretrain: the only reason to pass the flag is to get past
-    // the binding limit, and a silent dense fallback walks back into it.
-    die(`--loss-chunk needs an architecture with forwardToReadout; ${cfg.arch} has none`);
-  }
+  // Before the checkpoint read: a typo'd width should not cost a multi-GB load.
+  const badChunk = checkLossChunkValue(lossChunk);
+  if (badChunk) die(badChunk);
+  const { model, tokenizer: tok, cfg } = loadModelFromGGUF(await readFileBytes(modelPath));
+  const badForModel = checkLossChunkModel(lossChunk, cfg.vocabSize, cfg.arch, model);
+  if (badForModel) die(badForModel);
 
   let gpu: WebGPUBackend | null = null;
   if (!useCpu) {
