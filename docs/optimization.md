@@ -1198,19 +1198,38 @@ every id: `keptRowsInVocab` and `assertTeacherRows` accept everything, and the l
 the buffer. The range guards levers 26, 29 and 30 added turn themselves off on exactly the malformed
 input they exist to catch.
 
-`assertMatrix` refuses a `logits` that is not 2-D, and a `hidden` or `w` in `fusedCrossEntropy` the
-same. It runs above the backend dispatch and before the id checks, in that order, because a guard
-reporting on a shape it has already destructured is reporting nonsense.
+`assertMatrix` refuses a `logits` that is not 2-D, a `hidden` or `w` in `fusedCrossEntropy` the same,
+and `embedding`'s table, which reads a vocab size out of `shape[0]`. It runs above the backend
+dispatch and before the id checks, in that order, because a guard reporting on a shape it has already
+destructured is reporting nonsense.
+
+Pinning the rank at exactly 2 is what makes the vocab size trustworthy again, and the reason is the
+`Tensor` constructor: it throws when `data.length` does not equal the product of the shape, and
+`shape` is never reassigned afterwards. So a 2-D shape guarantees `shape[1]` is consistent with the
+buffer behind it, and there is no residual case of a `[3, 6]` holding four floats.
 
 Unreachable today: every producer builds logits from `linear(hidden, w)` or `forwardToReadout` with a
-2-D weight. It is a hole in a trust boundary rather than a live bug, which is why it is worth naming:
-the failure mode is silent acceptance, so nothing downstream would have complained.
+2-D weight, and a GGUF's own dims never become a `Tensor.shape`. It is a hole in a trust boundary
+rather than a live bug, which is why it is worth naming: the failure mode is silent acceptance.
 
-Seven cases in `tests/gradcheck.ts` and an arm on `targetRangeGate`. Dropping any one of the four
-calls fails only that loss's cases; loosening the rank test to `>= 1` fails all six refusals, since
-the point is the exact rank and not merely "has a shape"; and moving the `crossEntropy` call below
-the dispatch passes every CPU case and fails only the GPU arm, which is by now the recognisable
-signature of that mistake.
+**Measured with the guard disabled, five of the eight refusals were silent and three already threw
+something unhelpful.** The test block records both lists, because the deliverable differs:
+
+| input                                    | before                                                                       |
+| ---------------------------------------- | ---------------------------------------------------------------------------- |
+| `crossEntropy` on `[24]`                 | NaN                                                                          |
+| `crossEntropy` on `[2,3,4]`              | 1.0986, i.e. `log(3)` read out of a 24-float buffer                          |
+| `softCrossEntropy` on `[24]`             | NaN                                                                          |
+| `fusedCrossEntropy` on a 1-D pair        | 3.1781, i.e. `log(24)`, since `undefined !== undefined` passes the dim check |
+| `embedding` on `[2,3,4]`                 | a row of zeros, the right V with the wrong stride                            |
+| `fusedCrossEntropy` on a 1-D hidden or w | `dim mismatch undefined vs 4`                                                |
+| `embedding` on `[24]`                    | `data length 0 != shape 2,`                                                  |
+
+Ten cases in `tests/gradcheck.ts` and an arm on `targetRangeGate`. Dropping any one of the five calls
+fails only that op's cases; loosening the rank test to `>= 1` fails all eight refusals, since the
+point is the exact rank and not merely "has a shape"; and moving the `crossEntropy` call below the
+dispatch passes every CPU case and fails only the GPU arm, which is by now the recognisable signature
+of that mistake.
 
 ## Quality levers
 

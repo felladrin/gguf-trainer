@@ -511,6 +511,10 @@ export function rmsNormHeads(
 
 /** Embedding lookup: weight:[V,d], ids:number[T] -> [T,d]. */
 export function embedding(weight: Tensor, ids: number[]): Tensor {
+  // Before the id check, which reads a vocab size out of this shape: a 1-D table
+  // makes that V*d, and a 3-D one passes the right V while the row stride
+  // reads the wrong rows in silence.
+  assertMatrix(weight, "weight", "embedding");
   assertIdsInTable(ids, weight.shape[0], "embedding");
   if (opsBackend) return opsBackend.embedding(weight, ids);
   const [, d] = weight.shape;

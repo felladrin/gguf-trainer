@@ -355,12 +355,25 @@ async function main() {
   {
     // A loss input that is not the matrix its caller assumes. `const [T, V] =
     // logits.shape` on a 1-D tensor leaves V undefined, so every `id >= V` is
-    // false and the range guards silently accept everything, then index past the
-    // buffer. The guard that turns itself off on malformed input is worse than
-    // no guard, so this is checked before the ids are.
+    // false and the range guards silently accept everything.
+    //
+    // Every case here is built to get PAST the checks that run before the rank
+    // one. Measured with assertMatrix disabled, five of the eight refusals were
+    // SILENT and three already threw something unhelpful:
+    //
+    //   crossEntropy [24]        -> NaN
+    //   crossEntropy [2,3,4]     -> 1.0986, i.e. log(3) out of a 24-float buffer
+    //   softCrossEntropy [24]    -> NaN
+    //   fusedCrossEntropy pair   -> 3.1781, i.e. log(24)
+    //   embedding [2,3,4]        -> 0
+    //   fusedCrossEntropy hidden -> "dim mismatch undefined vs 4"
+    //   fusedCrossEntropy w      -> "dim mismatch 4 vs undefined"
+    //   embedding [24]           -> "data length 0 != shape 2,"
+    //
+    // The last three are kept because the message is the deliverable there.
     const V = 6, H = 4;
     const r = mulberry32(0x2b1f);
-    const flat = randTensor([V * H], r);
+    const flat = randTensor([V * H], r); // 24 floats, shape [24]
     const cube = new Tensor(new Float32Array(2 * 3 * 4), [2, 3, 4], true);
     const mat = randTensor([3, V], r);
     const hid = randTensor([3, H], r);
@@ -373,13 +386,23 @@ async function main() {
         return (e as Error).message;
       }
     };
+    // T = 24 for a [24] logits, so the count check passes and the id-range
+    // clause is what would have to fire. Without assertMatrix it does not: V is
+    // undefined, so `id >= V` is false for the 999 too.
+    const longTargets = Array.from({ length: 24 }, (_, i) => (i === 0 ? 999 : 0));
+    // Teacher arrays of length T*k = 24, so assertTeacherRows gets past its own
+    // length check and its id range is the guard that would have to fire.
+    const tIds = Array.from({ length: 24 }, (_, i) => (i === 0 ? 999 : 0));
+    const tProbs = new Array(24).fill(1);
+
     const cases: [string, boolean][] = [
       [
         "crossEntropy refuses 1-D logits",
         /^crossEntropy: logits must be 2-D, got \[24\]/.test(
-          message(() => crossEntropy(flat, [0, 1, 2])),
+          message(() => crossEntropy(flat, longTargets)),
         ),
       ],
+      // T=2, V=3 out of a 24-float buffer, returning a plausible log(3).
       [
         "crossEntropy refuses 3-D logits",
         /^crossEntropy: logits must be 2-D, got \[2, 3, 4\]/.test(
@@ -389,13 +412,13 @@ async function main() {
       [
         "softCrossEntropy refuses 1-D logits",
         /^softCrossEntropy: logits must be 2-D/.test(
-          message(() => softCrossEntropy(flat, [0], [1], 1)),
+          message(() => softCrossEntropy(flat, tIds, tProbs, 1)),
         ),
       ],
       [
         "fusedCrossEntropy refuses 1-D hidden",
         /^fusedCrossEntropy: hidden must be 2-D/.test(
-          message(() => fusedCrossEntropy(flat, w, [0], 2)),
+          message(() => fusedCrossEntropy(flat, w, longTargets, 2)),
         ),
       ],
       [
@@ -404,13 +427,27 @@ async function main() {
           message(() => fusedCrossEntropy(hid, flat, [0, 1, 2], 2)),
         ),
       ],
-      // The bad shape has to be refused BEFORE the id range is read from it, or
-      // the id guard is the thing reporting and V is already undefined.
+      // Both 1-D: `undefined !== undefined` is false, so the pre-existing dim
+      // check passes too, every dot() is zero and the loss comes out log(24).
+      // The one fused shape that was silently wrong.
       [
-        "the shape is checked before the ids",
-        /must be 2-D/.test(message(() => crossEntropy(flat, [0, 1, 999]))),
+        "fusedCrossEntropy refuses a 1-D pair",
+        /^fusedCrossEntropy: hidden must be 2-D/.test(
+          message(() => fusedCrossEntropy(flat, flat, new Array(24).fill(0), 2)),
+        ),
+      ],
+      // embedding reads shape[0], so a 1-D table yields V*d and accepts ids past
+      // the real vocab; a 3-D one passes the right V and reads the wrong rows.
+      [
+        "embedding refuses a 1-D table",
+        /^embedding: weight must be 2-D/.test(message(() => embedding(flat, [0, 1]))),
+      ],
+      [
+        "embedding refuses a 3-D table",
+        /^embedding: weight must be 2-D/.test(message(() => embedding(cube, [0, 1]))),
       ],
       ["a 2-D logits still scores", Number.isFinite(crossEntropy(mat, [0, 1, 2]).data[0])],
+      ["a 2-D table still reads", Number.isFinite(embedding(w, [0, 1]).data[0])],
     ];
     const bad = cases.filter(([, ok]) => !ok).map(([name]) => name);
     const ok = bad.length === 0;
