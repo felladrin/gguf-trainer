@@ -836,8 +836,8 @@ is. Measured on a single row before the change:
 
 Both GPU kernels already used the numerically stable form (`srcCeFwd` computes
 `log(s) - (z_target - m)`, and `srcSoftCeFwd`'s comment says it is "expanded so no probability is
-ever read back"), and `fusedCrossEntropy` from lever 19 was written that way too. So the dense CPU
-CPU paths were the two of four that clamped, and the chunked path this repo added was strictly more
+ever read back"), and `fusedCrossEntropy` from lever 19 was written that way too. So the two dense
+CPU losses were the only ones that clamped, and the chunked path this repo added was strictly more
 accurate than the dense one it replaced.
 
 `crossEntropy` and `softCrossEntropy` now use `log(Σ exp(z - m)) + m - z_target`. Gradients were

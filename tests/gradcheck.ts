@@ -313,11 +313,12 @@ async function main() {
     // dropped `q` factor or a mis-grouped `mass * log(s)` cannot hide either.
     // `exact` is the closed form, an oracle independent of the logsumexp the
     // implementations evaluate.
-    // Gap 1 is not decoration. From gap 30 up, `log(Σ exp(z-m))` underflows to
-    // exactly 0 on both sides, so those rows only exercise `m - z_target`, and
-    // even gap 10 is worth 9.3056e-5 against a 1e-4 threshold. Deleting the
-    // `log(sum)` term this fix ADDED would pass on gaps 10 to 90 alone. At gap 1
-    // it is worth 0.5619, which nothing can hide.
+    // Gap 1 is not decoration. `log(Σ exp(z-m))` shrinks out of the comparison as
+    // the gap grows: in the f64 this reference computes with it is 1.9184e-13 at
+    // gap 30 and exactly 0 from about gap 37, and even gap 10 is worth only
+    // 9.3056e-5 against a 1e-4 threshold. So deleting the `log(sum)` term this
+    // fix ADDED would pass on gaps 10 to 90 alone, with 7% to spare. At gap 1 it
+    // is worth 0.5619, which nothing can hide.
     let worst = 0;
     for (const gap of [1, 10, 30, 60, 90]) {
       const row = [gap, 0, 0, -3];
@@ -332,6 +333,23 @@ async function main() {
     console.log(
       `  ${ok ? "ok " : "FAIL"} ${"CE exact at big gaps".padEnd(24)}        ` +
         `hard and soft, max-to-target gaps to 93  maxAbs=${worst.toExponential(2)}`,
+    );
+  }
+  {
+    // A KEPT row that pads. Every zero-weight teacher entry elsewhere in the
+    // suite sits in an ignored row, where both implementations return before the
+    // loop, so the zero-weight skip itself was never executed by anything. The
+    // pad's id points at a -Infinity logit, which is the one input the skip
+    // saves: without it the expansion evaluates 0 * Infinity and the whole loss
+    // goes NaN.
+    const V = 5;
+    const logits = new Tensor(Float32Array.from([1, 0, -Infinity, 2, 0]), [1, V], true);
+    const l = softCrossEntropy(logits, [3, 0, 2], [0.7, 0.3, 0.0], 3).data[0];
+    const ok = Number.isFinite(l);
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"softCE skips a zero pad".padEnd(24)}        ` +
+        `kept row, -Infinity at the pad id  loss=${l}`,
     );
   }
   {
