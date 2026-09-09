@@ -1336,6 +1336,8 @@ async function recomputeMemoryGate() {
       return gpu.residentBytes().pool;
     } finally {
       setCheckpointing(false);
+      // destroy() runs setOpsBackend(null), so this leaves no backend installed.
+      // Every caller here installs its own, but say so rather than rely on it.
       gpu.destroy();
     }
   };

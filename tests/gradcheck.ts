@@ -282,6 +282,30 @@ async function main() {
       `  ${exact ? "ok " : "FAIL"} ${"checkpoint == off".padEnd(24)}        bit-exact grads  ` +
         `maxAbs=${worst.toExponential(2)}`,
     );
+
+    // The input contract, which is the one way to get a wrong gradient here and
+    // still see a normal-looking loss curve: a block that reads a computed
+    // tensor built outside it would run that tensor's backward once per block.
+    setCheckpointing(true);
+    const shared = linear(x, w1);
+    const threw = (f: () => void) => {
+      try {
+        f();
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    const caughtShared = threw(() => checkpoint([x], () => add(silu(linear(x, w1)), shared)));
+    const caughtIdentity = threw(() => checkpoint([x], () => x));
+    const allowed = !threw(() => checkpoint([x, shared], () => add(silu(linear(x, w1)), shared)));
+    setCheckpointing(false);
+    const guarded = caughtShared && caughtIdentity && allowed;
+    if (!guarded) failures++;
+    console.log(
+      `  ${guarded ? "ok " : "FAIL"} ${"checkpoint input guard".padEnd(24)}        ` +
+        `shared=${caughtShared} identity=${caughtIdentity} declared-ok=${allowed}`,
+    );
   }
   {
     // Fused readout + chunked cross-entropy. Both inputs are differentiated,

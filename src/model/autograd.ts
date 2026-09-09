@@ -15,6 +15,8 @@ function prod(shape: number[]): number {
   return n;
 }
 
+let tensorsCreated = 0;
+
 export class Tensor {
   data: Float32Array;
   grad: Float32Array;
@@ -22,6 +24,8 @@ export class Tensor {
   requiresGrad: boolean;
   _backward: () => void = () => {};
   _prev: Tensor[] = [];
+  /** Creation order, so `checkpoint` can tell its own nodes from older ones. */
+  readonly seq: number = tensorsCreated++;
 
   constructor(data: Float32Array, shape: number[], requiresGrad = false) {
     if (data.length !== prod(shape)) {
@@ -161,8 +165,39 @@ export function setCheckpointing(on: boolean) {
   checkpointing = on;
 }
 
-export function isCheckpointing(): boolean {
-  return checkpointing;
+/**
+ * Every non-leaf the block reads must have been built by this call to `fn`.
+ * One that predates it is shared with something outside the block, and the
+ * local walk in `checkpoint`'s backward would run its `_backward` once per
+ * block that reads it, each time propagating a gradient that has already grown:
+ *
+ *   const shared = linear(x, w);                      // built once, outside
+ *   const a = checkpoint([h0], () => add(h0, shared));
+ *   const b = checkpoint([a], () => add(a, shared));  // x.grad ends up 2a + b
+ *
+ * `shared` is not in the outer graph either, since the rewiring cut it, so
+ * nothing downstream corrects the double count. The numbers stay finite and the
+ * loss curve looks ordinary, which is why this is a throw rather than a note in
+ * the docs. Leaves are exempt: a parameter's `_backward` is a no-op, and its
+ * consumers accumulate independently.
+ */
+function assertSelfContained(out: Tensor, inputs: Tensor[], born: number) {
+  const seen = new Set<Tensor>(inputs);
+  if (seen.has(out)) {
+    throw new Error("checkpoint: fn returned one of its inputs; there is nothing to recompute");
+  }
+  const walk = (t: Tensor) => {
+    if (seen.has(t)) return;
+    seen.add(t);
+    if (t._prev.length > 0 && t.seq < born) {
+      throw new Error(
+        "checkpoint: the block reads a computed tensor it did not create. Pass it in `inputs`, " +
+          "or move its computation inside the block (docs/adding-an-architecture.md).",
+      );
+    }
+    for (const p of t._prev) walk(p);
+  };
+  walk(out);
 }
 
 /**
@@ -186,8 +221,10 @@ export function checkpoint(inputs: Tensor[], fn: () => Tensor): Tensor {
   if (!checkpointing) return fn();
   const rb = regionBackend();
 
+  const born = tensorsCreated;
   const mark = rb ? rb.beginRegion() : 0;
   const out = fn();
+  assertSelfContained(out, inputs, born);
   // Keeping `out` alive is the whole point: everything else the block allocated
   // becomes reusable, and the next block's forward draws from it.
   if (rb) rb.endRegion(mark, [out]);

@@ -314,14 +314,14 @@ export class WebGPUBackend implements OpsBackend {
   /**
    * Buffers released by endRegion, reusable ONLY by makeOut.
    *
-   * Deliberately not returned to the pool. `pool.acquire` also serves
-   * `entryFor`, `uploadU32` and `uploadF32`, and those write with
-   * `queue.writeBuffer`, whose safety argument (see uploadU32) is that the
-   * buffer "was free in the pool until this call" and so cannot appear in an
-   * already-encoded, unsubmitted pass. Recycling a mid-graph buffer through the
-   * pool would falsify that and let a writeBuffer land before the pass that
-   * still reads it. Keeping a separate list that only makeOut draws from makes
-   * that hazard structurally impossible rather than merely argued away.
+   * Deliberately not returned to the pool, though after endRegion's submit that
+   * would also be correct. The pool feeds `entryFor`, `uploadU32` and
+   * `uploadF32`, whose `queue.writeBuffer` calls carry a comment justifying
+   * themselves by the buffer having been "free in the pool until this call".
+   * Recycling mid-graph buffers through the pool would not break them, but it
+   * would make every one of those call sites depend on the submit happening,
+   * which is a thing a future change can quietly remove. A private list only
+   * `makeOut` draws from needs no such argument at any of them.
    */
   private regionFree: { buf: GpuBuffer; size: number }[] = [];
   private enc: GpuCommandEncoder | null = null;
@@ -490,21 +490,40 @@ export class WebGPUBackend implements OpsBackend {
   }
 
   /**
+   * Guard for the mark `beginRegion` returns: it indexes `transients`, which
+   * `sync()` and `reclaimStepTransients()` truncate. Nothing can interleave
+   * today because `checkpoint` contains no `await`, but that is invisible from
+   * the call site, so fail loudly rather than silently release the wrong slice.
+   */
+  private checkRegionMark(mark: number): void {
+    if (mark > this.transients.length) {
+      throw new Error(
+        `endRegion: mark ${mark} is past the ${this.transients.length} live transients; ` +
+          `a sync() or reclaim ran inside the region`,
+      );
+    }
+  }
+
+  /**
    * Close the region opened at `mark`: every transient allocated since, except
    * the buffers behind `keep`, becomes reusable by makeOut.
    *
-   * No fence. `submit()` is what makes this safe, not a wait: dispatches inside
-   * one compute pass are ordered against each other, so a later dispatch writing
-   * a recycled buffer cannot outrun an earlier one reading it, and submitting
-   * closes the only unordered writer (queue.writeBuffer, which is ordered behind
-   * an already-submitted command buffer). Nothing is destroyed here; the driver
-   * keeps every buffer alive and this only moves entries between JS-side lists.
+   * No fence, and none is needed. Recycling is correct because the queue orders
+   * the accesses: dispatches within one compute pass are ordered against each
+   * other, passes within a command buffer execute in order (which is the path
+   * `bench --profile` takes, one pass per dispatch), and `queue.writeBuffer` is
+   * ordered behind an already-submitted command buffer. The dense path has
+   * always depended on the first of those, since every op reads the previous
+   * op's output out of the same pass. `submit()` is here so the writeBuffer
+   * clause holds, not to wait. Nothing is destroyed; this only moves entries
+   * between JS-side lists and the driver keeps every buffer alive.
    *
    * Released grad buffers are purged from pendingClears: a buffer handed on as
    * some later tensor's DATA must not be zeroed by a clear queued when it was a
    * gradient.
    */
   endRegion(mark: number, keep: Tensor[]): void {
+    this.checkRegionMark(mark);
     this.endPass();
     this.submit();
     const keepBufs = new Set<GpuBuffer>();
@@ -538,6 +557,13 @@ export class WebGPUBackend implements OpsBackend {
    * clear.
    */
   seedGradFrom(dst: Tensor, src: Tensor): void {
+    // Overwrite is equivalent to accumulate here only because the replay reset
+    // `backwardBegun`: its first forward op called beginForwardOp, so this
+    // ensureBackwardBegun actually flushes the interior grad clears the replay
+    // just queued, and the copy below lands on a zeroed buffer. If
+    // ensureBackwardBegun ever became idempotent across a replay, those clears
+    // would never flush (endRegion purges them on the way out) and every
+    // interior gradient would start from pool garbage.
     this.ensureBackwardBegun();
     const ed = this.entries.get(dst), es = this.entries.get(src);
     if (!ed || !es) throw new Error("seedGradFrom: tensor has no GPU buffers");
@@ -1300,6 +1326,11 @@ export class WebGPUBackend implements OpsBackend {
       this.entries.set(t, e);
       this.queue.writeBuffer(e.data, 0, t.data);
     }
+    // Load-bearing for --recompute as well as for grad accumulation: a replay
+    // calls entryFor on every parameter again, and re-queuing e.grad for a clear
+    // would zero parameter gradients mid-backward, wiping every block already
+    // processed. reclaimStepTransients deliberately leaves this set alone so the
+    // guard keeps holding across micro-batches.
     if (e.external && !this.touchedExternals.has(t)) {
       this.touchedExternals.add(t);
       if (e.gradNeedsClear) {

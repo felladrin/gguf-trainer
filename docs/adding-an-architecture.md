@@ -83,11 +83,15 @@ Wrap each layer's body in `checkpoint([hIn], () => { ... })`, as the three shipp
 do. With `--recompute` off it is a passthrough that builds exactly the graph it built before, so
 there is no second code path to keep in step.
 
-Two rules. Capture the input by value (`const hIn = h;`) rather than closing over the loop
+Three rules. Capture the input by value (`const hIn = h;`) rather than closing over the loop
 variable: the closure runs again during backward, long after the loop has moved `h` on to the last
-layer's output. And keep the body a pure replay, since it is called twice with the same inputs and
-must produce the same values. A captured RNG or a mutated buffer would make the second call
-disagree with the first and corrupt the gradient without failing anything.
+layer's output. Keep the body a pure replay, since it is called twice with the same inputs and must
+produce the same values; a captured RNG or a mutated buffer would make the second call disagree
+with the first. And every computed tensor the body reads must either be built inside the body or
+named in `inputs`: a value computed once outside the loop and read by several blocks would have its
+own backward run once per block, each time on a gradient that has already grown. `checkpoint`
+throws on that rather than letting it through, because the loss curve looks normal either way.
+Parameters need no declaring; they are leaves.
 
 ## The parts that are easy to get wrong
 
