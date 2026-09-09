@@ -1647,9 +1647,10 @@ async function residentReadbackGate() {
  * The clear queue. `sync()` re-arms `gradNeedsClear` for every touched external,
  * and `entryFor` then queues that buffer for a `clearBuffer` on the next window.
  * A frozen external shares one 256-byte stub that nothing ever writes, so every
- * one of those clears was a no-op: a few hundred per window on a 293M model
- * under eval, and per step under LoRA, where the base weights are frozen for the
- * whole run.
+ * one of those clears was a no-op. Lever 32 has since taken the eval case away
+ * entirely, a forward-only window issuing no clears at all; what is left is a
+ * step that runs a backward with frozen weights, i.e. LoRA and finetune, which
+ * is the shape below.
  *
  * Waste has no symptom in a number, so the only way to see it is to count. The
  * second window is what matters: on the first, a frozen parameter is not queued
@@ -1787,12 +1788,76 @@ async function forwardOnlyClearGate() {
   //    lost is the rest of this suite's gradient comparisons staying green.
   const same = bwd.loss === fwd.loss;
 
-  const ok = stillClears && noneWithoutBackward && same && refusesLateBackward;
+  // An optimizer constructor queues one entryFor clear per parameter. Those are
+  // persistent accumulators, not pool buffers, and the same sync re-arms them,
+  // so dropping theirs is free and must not arm the throw. Flagging the whole
+  // queue rather than makeOut's share refused this flow.
+  const allowsOptimizerOnly = await (async () => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    const g = m.paramGroups();
+    try {
+      gpu.install();
+      new MuonGpu(gpu, g.muon, g.aux, {
+        lr: 0.01,
+        momentum: 0.95,
+        aux: { lr: 3e-3, weightDecay: 0, clip: 1 },
+      });
+      await gpu.sync([]);
+      gpu.seedGradFromHost(g.muon[0]);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      gpu.uninstall();
+      gpu.destroy();
+    }
+  })();
+
+  // The re-arm on the DROP path, which pretrain depends on: its trust gate is a
+  // forward-only sync that drops every parameter's clear, and the training loop
+  // then accumulates into those same accumulators. Moving the re-arm inside the
+  // new backwardBegun branch reads like a tidy-up and would make step 0
+  // accumulate into an unzeroed buffer, reporting exactly 2x with nothing else
+  // failing.
+  const rearmsAcrossAForwardOnlySync = await (async () => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    try {
+      gpu.install();
+      gpu.uploadParams(m.params());
+      const step = async () => {
+        const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+        backward(loss, 1);
+        await gpu.sync([loss]);
+        return m.params().map((p) => Float32Array.from(p.grad));
+      };
+      const first = await step();
+      // The trust gate's shape: a forward, a sync, no backward.
+      await gpu.sync([sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0)]);
+      const third = await step();
+      let worst = 0, n = 0;
+      for (let i = 0; i < first.length; i++) {
+        for (let j = 0; j < first[i].length; j++) {
+          if (Math.abs(first[i][j]) < 1e-6) continue;
+          worst = Math.max(worst, Math.abs(third[i][j] / first[i][j] - 1));
+          n++;
+        }
+      }
+      return n > 0 && worst < 1e-4;
+    } finally {
+      gpu.destroy();
+    }
+  })();
+
+  const ok = stillClears && noneWithoutBackward && same && refusesLateBackward &&
+    allowsOptimizerOnly && rearmsAcrossAForwardOnlySync;
   if (!ok) failures++;
   console.log(
     `  ${ok ? "ok " : "FAIL"} forward-only clears: ${bwd.clears} issued with a backward, ` +
-      `${fwd.clears} without, loss ${bwd.loss.toFixed(6)} both, ` +
-      `late backward refused ${refusesLateBackward}`,
+      `${fwd.clears} without, loss ${bwd.loss.toFixed(6)} both, late backward refused ` +
+      `${refusesLateBackward}, optimizer-only allowed ${allowsOptimizerOnly}, ` +
+      `re-armed across a forward-only sync ${rearmsAcrossAForwardOnlySync}`,
   );
 }
 

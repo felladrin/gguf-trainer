@@ -1256,8 +1256,9 @@ speed-up. `makeOut` queues every intermediate's gradient buffer for a `clearBuff
 because a backward accumulates into it with `+=` and a pooled buffer arrives dirty. Its comment says
 "before this graph's backward pass runs". Eval, `generate` and `pretrain`'s trust gate never run
 one, so every one of those clears was zeroing a buffer nobody would read. On the toy model in the
-gate that is 85 per window against 54 parameters, and unlike #60's they are full-size buffers rather
-than a shared 256-byte stub.
+gate a forward-only window issues 139 clears, 85 intermediates and 54 parameter accumulators, and
+all 139 go: the 54 are the ones lever 28 attacked in the frozen case, and unlike those the
+intermediates are full-size buffers rather than a shared 256-byte stub.
 
 `sync()` drained the queue whether or not a backward had begun, which is what forced them. It now
 asks. **Dropping rather than deferring is what the recycling forces:** those buffers return to the
@@ -1284,14 +1285,28 @@ case, and that entry now says so. Worth noting as the failure mode of counting g
 levers that quote them: both pin a number a later, unrelated improvement is entitled to move.
 
 The drain in `sync()` is a safety net rather than a live path, measured by deleting it: every clear
-today is issued by `ensureBackwardBegun`, and no count moves. It covers clears queued after a
-backward began, which is where a second backward over one graph would need them.
+today is issued by `ensureBackwardBegun`, and no count moves. What it covers is a clear queued after
+the backward began, an external first materialized mid-backward. Not a second backward over one
+graph, which queues nothing at all: `ensureBackwardBegun` early-returns and `makeOut` is not called
+again.
 
 **The price is an invariant that used to be forgiving.** Dropping a clear is safe only while no
 backward runs over a graph built before a sync. That ordering was previously wasteful but survivable,
 since the buffers went back to the pool zeroed; now they go back dirty, so the same mistake would
 accumulate into pool garbage and report a believable number. `ensureBackwardBegun` throws on it, and
 the gate has an arm that builds a graph, syncs it, asks for a backward and expects the refusal.
+
+The throw is armed only by a dropped `makeOut` clear, not by any dropped clear. `entryFor`'s
+accumulators are persistent, never return to the pool, and are re-armed by the same `sync()`, so
+dropping theirs is free: an optimizer constructor queues one per parameter, and flagging the whole
+queue refused `new MuonGpu(...)` followed by a sync and a `seedGradFromHost` with no graph anywhere
+in the flow. The gate has an arm for that too, and for the re-arm itself, which `pretrain` depends
+on: its trust gate is a forward-only sync that drops every parameter's clear, and the training loop
+then accumulates into those same accumulators.
+
+The reset in `beginForwardOp` bounds what the throw catches to a backward with no forward op in
+between. Forward A, sync, forward B, backward A still slips through, as it did before this change.
+The flag narrows the window rather than closing it.
 
 ## Quality levers
 

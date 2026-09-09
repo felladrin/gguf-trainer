@@ -319,9 +319,15 @@ export class WebGPUBackend implements OpsBackend {
   private gradKeptOnDevice = new WeakSet<Tensor>();
   private transients: { buf: GpuBuffer; size: number }[] = [];
   private pendingClears: GpuBuffer[] = [];
-  // Set when a sync() discarded queued clears because no backward had begun.
-  // Cleared by the next forward op, i.e. by the next graph.
+  // Set when a sync() discarded a queued clear for a GRAPH buffer because no
+  // backward had begun. Cleared by the next forward op, i.e. by the next graph.
   private droppedClearsForGraph = false;
+  // Whether pendingClears holds any makeOut buffer. Those come from the pool and
+  // go back to it at the end of the sync, so dropping their clear is what a
+  // later backward would notice. entryFor's accumulators are persistent and are
+  // re-armed on the drop path, so dropping theirs is free and must not arm the
+  // throw: an optimizer constructor queues one per parameter.
+  private pendingGraphClears = false;
   /**
    * Buffers released by endRegion, reusable ONLY by makeOut.
    *
@@ -414,15 +420,18 @@ export class WebGPUBackend implements OpsBackend {
     //
     // The drain itself is a safety net rather than a live path: measured by
     // deleting it, every clear today is issued by ensureBackwardBegun and no
-    // count moves. It covers clears queued AFTER a backward began, which is
-    // where a second backward over one graph would need them.
+    // count moves. What it covers is a clear queued after the backward began,
+    // i.e. an external first materialized mid-backward. A second backward over
+    // one graph would not need it: ensureBackwardBegun early-returns and makeOut
+    // is not called again, so nothing is queued.
     if (this.backwardBegun) {
       for (const b of this.pendingClears) this.enc.clearBuffer(b);
       this.gradClearsIssued += this.pendingClears.length;
-    } else if (this.pendingClears.length > 0) {
+    } else if (this.pendingGraphClears) {
       this.droppedClearsForGraph = true;
     }
     this.pendingClears = [];
+    this.pendingGraphClears = false;
 
     const stagings: { stage: GpuBuffer; dst: Float32Array }[] = [];
     const readSet = new Set(reads);
@@ -1270,11 +1279,16 @@ export class WebGPUBackend implements OpsBackend {
    */
   private ensureBackwardBegun() {
     if (this.backwardBegun) return;
-    // The invariant recycling already needed, made loud. Before the clears were
-    // conditional this ordering was wrong but survivable: the buffers went back
-    // to the pool zeroed. Now they go back dirty, so a backward over a graph
-    // built before a sync would accumulate into whatever reacquired them and
-    // report a believable number.
+    // The invariant recycling already needed, made loud for the one ordering the
+    // flag can see. Before the clears were conditional this was wrong but
+    // survivable: the buffers went back to the pool zeroed. Now they go back
+    // dirty, so a backward over a graph built before a sync would accumulate
+    // into whatever reacquired them and report a believable number.
+    //
+    // The reset in beginForwardOp bounds what this catches to a backward with no
+    // forward op in between. Forward A, sync, forward B, backward A slips
+    // through, as it did before this change; the flag narrows the window, it
+    // does not close it.
     if (this.droppedClearsForGraph) {
       throw new Error(
         "backward over a graph built before a sync(): that sync recycled the graph's " +
@@ -1289,6 +1303,7 @@ export class WebGPUBackend implements OpsBackend {
       for (const b of this.pendingClears) this.enc.clearBuffer(b);
       this.gradClearsIssued += this.pendingClears.length;
       this.pendingClears = [];
+      this.pendingGraphClears = false;
     }
     this.submit();
   }
@@ -1451,6 +1466,7 @@ export class WebGPUBackend implements OpsBackend {
     // Gradients accumulate with +=, so the (possibly recycled) buffer must be
     // zeroed before this graph's backward pass runs.
     this.pendingClears.push(e.grad);
+    this.pendingGraphClears = true;
     this.entries.set(t, e);
     return { t, e };
   }
