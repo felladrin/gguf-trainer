@@ -72,7 +72,8 @@ forward(ids: number[]): Tensor {
 }
 ```
 
-Without it `pretrain --loss-chunk` refuses to start, naming the architecture: the dense path
+Without it `--loss-chunk` refuses to start on `pretrain`, `finetune`, `eval-loss` and
+`eval-choice`, naming the architecture: the dense path
 materializes `[seq-len, vocab]` logits and caps context at a large vocab (agents.md invariant 7),
 so falling back silently would walk into the abort the flag exists to avoid. Calling `trainLM`
 directly still falls back. All three shipped architectures implement it.

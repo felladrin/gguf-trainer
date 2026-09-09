@@ -23,7 +23,7 @@
 import { readGGUF } from "../gguf/gguf.ts";
 import { greedyComplete, SAMPLE_PRESET } from "../eval/generate.ts";
 import { lossTrend } from "../loss-trend.ts";
-import { sequenceLoss } from "../train/loss.ts";
+import { lossChunkModelError, lossChunkValueError, sequenceLoss } from "../train/loss.ts";
 import { applyLora } from "../train/lora.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
@@ -53,16 +53,6 @@ import { deserializeOptState, MuonGpu, serializeOptState } from "../backend/muon
 import { trainLMGpuResident } from "../backend/train-gpu.ts";
 import type { Command, Flag, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
-
-/**
- * Span ceiling for `--loss-chunk`. Each vocab span bakes its own offset into the
- * kernels it dispatches, so every span costs pipelines compiled before step 0.
- * The ceiling exists only because the offset is baked rather than passed; see
- * docs/optimization.md lever 19 for what would remove it. No width this refuses
- * buys memory worth having: at vocab 32768 the floor is 328, and `[2048, 328]`
- * is already 2.7 MB.
- */
-const MAX_LOSS_SPANS = 100;
 
 const DOC_SEP = "<|endoftext|>"; // TinyStories and most raw dumps mark doc boundaries with this
 const VOCAB = 16384; // .txt-mode shared vocab (caps below this on a small sample)
@@ -245,11 +235,10 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     die("--lora-alpha does nothing without --lora-rank");
   }
   const lossChunk = v.num("loss-chunk");
-  if (!Number.isInteger(lossChunk) || lossChunk < 0) {
-    // A fractional width would reach WGSL as `const N: u32 = 8192.5u;` and fail
-    // as a shader-compile error rather than a usage error.
-    die(`--loss-chunk must be a whole number, 0 (dense) or positive, got ${lossChunk}`);
-  }
+  // A fractional width would reach WGSL as `const N: u32 = 8192.5u;` and fail as
+  // a shader-compile error rather than a usage error.
+  const badChunk = lossChunkValueError(lossChunk);
+  if (badChunk) die(badChunk);
   const resumePath = v.opt("resume");
   const outPath = v.str("out");
   const name = v.opt("name") ?? (mode === "finetune" ? "finetune" : "pretrain-base");
@@ -356,25 +345,13 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     console.log(`Resumed weights from ${resumePath} (${g.tensors.length} tensors)`);
   }
 
-  // Every span bakes its offset into five WGSL sources (NT, stats, grad, NN, TN),
-  // so a small width compiles a pipeline per span per kernel before step 0 and
-  // presents as a hang. Checked before the parity probe below, which would
-  // otherwise pay that cost on the way to reporting it.
-  const lossSpans = lossChunk > 0 ? Math.ceil(cfg.vocabSize / lossChunk) : 0;
-  if (lossSpans > MAX_LOSS_SPANS) {
-    die(
-      `--loss-chunk ${lossChunk} splits a ${cfg.vocabSize}-token vocab into ${lossSpans} spans, ` +
-        `each compiling its own kernels before step 0. ` +
-        `Raise it to at least ${Math.ceil(cfg.vocabSize / MAX_LOSS_SPANS)}.`,
-    );
-  }
-  if (lossChunk > 0 && !model.forwardToReadout) {
-    // Silent degradation would be the worst outcome: the only reason to pass the
-    // flag is to get past the binding limit, and the dense fallback walks back
-    // into it with nothing to say why. Also before the probe, which would
-    // otherwise compare the dense path against itself and print a green line.
-    die(`--loss-chunk needs an architecture with forwardToReadout; ${arch.name} has none`);
-  }
+  // Both checks run BEFORE the parity probe below, and the shared validator
+  // cannot say why: the span ceiling has to fire before the probe compiles a
+  // pipeline per span on the way to reporting the cost, and the
+  // forwardToReadout check has to fire before the probe compares the dense path
+  // against itself and prints a green line for a path it never ran.
+  const badForModel = lossChunkModelError(lossChunk, cfg.vocabSize, arch.name, model);
+  if (badForModel) die(badForModel);
 
   if (loraRank > 0 && !resumePath) {
     die("--lora-rank needs --resume: adapters on a frozen random init learn against noise");
@@ -432,8 +409,9 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   );
   if (drift > 1e-3 + 1e-3 * Math.abs(cpuLoss)) die("GPU/CPU parity probe failed");
   if (flags.has("recompute") && gpu.regionCount() === 0) {
-    // Matches how --loss-chunk refuses an architecture without forwardToReadout:
-    // the flag would otherwise print "recompute on" and change nothing.
+    // Matches how --loss-chunk refuses an architecture without forwardToReadout
+    // (lossChunkModelError in src/train/loss.ts): the flag would otherwise print
+    // "recompute on" and change nothing.
     die(
       `--recompute needs an architecture whose forward calls checkpoint(); ${arch.name} does not`,
     );
@@ -490,9 +468,11 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
       Math.round(steps * 0.1)
     } / cooldown ${Math.round(steps * 0.2)} steps, quant ${quant}, reclaim ${
       flags.has("reclaim") ? "on" : "off"
-    }, loss ${lossChunk > 0 ? `chunked x${lossChunk} (${lossSpans} spans)` : "dense"}, recompute ${
-      flags.has("recompute") ? "on" : "off"
-    }, ${
+    }, loss ${
+      lossChunk > 0
+        ? `chunked x${lossChunk} (${Math.ceil(cfg.vocabSize / lossChunk)} spans)`
+        : "dense"
+    }, recompute ${flags.has("recompute") ? "on" : "off"}, ${
       loraRank > 0
         ? `lora r${loraRank} a${loraAlpha} (adapters train at aux lr; muon lr is inert)`
         : "full fine-tune"

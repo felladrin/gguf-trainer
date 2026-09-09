@@ -301,6 +301,45 @@ async function main() {
     );
   }
   {
+    // The identity eval-choice depends on: it reads the mean over kept rows and
+    // multiplies by that count to recover a summed NLL. That only survives the
+    // chunked path if both denominators are the same count, so pin it on the
+    // shape eval-choice actually builds, an ignored context prefix followed by
+    // the scored choice tokens.
+    const T = 7, H = 5, V = 23;
+    const hid = randTensor([T, H], rng);
+    const w = randTensor([V, H], rng);
+    const targets = [-1, -1, -1, 4, 9, 2, 17];
+    const kept = targets.filter((t) => t >= 0).length;
+
+    // The reference is computed here, not taken from either implementation:
+    // multiplying both sides by the same `kept` would cancel it, and a change
+    // that moved BOTH to a different denominator would pass while every
+    // eval-choice score shifted.
+    const logits = linear(hid, w);
+    let expected = 0;
+    for (let t = 0; t < T; t++) {
+      if (targets[t] < 0) continue;
+      let mx = -Infinity;
+      for (let v = 0; v < V; v++) mx = Math.max(mx, logits.data[t * V + v]);
+      let sum = 0;
+      for (let v = 0; v < V; v++) sum += Math.exp(logits.data[t * V + v] - mx);
+      expected += Math.log(sum) + mx - logits.data[t * V + targets[t]];
+    }
+
+    let worst = Math.abs(crossEntropy(logits, targets).data[0] * kept - expected);
+    for (const chunk of [4, 8, 100]) {
+      const fused = fusedCrossEntropy(hid, w, targets, chunk).data[0] * kept;
+      worst = Math.max(worst, Math.abs(fused - expected));
+    }
+    const ok = worst < 1e-4;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"chunked summed NLL".padEnd(24)}        ` +
+        `mean*kept == summed NLL, ${kept} kept of ${T}  maxAbs=${worst.toExponential(2)}`,
+    );
+  }
+  {
     // Activation recomputation. Two claims, and the second is the one that
     // matters: the analytic gradient still matches finite differences THROUGH a
     // recompute boundary, and enabling it changes nothing. The recompute is a
