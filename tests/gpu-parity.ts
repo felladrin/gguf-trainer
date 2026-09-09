@@ -681,6 +681,7 @@ async function main() {
   await generateFreezeGate();
   await residentReadbackGate();
   await frozenClearGate();
+  await forwardOnlyClearGate();
   await clearRearmPredicateGate();
   await flatOverflowGate(gpu);
   {
@@ -1654,8 +1655,7 @@ async function residentReadbackGate() {
  * second window is what matters: on the first, a frozen parameter is not queued
  * at all, because `entryFor` starts `gradNeedsClear` at `requiresGrad`. The
  * count does not go to zero, and should not: `makeOut` queues every
- * intermediate's gradient buffer unconditionally, which is a separate waste in a
- * forward-only run (#67).
+ * intermediate's gradient buffer, which a backward genuinely needs.
  */
 async function frozenClearGate() {
   const cfg = gemma3Config(64, 64, 4, 256, 16);
@@ -1670,8 +1670,12 @@ async function frozenClearGate() {
       // params().length stands in for "externals this forward touches", which
       // holds because this forward touches every parameter. A parameter a future
       // forward skipped would move the count for a reason unrelated to freezing.
+      // With a backward, because a forward-only window issues no clears at all
+      // since lever 32: the drain is skipped when nothing ran backward. A
+      // parameter's clear is only observable in a window that has one.
       const window = async () => {
         const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+        backward(loss, 1);
         await gpu.sync([loss]);
         return loss.data[0];
       };
@@ -1707,6 +1711,56 @@ async function frozenClearGate() {
     `  ${ok ? "ok " : "FAIL"} frozen clears: second window issues ${hot.second} unfrozen ` +
       `and ${cold.second} frozen, a saving of exactly the ${hot.params} parameters, ` +
       `loss ${hot.loss.toFixed(6)} both`,
+  );
+}
+
+/**
+ * A forward-only window asks the device to zero nothing.
+ *
+ * `makeOut` queues every intermediate's gradient buffer for a clear at creation,
+ * because a backward accumulates into it with `+=` and a pooled buffer arrives
+ * dirty. Eval, `generate` and the trust gate never run one, so every one of
+ * those clears was zeroing a buffer nobody would read.
+ *
+ * The counting arms are the whole test: this is not a speed fix, and a probe
+ * measured it at 26.53 s against 26.69 s on `eval-loss --windows 16`, inside the
+ * run-to-run spread. What it buys is a command stream that says what it means.
+ */
+async function forwardOnlyClearGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const ids = Array.from({ length: 33 }, (_, i) => (i * 11 + 5) % cfg.vocabSize);
+  const arm = async (withBackward: boolean) => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    try {
+      gpu.install();
+      gpu.uploadParams(m.params());
+      const before = gpu.gradClearsIssued;
+      const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
+      if (withBackward) backward(loss, 1);
+      await gpu.sync([loss]);
+      return { clears: gpu.gradClearsIssued - before, loss: loss.data[0] };
+    } finally {
+      gpu.destroy();
+    }
+  };
+  const bwd = await arm(true);
+  const fwd = await arm(false);
+
+  // 1. A window with a backward still zeroes every buffer that backward will
+  //    accumulate into. Losing this is a correctness bug, not a tidiness one.
+  const stillClears = bwd.clears > 0;
+  // 2. A forward-only window issues none.
+  const noneWithoutBackward = fwd.clears === 0;
+  // 3. And the loss is identical, which is the claim that the skipped clears
+  //    were doing nothing.
+  const same = bwd.loss === fwd.loss;
+
+  const ok = stillClears && noneWithoutBackward && same;
+  if (!ok) failures++;
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} forward-only clears: ${bwd.clears} issued with a backward, ` +
+      `${fwd.clears} without, loss ${bwd.loss.toFixed(6)} both`,
   );
 }
 

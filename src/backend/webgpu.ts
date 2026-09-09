@@ -396,8 +396,23 @@ export class WebGPUBackend implements OpsBackend {
   async sync(reads: Tensor[] = []): Promise<void> {
     this.endPass();
     if (!this.enc) this.enc = this.device.createCommandEncoder();
-    for (const b of this.pendingClears) this.enc.clearBuffer(b);
-    this.gradClearsIssued += this.pendingClears.length;
+    // Only if a backward actually began. makeOut queues every intermediate's
+    // gradient buffer at creation, because a backward accumulates into it with
+    // += and a pooled buffer arrives dirty. A forward-only window never runs
+    // one, so those clears zero buffers nobody reads: 85 per window against 54
+    // parameters on the toy model in frozenClearGate, and full-size rather than
+    // the shared stub.
+    //
+    // Dropping rather than deferring is what the recycling below forces: these
+    // buffers return to the pool at the end of this sync, so a clear held over
+    // would land on whatever reacquires them. The invariant that makes it safe
+    // is the same one recycling already needs, that no backward may begin for a
+    // graph built before this sync; ensureBackwardBegun drains the queue itself
+    // when one does.
+    if (this.backwardBegun) {
+      for (const b of this.pendingClears) this.enc.clearBuffer(b);
+      this.gradClearsIssued += this.pendingClears.length;
+    }
     this.pendingClears = [];
 
     const stagings: { stage: GpuBuffer; dst: Float32Array }[] = [];

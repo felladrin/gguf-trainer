@@ -1244,6 +1244,38 @@ point is the exact rank and not merely "has a shape"; and moving the `crossEntro
 dispatch passes every CPU case and fails only the GPU arm, which is by now the recognisable signature
 of that mistake.
 
+### 32. A forward-only window asked the device to zero buffers nobody reads (2026-09-09)
+
+Filed as #67 while fixing #60, and filed with its own null measurement so nobody chases it as a
+speed-up. `makeOut` queues every intermediate's gradient buffer for a `clearBuffer` at creation,
+because a backward accumulates into it with `+=` and a pooled buffer arrives dirty. Its comment says
+"before this graph's backward pass runs". Eval, `generate` and `pretrain`'s trust gate never run
+one, so every one of those clears was zeroing a buffer nobody would read. On the toy model in the
+gate that is 85 per window against 54 parameters, and unlike #60's they are full-size buffers rather
+than a shared 256-byte stub.
+
+`sync()` drained the queue whether or not a backward had begun, which is what forced them. It now
+asks. **Dropping rather than deferring is what the recycling forces:** those buffers return to the
+pool at the end of the same `sync()`, so a clear held over would land on whatever reacquires them.
+The invariant that makes dropping safe is the one recycling already needs, that no backward may
+begin for a graph built before the sync, and `ensureBackwardBegun` drains the queue itself when one
+does.
+
+**It buys no measurable time, the second such entry in a row.** `eval-loss --windows 16 --seq-len
+512` on `littlelamb-base.f32.gguf` measures 26.62 s median against `main`'s 26.69 s, three runs each,
+inside the run-to-run spread, and a one-step `pretrain` on a 306M model moved 36.58 s against 37.25 s
+when probed. Both are the size of the noise. What the change buys is a command stream that says what it means.
+
+`forwardOnlyClearGate` counts rather than times: a window with a backward still issues 139 clears,
+one without issues 0, and the two losses are bit-equal. Removing the guard or inverting it makes the
+forward-only arm issue all 139.
+
+**It also invalidated a gate written three levers ago.** `frozenClearGate` compared clear counts
+across two forward-only windows, which now issue none at all, so it went red on a correct change. It
+runs a backward now, since a parameter's clear is only observable in a window that has one. Worth
+noting as the failure mode of counting gates: they pin a number that a later, unrelated improvement
+is entitled to move.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
