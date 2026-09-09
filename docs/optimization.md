@@ -1081,9 +1081,13 @@ the buffer cannot go stale in any ordering and drops exactly the same clears.
 
 That is +0.3%, well inside the run-to-run spread, and the val loss is 3.4202 either way. A
 256-byte `clearBuffer` really is nearly free; what was wrong was the bookkeeping, not the clock.
-Two reasons it is still worth having: the command stream now says what it means, and #66 depends on
-it, because freezing `pretrain`'s end-of-run sample stops the copies while leaving the clears, and
-there the re-queued buffer is a full-size accumulator rather than the stub.
+It is still worth having, though the second reason this entry first gave was backwards. #66 does not
+depend on it: those parameters already carry full accumulators from training, so `e.grad !==
+frozenStub` is true for every one and their clears are still re-armed. #66 is the case this does
+NOT cover, and it is not blocked by it either, since its copy saving comes from the `requiresGrad`
+guard in the staging branch rather than from here. What remains is reason enough: `sync()` stated
+something untrue about frozen externals, and the eval and LoRA no-ops leave the command stream at no
+measurable cost.
 
 **It costs nothing, which took two wrong readings to establish.** I first wrote that a parameter
 frozen after it had a full-size accumulator would keep stale gradients forever. It does not: the

@@ -1643,6 +1643,11 @@ async function frozenClearGate() {
  * Nothing in the tree freezes mid-window. This is here so that simplifying the
  * predicate to the flag, which reads like the same thing and passes every other
  * check, fails something.
+ *
+ * It reads host `p.grad`, which `sync()` refreshes only while the tensor
+ * requires grad and is not in `gradKeptOnDevice`. Construct an optimizer here,
+ * or call `keepGradOnDevice`, and the staging stops: `third` would be a copy of
+ * the step-1 host array and the gate would pass against any device state.
  */
 async function clearRearmPredicateGate() {
   const cfg = gemma3Config(64, 64, 4, 256, 16);
@@ -1681,7 +1686,9 @@ async function clearRearmPredicateGate() {
         n++;
       }
     }
-    const ok = worst < 1e-4;
+    // n > 0 or this passes on an all-zero gradient: every element below the
+    // threshold is skipped, so an empty comparison leaves `worst` at 0.
+    const ok = n > 0 && worst < 1e-4;
     if (!ok) failures++;
     console.log(
       `  ${ok ? "ok " : "FAIL"} clear re-arm survives a mid-window freeze: ` +

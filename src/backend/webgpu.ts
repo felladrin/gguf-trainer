@@ -425,6 +425,11 @@ export class WebGPUBackend implements OpsBackend {
       // and a later thaw would accumulate on top of them. Measured at exactly
       // 2x. Keying on the buffer cannot go stale in any ordering, and it still
       // drops every clear that was measurably waste.
+      //
+      // Identity comparison is sound because the stub comes from
+      // acquirePersistent and never returns to the pool: only `transients` and
+      // `regionFree` reach pool.release, so no real accumulator can alias it.
+      // Make parameter gradients poolable and this breaks silently.
       e.gradNeedsClear = e.grad !== this.frozenStub;
     }
     this.lastSyncReadbackBytes = stagings.reduce((a, s) => a + s.dst.length * 4, 0);
