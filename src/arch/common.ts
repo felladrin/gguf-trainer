@@ -140,9 +140,11 @@ export function tensorLoader(g: GGUFFile): (name: string, dst: Tensor) => void {
     // element count scrambles the weight. The other direction threw, but as an
     // unnamed DataView RangeError; dequantize names it now.
     //
-    // Trailing 1s are trimmed from both sides. ggml's ne is always four long
-    // with implicit 1s, so a foreign writer may declare a 1-D tensor as [n, 1],
-    // which llama.cpp accepts and an exact comparison would refuse. Trimming
+    // Trailing 1s are trimmed from both sides. GGUF stores an explicit n_dims
+    // and exactly that many values, so a file is never padded; llama.cpp pads
+    // ne to four with 1s ON READ, which is why [n] and [n, 1] are the same
+    // tensor to it and why a writer that emits the redundant trailing 1
+    // produces a file it accepts and an exact comparison here would refuse. Trimming
     // still refuses [4] against [4, 3], which is the case the length clause is
     // for: [4] is a PREFIX of [4, 3], so comparing element-wise alone accepts a
     // 1-D destination against a 2-D tensor.
@@ -157,8 +159,10 @@ export function tensorLoader(g: GGUFFile): (name: string, dst: Tensor) => void {
       throw new Error(
         `GGUF tensor "${name}" has dims [${t.dims.join(", ")}], but this model wants ` +
           `[${want.join(", ")}] (shape [${dst.shape.join(", ")}] in this repo's order). ` +
-          `For a file this repo wrote that means corruption; for a foreign one it usually ` +
-          `means its metadata and its tensors disagree about a dimension.`,
+          `For a file this repo wrote that means corruption. For a foreign one it means ` +
+          `its metadata and its tensors disagree about a dimension: the common benign case ` +
+          `is an embedding padded wider than the declared vocab, which llama.cpp tolerates ` +
+          `because it sizes the model from the tensor and this repo does not.`,
       );
     }
     const de = dequantize(t.type, t.data, dst.size);

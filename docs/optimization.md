@@ -1366,10 +1366,26 @@ one**. Its nibble read is a plain array index, and in JS `undefined & 0x0f` is 0
 the end of a truncated block decodes as `(0 - 8) * scale`: finite, plausible, no NaN. Measured on a
 block with half its nibbles missing, the last eight values came back as -8.
 
-And the dims comparison trims trailing 1s from both sides. ggml's `ne` is always four long with
-implicit 1s, so a foreign writer may declare a 1-D tensor as `[n, 1]`, which llama.cpp accepts and an
-exact comparison would refuse. This repo reads foreign GGUFs on purpose, BF16 existing only as an
-import path.
+And the dims comparison trims trailing 1s from both sides. GGUF itself stores an explicit `n_dims`
+and exactly that many values, so a file is never padded; llama.cpp pads `ne` to four with 1s **on
+read**, which is why `[n]` and `[n, 1]` are the same tensor to it and why a writer emitting the
+redundant trailing 1 produces a file it accepts and an exact comparison here would refuse. This repo
+reads foreign GGUFs on purpose, BF16 existing only as an import path.
+
+Trimming cannot admit anything it should refuse, because it preserves the product: if the two
+trimmed lists are equal then the element counts are equal. The `> 1` floor has no distinguishing
+input either, and that is a property rather than a gap. The two floors differ only for an all-1s
+list, `[]` against `[1]`, and a list of positive integers is all-1s exactly when its product is 1; so
+if one side is all-1s the other either is too, in which case both floors collapse both sides
+identically, or has a different product, in which case both refuse.
+
+**The trade it makes, stated because it is a live one.** This repo sizes a model from its metadata
+and llama.cpp sizes it from the tensor. A foreign checkpoint whose embedding is padded wider than its
+declared vocab used to load a prefix, and the prefix was the CORRECT weights, the padded rows being
+unused. It now stops. That is the point of the guard, silence being the thing #74 is about, but the
+message names that case so the person who hits it is not sent looking for a corrupt download. The
+readme's verified base-model list is unaffected: all eight local checkpoints across all three
+architectures load unchanged.
 
 `assertRank` is `assertMatrix` from lever 31 with the rank as an argument, since the writer needs 2
 for a matrix and 1 for a vector. Nine mutations in `tests/export-extras.ts`, one per clause on each

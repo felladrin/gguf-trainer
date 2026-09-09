@@ -46,7 +46,7 @@ export function serializeQ8_0(data: Float32Array): Serialized {
     throw new Error(`Q8_0 needs a length multiple of ${QK}, got ${data.length}`);
   }
   const nBlocks = data.length / QK;
-  const blockBytes = 2 + QK; // 34
+  const blockBytes = BLOCK_BYTES[GGMLType.Q8_0]!; // 34
   const out = new Uint8Array(nBlocks * blockBytes);
   const dv = new DataView(out.buffer);
 
@@ -78,7 +78,7 @@ export function serializeQ4_0(data: Float32Array): Serialized {
     throw new Error(`Q4_0 needs a length multiple of ${QK}, got ${data.length}`);
   }
   const nBlocks = data.length / QK;
-  const blockBytes = 2 + QK / 2; // 18
+  const blockBytes = BLOCK_BYTES[GGMLType.Q4_0]!; // 18
   const out = new Uint8Array(nBlocks * blockBytes);
   const dv = new DataView(out.buffer);
 
@@ -114,35 +114,40 @@ export function serializeQ4_0(data: Float32Array): Serialized {
 // as the basis for a future GGUF checkpoint loader.
 // ---------------------------------------------------------------------------
 
+/** Bytes one block of a block-quantized type occupies: an f16 scale plus its payload. */
+const BLOCK_BYTES: Partial<Record<GGMLTypeId, number>> = {
+  [GGMLType.Q8_0]: 2 + QK,
+  [GGMLType.Q4_0]: 2 + QK / 2,
+};
+
 /**
- * Bytes `count` elements of `type` occupy, so a short buffer is refused by name
- * rather than by a DataView RangeError, or worse. The block types are the reason
- * this exists: a q4_0 buffer truncated inside a block decodes its missing
- * nibbles as `undefined & 0x0f`, i.e. 0, so every one of them comes out as
- * `(0 - 8) * scale`, a finite and entirely plausible value.
+ * Bytes `count` elements of `type` occupy, or null for a type this file cannot
+ * read, so `dequantize` keeps its own message for that case rather than losing
+ * it to a guard running first.
+ *
+ * It exists so a short buffer is refused by name instead of by a DataView
+ * RangeError, or worse. The block types are the reason: a q4_0 buffer truncated
+ * inside a block decodes its missing nibbles as `undefined & 0x0f`, i.e. 0, so
+ * every one comes out as `(0 - 8) * scale`, finite and entirely plausible.
  */
-export function bytesFor(type: GGMLTypeId, count: number): number {
-  switch (type) {
-    case GGMLType.F32:
-      return count * 4;
-    case GGMLType.F16:
-    case GGMLType.BF16:
-      return count * 2;
-    case GGMLType.Q8_0:
-      return (count / QK) * (2 + QK);
-    case GGMLType.Q4_0:
-      return (count / QK) * (2 + QK / 2);
-    default:
-      throw new Error(`dequantize: unsupported ggml type ${type}`);
+export function bytesFor(type: GGMLTypeId, count: number): number | null {
+  const block = BLOCK_BYTES[type];
+  if (block !== undefined) {
+    if (count % QK !== 0) {
+      throw new Error(
+        `dequantize: ggml type ${type} needs a count multiple of ${QK}, got ${count}`,
+      );
+    }
+    return (count / QK) * block;
   }
+  if (type === GGMLType.F32) return count * 4;
+  if (type === GGMLType.F16 || type === GGMLType.BF16) return count * 2;
+  return null;
 }
 
 export function dequantize(type: GGMLTypeId, bytes: Uint8Array, count: number): Float32Array {
-  if ((type === GGMLType.Q8_0 || type === GGMLType.Q4_0) && count % QK !== 0) {
-    throw new Error(`dequantize: ggml type ${type} needs a count multiple of ${QK}, got ${count}`);
-  }
   const need = bytesFor(type, count);
-  if (bytes.length < need) {
+  if (need !== null && bytes.length < need) {
     throw new Error(
       `dequantize: ${count} elements of ggml type ${type} need ${need} bytes, got ${bytes.length}`,
     );
@@ -166,7 +171,7 @@ export function dequantize(type: GGMLTypeId, bytes: Uint8Array, count: number): 
       return out;
     }
     case GGMLType.Q8_0: {
-      const blockBytes = 2 + QK;
+      const blockBytes = BLOCK_BYTES[GGMLType.Q8_0]!;
       const nBlocks = count / QK;
       for (let b = 0; b < nBlocks; b++) {
         const base = b * blockBytes;
@@ -176,7 +181,7 @@ export function dequantize(type: GGMLTypeId, bytes: Uint8Array, count: number): 
       return out;
     }
     case GGMLType.Q4_0: {
-      const blockBytes = 2 + QK / 2;
+      const blockBytes = BLOCK_BYTES[GGMLType.Q4_0]!;
       const nBlocks = count / QK;
       for (let b = 0; b < nBlocks; b++) {
         const base = b * blockBytes;
