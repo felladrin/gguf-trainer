@@ -202,5 +202,36 @@ ok(
 );
 ok(choiceWindowError(600, 600, 512) !== null, "a choice longer than the context is refused");
 ok(choiceWindowError(20, 0, 512) !== null, "an empty choice is refused, not scored as a free 0");
+ok(
+  choiceWindowError(0, 5, 512) !== null,
+  "with no context at all there is no token to predict the first choice token from",
+);
+
+// The composition the two formulas only describe: slice the window the way
+// choiceNLL does, run its mask loop, and look at what is left scoreable. This is
+// what pins targets.length === inputs.length, the equality the GPU losses lean on
+// when they count kept rows over the whole targets array.
+for (const [nCtx, nChoice, maxSeq] of [[20, 10, 512], [100, 10, 105], [600, 10, 512], [1, 7, 8]]) {
+  const shape = `ctx ${nCtx}, choice ${nChoice}, maxSeq ${maxSeq}`;
+  ok(choiceWindowError(nCtx, nChoice, maxSeq) === null, `${shape} is scoreable`);
+  const ids = Array.from({ length: nCtx + nChoice }, (_, i) => i + 1);
+  const full = ids.slice(-maxSeq);
+  const inputs = full.slice(0, -1);
+  const targets = full.slice(1);
+  const start = choiceMaskStart(nCtx, nChoice, maxSeq);
+  for (let i = 0; i < start; i++) targets[i] = -1;
+  ok(
+    targets.length === inputs.length,
+    `the mask does not extend the targets (${shape}): ${targets.length} vs ${inputs.length}`,
+  );
+  ok(
+    targets.filter((t) => t >= 0).length === nChoice,
+    `the kept count is the whole choice (${shape})`,
+  );
+  ok(
+    targets.slice(start).join(",") === ids.slice(-nChoice).join(","),
+    `the scored targets are the choice tokens themselves (${shape})`,
+  );
+}
 
 console.log("eval-tasks: all checks passed");

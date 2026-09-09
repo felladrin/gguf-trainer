@@ -244,7 +244,7 @@ async function choiceNLL(
   const ctxIds = tok.encode(ctxText);
   const chIds = tok.encode(choiceText);
   const bad = choiceWindowError(ctxIds.length, chIds.length, model.cfg.maxSeq);
-  if (bad) die(bad);
+  if (bad) die(`${bad}. The choice reads ${JSON.stringify(choiceText.slice(0, 60))}`);
   const full = [...ctxIds, ...chIds].slice(-model.cfg.maxSeq);
   const inputs = full.slice(0, -1);
   const targets = full.slice(1);
@@ -254,12 +254,18 @@ async function choiceNLL(
   const firstChoiceTgt = choiceMaskStart(ctxIds.length, chIds.length, model.cfg.maxSeq);
   for (let i = 0; i < firstChoiceTgt; i++) targets[i] = -1;
   const nChoice = targets.length - firstChoiceTgt;
+  // The GPU losses count kept rows over the whole targets array while the
+  // kernels only sum inputs.length rows, so a longer targets array silently
+  // divides by too much. The mask loop used to extend it past the end.
+  if (targets.length !== inputs.length) {
+    throw new Error(`targets ${targets.length} != inputs ${inputs.length}`);
+  }
   // sequenceLoss returns the mean over kept rows, exactly as crossEntropy did,
   // so multiplying by the kept count still recovers the summed NLL whichever
   // path it took.
   const loss = sequenceLoss(model, inputs, targets, lossChunk);
   if (gpu) await gpu.sync([loss]);
-  return loss.data[0] * Math.max(1, nChoice);
+  return loss.data[0] * nChoice;
 }
 
 /**

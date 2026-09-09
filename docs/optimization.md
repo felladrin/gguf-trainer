@@ -862,7 +862,7 @@ truncation happened:
 | --: | -----: | -----: | ------: | -------: | :------------------- |
 |  20 |     10 |    512 |      29 |       19 | 10 of 10             |
 | 100 |     10 |    105 |     104 |       99 | **5 of 10**          |
-| 600 |     10 |    512 |     599 |      599 | **0 of 10**          |
+| 600 |     10 |    512 |     511 |      599 | **0 of 10**          |
 
 Partial truncation scored only the tail of the choice. `kept` and the count the mean is multiplied
 back by still agreed, so the summed NLL was self-consistent and merely too small, while `acc_norm`
@@ -874,8 +874,11 @@ _extended_ the array rather than writing into it, nothing was kept, and `choiceN
 0. A summed NLL of zero beats every real one, so that option was always the prediction.
 
 The boundary now comes from the window the model actually sees, `min(nCtx + nChoice, maxSeq) -
-nChoice - 1`, which scores the whole choice at every context length, and a choice that cannot fit
-with at least one token in front of it is refused instead of scored short. `choiceMaskStart` and
+nChoice - 1`, which scores the whole choice at every context length: a prompt that outgrows the
+context is trimmed from the left, so the choice always survives intact and only the oldest context
+goes. Solving `choiceMaskStart < 0` gives the refusal set exactly, and it is narrow: a single
+candidate answer at least as long as the model's whole declared context, or a stem that rendered to
+nothing. Both are unscoreable, and a shortened score is not comparable to a full one. `choiceMaskStart` and
 `choiceWindowError` are exported and swept in `tests/eval-tasks.ts` over every window shape the
 command accepts; restoring the old boundary fails them.
 
