@@ -1007,8 +1007,8 @@ losses, because both now draw their denominator from the same helper and would a
 count. Making the helper count ignored rows fails `-1 still means ignore`.
 
 Not covered here: the refusal lands mid-run rather than at start-up (#64), which matters for
-`pretrain`, whose trust gate only reads the first 16 tokens. The two neighbours that were are
-`embedding` (#63, lever 29) and the GPU `softCrossEntropy`'s teacher ids (#61, lever 30).
+`pretrain`, whose trust gate only reads the first 16 tokens. The two neighbouring gaps are closed:
+`embedding` by lever 29 and the GPU `softCrossEntropy`'s teacher ids by lever 30.
 `embedding`, the input-side twin, was #63 and is now lever 29.
 
 ### 27. `generate` paid lever 25's cost per token, 39% of its wall clock (2026-09-09)
@@ -1172,11 +1172,17 @@ Three things the validator has to get right, each with its own case in `tests/gr
   `keptRowsInVocab`.
 - an ignored row's remaining ids are never read, so junk there must be accepted.
 - inside a kept row all `k` ids are checked, including the slots a short row pads at probability 0.
-  That is **stricter than the kernels need**: neither forward reads a pad, both skipping on
-  `q == 0`, and both backwards multiply it by zero. It is deliberate. The documented contract is
-  that a pad carries an in-range id, and a validator at a trust boundary should enforce the contract
-  rather than the minimum the kernels happen to survive. The consequence for whoever writes a
-  teacher file: pad short rows with an in-range id, never with `-1`.
+  Only the FORWARDS skip a pad, both on `q == 0`. Both backwards index by its id unconditionally,
+  and the GPU's is a non-atomic read-modify-write (`DLOG[i] = DLOG[i] - scale * TQ[...]`), so an
+  out-of-range pad id lands in another row and can lose that row's real update. That is the race
+  the one-thread-per-row design exists to prevent, which makes this check load-bearing rather than
+  contract-keeping. The consequence for whoever writes a teacher file: pad short rows with an
+  in-range id, never with `-1`.
+
+One instance of the shape this lever argues against is still in the tree, pre-existing and left
+alone: `crossEntropy` dispatches above its own `keptRowsInVocab` call, so that guard lives in each
+backend. All four call sites are present today, so there is no live gap, but it is the next place
+one could open.
 
 Nine mutations, each applied alone. Removing the id check fails eight cases and the GPU arm. Moving
 the call below the dispatch passes every CPU case and fails only the GPU arm, which is the whole
@@ -1389,7 +1395,7 @@ response tokens); an online teacher forward adds roughly a third of a step (forw
 attention-bound), affordable at this scale.
 
 **The op shipped (2026-08-04): `softCrossEntropy(logits, teacherIds, teacherProbs, k)`.** Sparse
-teacher, `[T*k]` ids + probs per row; a row is ignored when its first id is negative, the same
+teacher, `[T*k]` ids + probs per row; a row is ignored when its first id is exactly -1, the same
 convention `crossEntropy` uses, so assistant-only masking carries over unchanged. The teacher mass
 need not be normalized: with top-k truncation it sums to `S <= 1` and the exact gradient is
 `S*p - q`, which is the documented `(p - q)` when `S = 1`. The reported value is a cross-entropy in

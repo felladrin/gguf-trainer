@@ -706,12 +706,15 @@ export function attention(
  * unchecked, with the CPU dropping the row and the GPU scoring it.
  *
  * Inside a kept row all k ids must be in range, including the slots a row
- * shorter than k pads at probability 0. Neither forward reads a pad, both
- * skipping on `q == 0`, and both backwards multiply it by 0. So this is stricter
- * than the kernels currently need, on purpose: the documented contract is that a
- * pad carries an in-range id, and a validator at a trust boundary should enforce
- * the contract rather than the minimum the kernels happen to survive. A teacher
- * file must pad short rows with an in-range id, not with `-1`.
+ * shorter than k pads at probability 0. Only the FORWARDS skip a pad, both on
+ * `q == 0`; both backwards index by its id unconditionally. On the CPU that is a
+ * no-op, `x -= 0` writing back what it read. On the GPU it is a non-atomic
+ * read-modify-write (`DLOG[i] = DLOG[i] - scale * TQ[...]` in srcSoftCeBwdQ), so
+ * an out-of-range pad id lands in another row and can lose that row's real
+ * update: exactly the race the one-thread-per-row design exists to prevent. The
+ * contract that a pad carries an in-range id is a consequence of that, not the
+ * reason for it. A teacher file must pad short rows with an in-range id, never
+ * with `-1`.
  */
 export function assertTeacherRows(
   teacherIds: number[],
@@ -982,7 +985,7 @@ export function fusedCrossEntropy(
  *
  * `teacherIds`/`teacherProbs` are [T*k] row-major: row t holds the k teacher
  * token ids and their probabilities. A row is IGNORED (no loss, no gradient,
- * excluded from the mean) when its first id is negative: the same convention
+ * excluded from the mean) when its first id is exactly -1: the same convention
  * as crossEntropy's ignore-index, so assistant-only masking carries over. Rows
  * with fewer than k entries pad with any in-range id at probability 0.
  *
