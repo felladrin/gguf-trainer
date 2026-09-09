@@ -60,7 +60,12 @@ for (const arch of ARCHITECTURES) {
   const grouped = new Set([...groups.muon, ...groups.aux]);
   check(
     "every parameter is in exactly one optimizer group",
-    grouped.size === model.params().length &&
+    // The membership check is the one that matters: counting alone survives an
+    // arch that groups a non-parameter and omits a real one, which would never
+    // train AND would be staged back to the host on every sync, since
+    // keepGradOnDevice only reaches what an optimizer owns.
+    model.params().every((p) => grouped.has(p)) &&
+      grouped.size === model.params().length &&
       groups.muon.length + groups.aux.length === model.params().length,
     `${groups.muon.length} muon + ${groups.aux.length} aux vs ${model.params().length} params`,
   );

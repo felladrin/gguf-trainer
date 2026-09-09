@@ -679,6 +679,7 @@ async function main() {
   await recomputeMemoryGate();
   await evalFreezeGate();
   await generateFreezeGate();
+  await residentReadbackGate();
   await frozenClearGate();
   await clearRearmPredicateGate();
   await flatOverflowGate(gpu);
@@ -1557,6 +1558,86 @@ async function generateFreezeGate() {
     `  ${ok ? "ok " : "FAIL"} generate freeze: readback ${mb(hot.readback)} MB -> ` +
       `${cold.readback} B (logits alone ${lastLogits} B, params ${mb(paramBytes)} MB), ` +
       `pool ${mb(hot.pool)} -> ${mb(cold.pool)} MB, ids ${cold.ids}`,
+  );
+}
+
+/**
+ * What a resident training step and the sample after it actually stage back.
+ *
+ * Both GPU optimizers call `keepGradOnDevice` on the parameters they own while
+ * building their state, and `paramGroups()` covers every parameter, so the
+ * step's forward+backward sync reads back only its loss scalars and the sample
+ * that follows reads back only its logits. Nothing measured that: delete either `keepGradOnDevice` line and
+ * the numerics do not move, because the optimizer reads the device gradient
+ * either way, so every trajectory and parity gate stays green while each step
+ * re-copies the whole model to the host.
+ *
+ * The sample half is also what says #66 is not a bug: nothing between the
+ * trainer returning and `generateGpu` swaps the backend or rebuilds the
+ * parameters, so the exemption still holds there.
+ */
+async function residentReadbackGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const tokens = Array.from({ length: 2048 }, (_, i) => (i * 7 + 3) % cfg.vocabSize);
+  const prompt = [3, 11, 29, 5];
+  const arm = async (withOptimizer: boolean) => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    const g = m.paramGroups();
+    let step = -1;
+    try {
+      if (withOptimizer) {
+        await trainLMGpuResident(m, gpu, {
+          tokens,
+          seqLen: 64,
+          steps: 1,
+          batchPerStep: 1,
+          optimizer: new MuonGpu(gpu, g.muon, g.aux, {
+            lr: 0.01,
+            momentum: 0.95,
+            aux: { lr: 3e-3, weightDecay: 0, clip: 1 },
+          }),
+          logEvery: 100,
+          rng: mulberry32(7),
+          reclaimTransients: true,
+          // The trainer already instruments the sync this is about, the one its
+          // own comment calls "loss scalars only". The step's LAST sync is the
+          // optimizer flush, which legitimately stages more.
+          onStepTime: (_fwd, _opt, readback) => {
+            step = readback;
+          },
+        });
+      }
+      gpu.install();
+      gpu.uploadParams(m.params());
+      await greedyComplete(m, gpu, prompt, 2);
+      return {
+        step,
+        sample: gpu.lastSyncReadbackBytes,
+        paramBytes: m.params().reduce((a, t) => a + t.size * 4, 0),
+      };
+    } finally {
+      gpu.destroy();
+    }
+  };
+  const trained = await arm(true);
+  // The control: the same sample with nothing ever kept on device, so the gate
+  // cannot pass on a model too small for the copies to matter.
+  const bare = await arm(false);
+  const logits = (prompt.length + 1) * cfg.vocabSize * 4;
+
+  // One micro-batch, so one f32 loss scalar.
+  const stepScalarsOnly = trained.step === 4;
+  const sampleLogitsOnly = trained.sample === logits;
+  const controlCopies = bare.sample >= trained.paramBytes;
+
+  const ok = stepScalarsOnly && sampleLogitsOnly && controlCopies;
+  if (!ok) failures++;
+  const mb = (n: number) => (n / 1e6).toFixed(2);
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} resident readback: step ${trained.step} B, sample ` +
+      `${trained.sample} B (logits ${logits} B), against ${mb(bare.sample)} MB ` +
+      `with no optimizer (params ${mb(trained.paramBytes)} MB)`,
   );
 }
 
