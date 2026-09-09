@@ -205,6 +205,32 @@ async function loadRows(task: Task, limit: number): Promise<Row[]> {
   return rows;
 }
 
+/**
+ * The target index the choice span starts at, measured on the window AFTER
+ * truncation. Deriving it from the untruncated context length instead masks the
+ * wrong span once context plus choice passes maxSeq: the score then covers only
+ * the tail of the choice, or none of it.
+ */
+export function choiceMaskStart(nCtx: number, nChoice: number, maxSeq: number): number {
+  return Math.min(nCtx + nChoice, maxSeq) - nChoice - 1;
+}
+
+/**
+ * Null when the window can score every choice token with at least one token in
+ * front of it to predict the first one from. A negative start means truncation
+ * would eat choice tokens, and a short score is not comparable to a full one:
+ * the summed NLL drops while acc_norm still divides by the whole choice, so the
+ * truncated option wins on a discount it did not earn.
+ */
+export function choiceWindowError(nCtx: number, nChoice: number, maxSeq: number): string | null {
+  if (nChoice < 1) return "a choice rendered to 0 tokens, so there is nothing to score";
+  if (choiceMaskStart(nCtx, nChoice, maxSeq) < 0) {
+    return `a choice takes ${nChoice} tokens and needs one more of context, but this model's ` +
+      `context is ${maxSeq}: scoring it would drop choice tokens and flatter that option`;
+  }
+  return null;
+}
+
 /** Summed negative log-likelihood of `choiceText` given `ctxText`, scored over
  * ONLY the choice tokens. Runs on GPU if `gpu` is installed. */
 async function choiceNLL(
@@ -217,13 +243,15 @@ async function choiceNLL(
 ): Promise<number> {
   const ctxIds = tok.encode(ctxText);
   const chIds = tok.encode(choiceText);
+  const bad = choiceWindowError(ctxIds.length, chIds.length, model.cfg.maxSeq);
+  if (bad) die(bad);
   const full = [...ctxIds, ...chIds].slice(-model.cfg.maxSeq);
   const inputs = full.slice(0, -1);
   const targets = full.slice(1);
   // Keep only the choice tokens as targets; -1 (ignored) everywhere else. The
-  // first choice token is predicted from the last context token, at targets
-  // index ctxIds.length-1.
-  const firstChoiceTgt = Math.max(0, ctxIds.length - 1);
+  // first choice token is predicted from the token before it, so the boundary
+  // sits one index earlier than the choice does.
+  const firstChoiceTgt = choiceMaskStart(ctxIds.length, chIds.length, model.cfg.maxSeq);
   for (let i = 0; i < firstChoiceTgt; i++) targets[i] = -1;
   const nChoice = targets.length - firstChoiceTgt;
   // sequenceLoss returns the mean over kept rows, exactly as crossEntropy did,
