@@ -1567,10 +1567,10 @@ async function generateFreezeGate() {
  * Both GPU optimizers call `keepGradOnDevice` on the parameters they own while
  * building their state, and `paramGroups()` covers every parameter, so the
  * step's forward+backward sync reads back only its loss scalars and the sample
- * that follows reads back only its logits. Nothing measured that: delete either `keepGradOnDevice` line and
- * the numerics do not move, because the optimizer reads the device gradient
- * either way, so every trajectory and parity gate stays green while each step
- * re-copies the whole model to the host.
+ * that follows reads back only its logits. Nothing measured that: delete either
+ * `keepGradOnDevice` line and the numerics do not move, because the optimizer
+ * reads the device gradient either way, so every trajectory and parity gate
+ * stays green while each step re-copies the whole model to the host.
  *
  * The sample half is also what says #66 is not a bug: nothing between the
  * trainer returning and `generateGpu` swaps the backend or rebuilds the
@@ -1580,6 +1580,7 @@ async function residentReadbackGate() {
   const cfg = gemma3Config(64, 64, 4, 256, 16);
   const tokens = Array.from({ length: 2048 }, (_, i) => (i * 7 + 3) % cfg.vocabSize);
   const prompt = [3, 11, 29, 5];
+  const maxNew = 2;
   const arm = async (withOptimizer: boolean) => {
     const gpu = (await initWebGPU())!;
     const m = new Gemma3Model(cfg, mulberry32(5));
@@ -1610,7 +1611,7 @@ async function residentReadbackGate() {
       }
       gpu.install();
       gpu.uploadParams(m.params());
-      await greedyComplete(m, gpu, prompt, 2);
+      await greedyComplete(m, gpu, prompt, maxNew);
       return {
         step,
         sample: gpu.lastSyncReadbackBytes,
@@ -1624,7 +1625,7 @@ async function residentReadbackGate() {
   // The control: the same sample with nothing ever kept on device, so the gate
   // cannot pass on a model too small for the copies to matter.
   const bare = await arm(false);
-  const logits = (prompt.length + 1) * cfg.vocabSize * 4;
+  const logits = Math.min(prompt.length + maxNew - 1, cfg.maxSeq) * cfg.vocabSize * 4;
 
   // One micro-batch, so one f32 loss scalar.
   const stepScalarsOnly = trained.step === 4;

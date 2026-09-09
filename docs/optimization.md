@@ -1054,15 +1054,17 @@ bug: that was #66, and it is not one. Every GPU optimizer calls `keepGradOnDevic
 it owns while building its state (`muon-gpu.ts`, `adamw-gpu.ts`), and `paramGroups()` covers every
 parameter, so by the time the sample runs each one is already exempt from staging. Measured on the
 real sequence, a resident training step with `MuonGpu` followed by a sample: the last sync reads back
-1280 bytes, the logits alone, with or without a `keepGradOnDevice` call of our own. A LoRA run
+the logits and nothing else (1280 bytes on the gate's micro model), with or without a
+`keepGradOnDevice` call of our own. A LoRA run
 reaches the same place by both routes: its base weights are frozen, and its adapters go through the
 aux group like any other trainable tensor. The narrow version of #66 is nil too: freezing never
 frees an accumulator, and these already exist from training, so there was nothing to reclaim on
 either half.
 
 `pretrain` does still stage a whole model of gradients in one place, its trust gate, which forwards
-before the optimizer exists to keep anything on device. That is once per run rather than per token,
-it is deliberate, and the comment there says so.
+before the optimizer exists to keep anything on device. A LoRA run stages only its adapters there,
+since `applyLora`'s freeze is deliberately placed before the gate. Once per run rather than per
+token either way, and the comment there says so.
 
 ### 28. The clear queue re-armed itself for frozen parameters, and it buys no time (2026-09-09)
 

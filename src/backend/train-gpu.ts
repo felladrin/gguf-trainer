@@ -88,6 +88,8 @@ export interface TrainGpuResidentOpts {
   /** MuonClip/QK-logit clip threshold; when set, clip qNorm/kNorm after each step. */
   qkClipTau?: number;
   /** Per-step wall-time split and sync readback volume, for profiling. */
+  /** `readbackBytes` is the forward+backward sync alone, taken before the
+   * optimizer flush, so it is the number that should stay at the loss scalars. */
   onStepTime?: (fwdBwdSyncMs: number, optimizerMs: number, readbackBytes: number) => void;
   /**
    * Optional supervision mask aligned to `tokens` (1 = train, 0 = ignore).
