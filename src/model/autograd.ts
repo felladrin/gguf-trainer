@@ -690,6 +690,49 @@ export function attention(
 }
 
 /**
+ * Everything `softCrossEntropy` needs checked, in one place ABOVE the backend
+ * dispatch.
+ *
+ * The two implementations carried the shape guards verbatim and only the CPU one
+ * carried the id check, which is the omission the below-dispatch style invites
+ * and was #61: `teacherIds` reached the kernel unvalidated, so an id built
+ * against a different vocab indexed whatever the bound buffer held.
+ *
+ * A row whose FIRST id is negative is the ignore marker and its remaining ids
+ * are never read, so they are not checked. Inside a kept row every id is read,
+ * including the in-range zero-probability entries a row shorter than k pads
+ * with, so all k are.
+ */
+export function assertTeacherRows(
+  teacherIds: number[],
+  teacherProbs: number[],
+  T: number,
+  k: number,
+  V: number,
+): void {
+  if (k < 1) throw new Error(`softCrossEntropy: k must be >= 1, got ${k}`);
+  if (teacherIds.length !== T * k || teacherProbs.length !== T * k) {
+    throw new Error(
+      `softCrossEntropy: teacher arrays must be [T*k]=${T * k}, got ` +
+        `${teacherIds.length}/${teacherProbs.length}`,
+    );
+  }
+  for (let t = 0; t < T; t++) {
+    if (teacherIds[t * k] < 0) continue; // ignored row: nothing below is read
+    for (let j = 0; j < k; j++) {
+      const id = teacherIds[t * k + j];
+      if (!Number.isInteger(id) || id < 0 || id >= V) {
+        throw new Error(
+          `softCrossEntropy: teacher id ${id} at slot ${j} of row ${t} is not an ` +
+            `integer in [0,${V}). A teacher file built against a different vocab ` +
+            `than the checkpoint is the usual cause.`,
+        );
+      }
+    }
+  }
+}
+
+/**
  * Every embedding id must be a row of the table.
  *
  * `weight.data[id * d + j]` with `id >= V` reads into the next row, or past the
@@ -944,15 +987,9 @@ export function softCrossEntropy(
   teacherProbs: number[],
   k: number,
 ): Tensor {
-  if (opsBackend) return opsBackend.softCrossEntropy(logits, teacherIds, teacherProbs, k);
   const [T, V] = logits.shape;
-  if (k < 1) throw new Error(`softCrossEntropy: k must be >= 1, got ${k}`);
-  if (teacherIds.length !== T * k || teacherProbs.length !== T * k) {
-    throw new Error(
-      `softCrossEntropy: teacher arrays must be [T*k]=${T * k}, got ` +
-        `${teacherIds.length}/${teacherProbs.length}`,
-    );
-  }
+  assertTeacherRows(teacherIds, teacherProbs, T, k, V);
+  if (opsBackend) return opsBackend.softCrossEntropy(logits, teacherIds, teacherProbs, k);
   const loss = Tensor.zeros([1]);
   const probs = new Float32Array(T * V);
   const rowMass = new Float32Array(T); // S per row: Σ_j q[t,j]
@@ -972,7 +1009,6 @@ export function softCrossEntropy(
     if (teacherIds[t * k] < 0) continue; // ignored row
     for (let j = 0; j < k; j++) {
       const id = teacherIds[t * k + j];
-      if (id < 0 || id >= V) throw new Error(`softCrossEntropy: teacher id ${id} out of [0,${V})`);
       const q = teacherProbs[t * k + j];
       // A row shorter than k pads with an in-range id at probability 0 (see the
       // docstring). The one input this saves is a -Infinity logit sitting at a

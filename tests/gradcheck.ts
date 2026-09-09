@@ -353,6 +353,62 @@ async function main() {
     );
   }
   {
+    // Teacher ids outside the vocab. The CPU checked these inside its per-row
+    // loop and the GPU did not check them at all, which is #61 and the omission
+    // a below-dispatch guard invites. Hoisting it also let both copies of the
+    // shape guards go: they were duplicated verbatim in the two backends.
+    const T = 3, V = 6, k = 2;
+    const r = mulberry32(0x51c3);
+    const logits = randTensor([T, V], r);
+    const probs = [0.6, 0.4, 0.7, 0.3, 0.5, 0.5];
+    const message = (fn: () => unknown): string => {
+      try {
+        fn();
+        return "";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    };
+    const call = (ids: number[], kk = k, q = probs) => () => softCrossEntropy(logits, ids, q, kk);
+    const refuses = (ids: number[], pattern: RegExp, kk = k, q = probs) =>
+      pattern.test(message(call(ids, kk, q)));
+    const range = /^softCrossEntropy: teacher id .* is not an integer in \[0,6\)/;
+    const scores = (ids: number[]) => {
+      try {
+        return Number.isFinite(softCrossEntropy(logits, ids, probs, k).data[0]);
+      } catch {
+        return false;
+      }
+    };
+
+    const cases: [string, boolean][] = [
+      ["id == V in the first slot", refuses([V, 1, 0, 1, 2, 3], /at slot 0 of row 0/)],
+      ["id == V in a later slot", refuses([0, V, 0, 1, 2, 3], /at slot 1 of row 0/)],
+      ["id == V in a later row", refuses([0, 1, 0, 1, 2, V], /at slot 1 of row 2/)],
+      ["a negative id after the first", refuses([0, -1, 0, 1, 2, 3], range)],
+      ["a non-integer id", refuses([0, 1.5, 0, 1, 2, 3], range)],
+      ["k < 1", refuses([0, 1], /k must be >= 1/, 0)],
+      [
+        "a teacher array of the wrong length",
+        refuses([0, 1, 2, 3], /teacher arrays must be \[T\*k\]=6/),
+      ],
+      // The ignore marker is the FIRST id of a row, and the rest of that row is
+      // never read, so junk there must not be refused: masked positions are
+      // written that way.
+      // Wrapped so that a guard which wrongly refuses these reports as a failed
+      // case instead of aborting the whole file.
+      ["an ignored row's other ids are not checked", scores([-1, 999, 0, 1, 2, 3])],
+      ["a valid set still scores", scores([0, 1, 2, 3, 4, 5])],
+    ];
+    const bad = cases.filter(([, ok]) => !ok).map(([name]) => name);
+    const ok = bad.length === 0;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"teacher id range".padEnd(24)}        ` +
+        `V=${V}, k=${k}, ${cases.length} cases${bad.length ? `, failed: ${bad.join(", ")}` : ""}`,
+    );
+  }
+  {
     // An embedding id outside the table. The input-side twin of the target
     // check below, and it fires first when a corpus and a checkpoint disagree
     // about the vocab, because the inputs go through the table before the

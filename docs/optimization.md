@@ -1006,9 +1006,9 @@ The accepting cases carry an oracle computed in the test rather than a compariso
 losses, because both now draw their denominator from the same helper and would agree on a wrong
 count. Making the helper count ignored rows fails `-1 still means ignore`.
 
-Not covered here, and neighbours of the same mistake: the GPU `softCrossEntropy` still does not
-validate its teacher ids where the CPU one does (#61), and the refusal lands mid-run rather than at
-start-up (#64), which matters for `pretrain`, whose trust gate only reads the first 16 tokens.
+Not covered here: the refusal lands mid-run rather than at start-up (#64), which matters for
+`pretrain`, whose trust gate only reads the first 16 tokens. The two neighbours that were are
+`embedding` (#63, lever 29) and the GPU `softCrossEntropy`'s teacher ids (#61, lever 30).
 `embedding`, the input-side twin, was #63 and is now lever 29.
 
 ### 27. `generate` paid lever 25's cost per token, 39% of its wall clock (2026-09-09)
@@ -1146,6 +1146,35 @@ table before the targets reach the loss. Scoring `smolrp.gguf` (vocab 49152) aga
 tokenized with the 151936-entry Qwen3 vocab now stops at `embedding: id 49751 at position 20`, where
 before this it ran on to `crossEntropy: target 49751 at position 19`. Same token, one position
 apart, because the targets are the inputs shifted by one.
+
+### 30. The GPU never checked its teacher ids, and both backends carried the same shape guards (2026-09-09)
+
+Filed as #61 while fixing #55. `softCrossEntropy` validated each teacher id against the vocab on the
+CPU and not at all on the GPU, so an id built against a different vocab reached the kernel and
+indexed whatever the bound buffer held. Same class as levers 26 and 29, and the same corpus mistake
+reaches it: the KL anchor's teacher file is built once over the SFT corpus, so a teacher file and a
+checkpoint can disagree exactly the way a `.tokens` file and a checkpoint can.
+
+The fix is a placement, not a fourth call. `assertTeacherRows` runs ABOVE the backend dispatch, the
+way lever 29's guard does and the way `fusedCrossEntropy`'s dimension, chunk and LoRA guards already
+did. Validating below the dispatch is what created this gap in the first place: every implementation
+then needs its own call, and one of them will be the one nobody remembers.
+
+Hoisting paid for itself twice over, because the `k >= 1` and `[T*k]` length guards were **duplicated
+verbatim** in the two backends. Both copies are gone, along with the CPU's per-element id check
+inside its inner loop, and the diff removes more lines than it adds.
+
+Two things the validator has to get right, and each has its own case in `tests/gradcheck.ts`:
+
+- the ignore marker is the FIRST id of a row, and the rest of that row is never read, so junk there
+  must be accepted. Checking ignored rows fails `an ignored row's other ids are not checked`.
+- inside a kept row every id is read, including the in-range zero-probability entries a row shorter
+  than `k` pads with, so all `k` are checked. Checking only slot 0 fails four cases.
+
+Six mutations, each applied alone: removing the id check fails five cases and the GPU arm; moving
+the call below the dispatch passes every CPU case and fails only the GPU arm, which is the whole
+point of that arm; checking only the first slot, only the first row, checking ignored rows, and
+dropping the `k` guard each fail their own.
 
 ## Quality levers
 

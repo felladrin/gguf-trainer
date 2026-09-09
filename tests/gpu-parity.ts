@@ -1889,11 +1889,17 @@ async function targetRangeGate(gpu: WebGPUBackend) {
     // Its guard sits above the backend dispatch, so this fails if someone moves
     // it below, where an installed backend would skip it.
     const embed = refused(() => embedding(w, [0, V, 1]), /^embedding: id \d+ at position \d+ /);
-    const ok = dense && fused && embed && scores;
+    // softCrossEntropy's guard is above the dispatch too, and the GPU path never
+    // had one of its own: that was #61.
+    const soft = refused(
+      () => softCrossEntropy(logits, [0, V, 1], [0.5, 0.5, 1], 1),
+      /^softCrossEntropy: teacher id \d+ at slot \d+ of row \d+ /,
+    );
+    const ok = dense && fused && embed && soft && scores;
     if (!ok) failures++;
     console.log(
       `  ${ok ? "ok " : "FAIL"} GPU refuses an index outside its table ` +
-        `(dense ${dense}, fused ${fused}, embedding ${embed}, ` +
+        `(dense ${dense}, fused ${fused}, embedding ${embed}, softCE ${soft}, ` +
         `V-1 scores ${good.data[0].toFixed(4)})`,
     );
   } finally {
