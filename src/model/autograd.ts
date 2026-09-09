@@ -751,7 +751,8 @@ export function fusedCrossEntropy(
   targets: number[],
   chunk: number,
 ): Tensor {
-  if (opsBackend) return opsBackend.fusedCrossEntropy(hidden, w, targets, chunk);
+  // Validated ABOVE the backend dispatch, or these run on the CPU reference only
+  // and every real run installs the GPU backend first.
   const [T, H] = hidden.shape;
   const [V, H2] = w.shape;
   if (H !== H2) throw new Error(`fusedCrossEntropy dim mismatch ${H} vs ${H2}`);
@@ -768,6 +769,7 @@ export function fusedCrossEntropy(
         "path cannot apply. Put the readout in the aux param group, or use --loss-chunk 0.",
     );
   }
+  if (opsBackend) return opsBackend.fusedCrossEntropy(hidden, w, targets, chunk);
   const loss = Tensor.zeros([1]);
 
   // Online softmax over the chunked vocab: a chunk whose maximum beats the

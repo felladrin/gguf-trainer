@@ -689,12 +689,17 @@ full parameter set; a LoRA run trains 392 adapters instead, so reading one throw
 mismatch before step 0, which is what `pretrain --resume --lora-rank` did at first (`finetune`
 escaped it only because that mode defaults to a cold optimizer). Beyond the count, a resumed LoRA
 run re-initializes `A` from the seed and `B` to zero while their learned product is already folded
-into the base, so those moments describe a parameterization that no longer exists. Chaining LoRA
-runs is still the normal merge-and-restart pattern and costs only a few hundred steps of AdamW
-re-warm; note that each cycle redraws `A` from the same hardcoded seed, so repeated cycles reuse
-one random subspace. It does not
-write one either: a sidecar holding adapter moments beside a merged dense GGUF would break the next
-full fine-tune resuming from that checkpoint.
+into the base, so those moments describe a parameterization that no longer exists. It does not write
+one either: a sidecar holding adapter moments beside a merged dense GGUF would break the next full
+fine-tune resuming from that checkpoint. And it REMOVES one: a LoRA run rewrites `--out` with
+merged weights, so any sidecar already sitting beside that file is invalidated by the rewrite, and
+its parameter count still matches the full set well enough for `importState` to accept it. The
+deletion is coupled to the rename rather than done at startup, so a run that dies before its first
+checkpoint leaves an existing sidecar alone.
+
+Chaining LoRA runs is the normal merge-and-restart pattern: run two takes the merged weights as its
+new frozen base and costs only a few hundred steps of AdamW re-warm. Each cycle redraws `A` from
+the same hardcoded seed, so repeated cycles reuse one random subspace.
 
 ## Correctness / robustness
 

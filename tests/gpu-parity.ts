@@ -1410,6 +1410,11 @@ async function loraModelParity(gpu: WebGPUBackend) {
     const h = applyLora(model, 4, 8, mulberry32(99));
     for (const t of h.groups.aux) for (let i = 0; i < t.data.length; i++) t.data[i] += 0.05;
     gpu.install();
+    // With recompute on, which is the combination the measured table uses and
+    // which nothing else covers: the replay rebuilds the adapter subgraph inside
+    // each block, so a double-counted adapter gradient would show up here as a
+    // 2x against the CPU reference rather than as a plausible learning rate.
+    setCheckpointing(true);
     let ok = true;
     try {
       const loss = crossEntropy(model.forward(ids), targets);
@@ -1424,6 +1429,7 @@ async function loraModelParity(gpu: WebGPUBackend) {
         ok = compare(`lora.${name}.dAdapter${i}`, h.groups.aux[i].grad, cpuGrads[i], BWD) && ok;
       }
     } finally {
+      setCheckpointing(false);
       gpu.uninstall();
     }
 
@@ -1474,7 +1480,7 @@ async function loraModelParity(gpu: WebGPUBackend) {
 
     if (!ok) failures++;
     console.log(
-      `  ${ok ? "ok " : "FAIL"} ${name} lora vs CPU (${h.adapted} adapters, ` +
+      `  ${ok ? "ok " : "FAIL"} ${name} lora + recompute vs CPU (${h.adapted} adapters, ` +
         `stub ${stubDirty}, merge drift ${drift.toExponential(1)})`,
     );
   }

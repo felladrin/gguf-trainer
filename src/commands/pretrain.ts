@@ -379,6 +379,12 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   if (loraRank > 0 && !resumePath) {
     die("--lora-rank needs --resume: adapters on a frozen random init learn against noise");
   }
+  // Placement matters twice. AFTER the resume has loaded the base weights, so
+  // `B = 0` makes the adapted model exactly the checkpoint at step 0. And BEFORE
+  // the trust gate below: the probe should exercise the graph the run will
+  // build, and the freeze has to be in place before any forward materializes the
+  // weights on device, or entryFor allocates a full-size gradient buffer for
+  // every one of them and the memory win never appears.
   const lora = loraRank > 0 ? applyLora(model, loraRank, loraAlpha, mulberry32(4321)) : null;
   if (lora) {
     const total = arch.paramCount(cfg);
@@ -442,11 +448,6 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     if (fdrift > 1e-3 + 1e-3 * Math.abs(gpuLoss)) die("chunked/dense loss probe failed");
   }
 
-  // After the resume has loaded the base weights, so `B = 0` makes the adapted
-  // model exactly the checkpoint at step 0, and BEFORE the trust gate below:
-  // the probe should exercise the graph the run will build, and the freeze has
-  // to be in place before any forward materializes the weights on device, or
-  // entryFor allocates a full-size gradient buffer for every one of them.
   const groups = lora ? lora.groups : model.paramGroups();
   const opt = new MuonGpu(gpu, groups.muon, groups.aux, {
     lr: muonLr,
@@ -525,6 +526,9 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     ? await readFileText(templatePath).catch(() => die(`cannot read --template ${templatePath}`))
     : undefined;
   if (chatTemplate) console.log(`Chat template: ${templatePath} (embedded in every export)`);
+  const optStatePath = `${outPath}.optstate`;
+  // Logged once, not on every checkpoint.
+  let removedOptState = false;
   const exportGGUF = async (): Promise<Uint8Array> => {
     // Fold the adapters in, write an ordinary dense checkpoint, fold them back
     // out. Every checkpoint this run writes loads in llama.cpp with no adapter
@@ -539,21 +543,24 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     await writeFileBytes(`${outPath}.tmp`, b);
     const fs = await import("node:fs");
     fs.renameSync(`${outPath}.tmp`, outPath);
+    if (lora) {
+      // Coupled to the rename, which is the event that invalidates the file: a
+      // sidecar beside a GGUF this run just rewrote is stale by construction.
+      // Deleting it at startup instead would destroy a valid, matching sidecar
+      // if the run died before its first checkpoint, and these files are
+      // sometimes hand-placed (agents.md, the publish recipe). Not written by a
+      // LoRA run either, so this only ever removes one an earlier run left.
+      // force: no throw if a concurrent checkpoint already removed it.
+      if (removedOptState === false) {
+        fs.rmSync(optStatePath, { force: true });
+        removedOptState = true;
+        console.log(`Removed ${optStatePath.split("/").pop()} (stale: the weights were rewritten)`);
+      }
+    }
     return b;
   };
   // Optimizer-state sidecar next to the GGUF, so a resume continues with a warm
   // optimizer (Muon momentum + Adam moments) instead of cold-starting. Atomic.
-  const optStatePath = `${outPath}.optstate`;
-  if (lora && await fileExists(optStatePath)) {
-    // Not writing a sidecar does not close the hazard: crash recovery here is
-    // `--resume X --out X`, so a LoRA run rewrites X with merged weights and
-    // would leave a full-parameter-set sidecar beside it. That file's param
-    // COUNT still matches, so importState accepts it and the next full
-    // fine-tune warm-starts on momentum belonging to a different weight point,
-    // silently. Remove it: this run is about to invalidate it either way.
-    (await import("node:fs")).rmSync(optStatePath);
-    console.log(`Removed ${optStatePath.split("/").pop()} (stale: this run rewrites the weights)`);
-  }
   const writeOptState = async (): Promise<number> => {
     // A LoRA run must not leave a sidecar: it would hold adapter moments beside
     // a merged dense GGUF, and the next full fine-tune resuming from that
