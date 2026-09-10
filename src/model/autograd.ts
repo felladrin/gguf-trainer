@@ -866,13 +866,13 @@ export function keptRowsInVocab(targets: number[], T: number, V: number, where: 
 export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
   assertMatrix(logits, "logits", "crossEntropy");
   const [T, V] = logits.shape;
-  // Above the dispatch, like every other validator here. It stayed below for as
-  // long as it did because it returns a value both implementations need as
-  // their loss denominator, so hoisting it means passing `kept` down rather
-  // than each backend calling it again. That is a smaller price than the shape
-  // that produced #61: a guard under a dispatch has to be repeated in every
-  // implementation, and the one nobody remembers is the one that ships
-  // unvalidated.
+  // Above the dispatch, like every id and shape validator in this file bar
+  // linearRaw's dim check (#91). It stayed below for as long as it did because
+  // it returns a value both implementations need as their loss denominator, so
+  // hoisting it means passing `kept` down rather than each backend calling it
+  // again. That is a smaller price than the shape that produced #61: a guard
+  // under a dispatch has to be repeated in every implementation, and the one
+  // nobody remembers is the one that ships unvalidated.
   const kept = keptRowsInVocab(targets, T, V, "crossEntropy");
   if (opsBackend) return opsBackend.crossEntropy(logits, targets, kept);
   const loss = Tensor.zeros([1]);

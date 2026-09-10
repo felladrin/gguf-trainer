@@ -1115,8 +1115,7 @@ export class WebGPUBackend implements OpsBackend {
    * sync() or reclaimStepTransients(). That is the same contract crossEntropy
    * already has for its probs/rowInv, and the training loops satisfy it by
    * calling backward() immediately; this op just holds more across the boundary.
-   */
-  /**
+   *
    * Targets are validated by the wrapper in autograd.ts, above the dispatch,
    * which hands down the kept-row count. This used to call keptRowsInVocab
    * itself, one of the two guards that lived under a dispatch and so had to be
@@ -1196,9 +1195,13 @@ export class WebGPUBackend implements OpsBackend {
    * The check itself cannot move onto the device, whoever calls it. The logits
    * buffer is bound whole, so LOG[t * V + tgt] with tgt >= V is an in-bounds
    * read of the next row, measured identical to the CPU's wrong value rather
-   * than trapping. Running it before the uploads below also means a refusal
-   * leaves no pooled buffer behind, which the wrapper preserves by validating
-   * before it dispatches at all.
+   * than trapping.
+   *
+   * Validating in the wrapper also made a claim true that the old comment here
+   * asserted and did not deliver: a refusal now leaves no pool state behind.
+   * The check used to sit after entryFor(logits), which for a first-seen host
+   * tensor takes two persistent buffers, writes the upload, registers an entry
+   * and queues a clear.
    */
   crossEntropy(logits: Tensor, targets: number[], kept: number): Tensor {
     this.beginForwardOp();

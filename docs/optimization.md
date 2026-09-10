@@ -1863,12 +1863,25 @@ called it in both places. There was no live gap, and that is the point: a guard 
 to be repeated in every implementation, and the one nobody remembers is the one that ships
 unvalidated. That is what #61 was.
 
-**What kept it down there was a real cost, not an oversight.** `keptRowsInVocab` returns the
-kept-row count, which both backends need as their loss denominator, so hoisting the call means
-either recomputing it on the GPU path, an extra O(T) pass, or widening the interface. This takes the
-second: `OpsBackend.crossEntropy` and `.fusedCrossEntropy` gain a `kept` parameter. Widening an
-interface for a guard is the objection, and the answer is that `kept` is not a guard, it is a value
-both implementations already needed and both were computing for themselves.
+**What kept it down there was that `keptRowsInVocab` returns something.** The count is both
+backends' loss denominator, so hoisting the call means either recomputing it on the GPU path or
+widening the interface. This takes the second: `OpsBackend.crossEntropy` and `.fusedCrossEntropy`
+gain a `kept` parameter.
+
+The reason is not the recount's cost. T is thousands, in a step whose readout alone does T x V x H
+multiply-adds, so an integer pass over T is not measurable and calling it a real cost would be
+overstating it. The reason is that a recount reopens the hole by another route: nothing would force
+a future backend to get its number from the _validator_, since it only needs a number, and a bare
+counting loop satisfies the compiler while skipping validation entirely. That is #61 wearing a
+different hat. Passing `kept` down leaves the backend nothing to compute, so nothing to compute
+wrongly. Widening an interface for a guard is the objection, and the answer is that `kept` is not a
+guard: it is a value both implementations already needed and both were separately computing.
+
+**`softCrossEntropy` is now on the other side of that argument, and this change did not move it.**
+#70 hoisted its `assertTeacherRows` above the dispatch, but that validator returns nothing, so each
+backend still counts its own kept rows: `webgpu.ts` runs `teacherIds[t * k] >= 0` over T while the
+CPU body counts inside its own loop. Two implementations of one quantity, and the repo now answers
+the same question two ways. Filed as #93 rather than folded in.
 
 Two things improve on the way. A malformed target now refuses before `beginForwardOp` and before
 any `entryFor`, where it used to refuse after both, so nothing is left half-recorded and no pooled
@@ -1878,11 +1891,16 @@ buffer is taken. And `webgpu.ts` drops its import of `keptRowsInVocab` entirely.
 its dispatch turns `dense true` into `dense false`, or `fused true` into `fused false`, while every
 CPU case still passes. Measured both ways.
 
-**One instance of the shape remains, and it is not this one.** `linearRaw` checks
+**One instance of the gap shape remains, and it is not this one.** `linearRaw` checks
 `inDim !== inDim2` below its dispatch and `webgpu.ts` repeats the identical check with the identical
 message. No gap today, same as here, and hoisting it is a different change to a different function.
 Filed as #91 rather than folded in, since `linear` is the hottest op in the graph and "the check is
 free" wants measuring rather than asserting.
+
+Two duplicates in `fusedCrossEntropy`'s GPU path are a different leftover: `H !== H2` and
+`chunk <= 0` are repeated there with identical messages, and the wrapper has checked both above the
+dispatch since before this change, so they were already unreachable. Dead rather than gap-shaped,
+and listed with #91.
 
 ## Quality levers
 
