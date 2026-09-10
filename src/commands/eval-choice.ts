@@ -220,6 +220,64 @@ export function choiceMaskStart(nCtx: number, nChoice: number, maxSeq: number): 
   return Math.min(nCtx + nChoice, maxSeq) - nChoice - 1;
 }
 
+/** The few-shot preamble joined to an item's stem, defined once so the preflight
+ * and the scoring loop cannot disagree about the separator. */
+export function withPreamble(preamble: string, it: MCItem): string {
+  return preamble ? `${preamble}\n\n${it.context}` : it.context;
+}
+
+/** The exact strings `choiceNLL` will score, so the preflight cannot check others. */
+export function renderPair(
+  render: (ctx: string, choice: string) => string,
+  ctx: string,
+  choice: string,
+): { ctxOnly: string; choiceText: string } {
+  const ctxOnly = render(ctx, "").replace(/\s+$/, "");
+  return { ctxOnly, choiceText: render(ctx, choice).slice(ctxOnly.length) };
+}
+
+const UTF8 = new TextEncoder();
+
+/**
+ * Refuse an unscoreable item before the first forward, without a tokenizer.
+ *
+ * `choiceWindowError` needs token counts, and encoding every pair up front costs
+ * 6.7 s on a full HellaSwag set, measured. It is not needed for almost any of
+ * them, because this repo's BPE is byte-level: every token covers at least one
+ * UTF-8 byte, so a rendered choice under `maxSeq` BYTES cannot reach `maxSeq`
+ * tokens, and a non-empty stem encodes to at least one token.
+ *
+ * Bytes, not characters. `String.length` counts UTF-16 units and does not bound
+ * the token count: a character whose bytes no merge covers decomposes to one
+ * token per byte, so a single three-byte character can be three tokens. Measured
+ * against the 151936-entry Qwen3 vocab in `data/lambrp-hold.tokenizer.json`, one
+ * `\u2e3b` is one character and two tokens. Only the byte count holds, and it
+ * holds for every vocab by construction: GPT2_SPLIT partitions without overlap,
+ * each pre-token starts at one symbol per byte, bpeWord only shortens, and an
+ * unknown id only drops.
+ *
+ * That last clause is also why a broken premise costs earliness rather than
+ * correctness. This refuses only an empty string, which is zero tokens under
+ * every vocab, so anything it rejects `choiceNLL` would reject too; and every
+ * way the bound could fail makes it pass a pair the scorer still checks with
+ * real token counts.
+ *
+ * Returns the pairs that still have to be checked exactly, usually none.
+ */
+export function preflightByBytes(
+  pairs: { ctxOnly: string; choiceText: string }[],
+  maxSeq: number,
+): { needExactCheck: { ctxOnly: string; choiceText: string }[]; empty: "stem" | "choice" | null } {
+  const needExactCheck: { ctxOnly: string; choiceText: string }[] = [];
+  let empty: "stem" | "choice" | null = null;
+  for (const p of pairs) {
+    if (empty === null && p.ctxOnly.length === 0) empty = "stem";
+    if (empty === null && p.choiceText.length === 0) empty = "choice";
+    if (UTF8.encode(p.choiceText).length >= maxSeq) needExactCheck.push(p);
+  }
+  return { needExactCheck, empty };
+}
+
 /**
  * Null when the window can score every choice token with at least one token in
  * front of it to predict the first one from. A negative start means truncation
@@ -340,19 +398,61 @@ async function run(v: Values) {
     const evalItems = items.slice(shots, limit ? shots + limit : undefined);
     const preamble = shotItems.map((s) => task.render(s.context, s.choices[s.gold])).join("\n\n");
 
+    // Before any forward. choiceNLL refuses an unscoreable window, but it does
+    // it on the item that holds one, which on a full set is hours in. The BYTE
+    // bound settles almost every pair without a tokenizer; only a choice whose
+    // bytes reach the context length needs encoding.
+    //
+    // Per item rather than over the whole grid: at 10-shot the preamble repeats
+    // in every pair's ctxOnly, and choiceText is a slice that retains its parent
+    // string, so materializing 40168 of them at once holds hundreds of MB the
+    // streaming loop below never does.
+    let total = 0, encoded = 0;
+    for (const it of evalItems) {
+      const ctx = withPreamble(preamble, it);
+      const pairs = it.choices.map((ch) => renderPair(task.render, ctx, ch));
+      const pre = preflightByBytes(pairs, cfg.maxSeq);
+      if (pre.empty) {
+        const which = pre.empty;
+        const p = pairs.find((q) => (which === "stem" ? q.ctxOnly : q.choiceText).length === 0)!;
+        die(
+          `${taskName}: an item's ${which} rendered to nothing, so it cannot be scored. ` +
+            // The stem's TAIL: at any --shots its head is the preamble's opening,
+            // identical for every item, so the head would identify nothing.
+            `The pair reads ${
+              JSON.stringify(`${p.ctxOnly.slice(-60)}|${p.choiceText.slice(0, 40)}`)
+            }`,
+        );
+      }
+      for (const p of pre.needExactCheck) {
+        const bad = choiceWindowError(
+          tok.encode(p.ctxOnly).length,
+          tok.encode(p.choiceText).length,
+          cfg.maxSeq,
+        );
+        if (bad) {
+          die(`${taskName}: ${bad}. The choice reads ${JSON.stringify(p.choiceText.slice(0, 60))}`);
+        }
+      }
+      total += pairs.length;
+      encoded += pre.needExactCheck.length;
+    }
+    console.log(
+      `Windows: none of ${total} choices exceeds the ${cfg.maxSeq}-token context ` +
+        `(${encoded} needed encoding) \u2713`,
+    );
+
     let correctNorm = 0, correctRaw = 0, done = 0;
     const t0 = Date.now();
     for (const it of evalItems) {
-      const ctx = preamble ? `${preamble}\n\n${it.context}` : it.context;
+      const ctx = withPreamble(preamble, it);
       const sums: number[] = [];
       for (const ch of it.choices) {
-        const full = task.render(ctx, ch);
-        // Score only the choice span: render context without the answer to find
-        // the boundary, then score the full render's choice tokens.
-        const ctxOnly = task.render(ctx, "").replace(/\s+$/, "");
-        sums.push(
-          await choiceNLL(model, tok, gpu, ctxOnly, full.slice(ctxOnly.length), lossChunk),
-        );
+        // Through renderPair, the same helper the preflight used: if the two
+        // sites drifted, the preflight would be vouching for strings that are
+        // not the ones scored.
+        const { ctxOnly, choiceText } = renderPair(task.render, ctx, ch);
+        sums.push(await choiceNLL(model, tok, gpu, ctxOnly, choiceText, lossChunk));
       }
       const bestNorm = argminPerChar(sums, it.choices);
       let bestRaw = 0;

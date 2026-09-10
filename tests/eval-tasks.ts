@@ -10,8 +10,12 @@ import {
   hellaswagItem,
   hellaswagPreprocess,
   piqaItem,
+  preflightByBytes,
+  renderPair,
   TASKS,
+  withPreamble,
 } from "../src/commands/eval-choice.ts";
+import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 
 function ok(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -242,6 +246,126 @@ for (const [nCtx, nChoice, maxSeq] of [[20, 10, 512], [100, 10, 105], [600, 10, 
   ok(
     targets.slice(start).join(",") === ids.slice(-nChoice).join(","),
     `the scored targets are the choice tokens themselves (${shape})`,
+  );
+}
+
+// The preflight. choiceNLL refuses an unscoreable window on the item that holds
+// one, which on a full set is hours in. Encoding every pair up front to find
+// them costs 6.7 s on HellaSwag, measured, so a length bound does the work
+// instead.
+//
+// BYTES, not characters. This repo's BPE is byte-level, so every token covers at
+// least one UTF-8 byte and the byte count bounds the token count by
+// construction. `String.length` does not: a character whose bytes no merge
+// covers decomposes to one token per byte, so U+2E3B is one UTF-16 unit and
+// three tokens under the ASCII-trained fixture below, and two under the
+// 151936-entry Qwen3 vocab. Either way, more than one.
+{
+  const pair = (ctxOnly: string, choiceText: string) => ({ ctxOnly, choiceText });
+  const maxSeq = 16;
+
+  const none = preflightByBytes([pair("Question: x\nAnswer:", " yes"), pair("q", "a")], maxSeq);
+  ok(none.needExactCheck.length === 0, "short choices need no tokenizer at all");
+  ok(none.empty === null, "and a non-empty pair is settled by being non-empty");
+
+  // At exactly maxSeq bytes the bound stops proving anything, so that pair has
+  // to be encoded. One byte less and it cannot reach maxSeq tokens.
+  ok(
+    preflightByBytes([pair("q", "x".repeat(maxSeq))], maxSeq).needExactCheck.length === 1,
+    "a choice of maxSeq bytes is not settled",
+  );
+  ok(
+    preflightByBytes([pair("q", "x".repeat(maxSeq - 1))], maxSeq).needExactCheck.length === 0,
+    "one byte under, it is",
+  );
+
+  // The case characters get wrong. Six of these are 6 UTF-16 units, well under
+  // maxSeq, but 18 UTF-8 bytes, so they could encode to more tokens than the
+  // context holds and the pair has to be handed on.
+  ok(
+    preflightByBytes([pair("q", "\u2e3b".repeat(6))], maxSeq).needExactCheck.length === 1,
+    "characters do not bound the token count; bytes do",
+  );
+  ok(
+    "\u2e3b".repeat(6).length < maxSeq,
+    "and that case really is under maxSeq by the character count",
+  );
+
+  ok(preflightByBytes([pair("", " yes")], maxSeq).empty === "stem", "an empty stem is caught");
+  ok(preflightByBytes([pair("q", "")], maxSeq).empty === "choice", "an empty choice too");
+
+  // Only the long ones are handed on, not the whole batch.
+  const mixed = preflightByBytes(
+    [pair("q", "short"), pair("q", "y".repeat(99)), pair("q", "also short")],
+    maxSeq,
+  );
+  ok(mixed.needExactCheck.length === 1, "only the pair that could reach the ceiling is returned");
+  ok(mixed.needExactCheck[0].choiceText.length === 99, "and it is the right one");
+
+  // renderPair is what makes the preflight vouch for the strings actually
+  // scored: both sites call it, so they cannot drift.
+  // withPreamble is the other shared definition: the preflight and the scoring
+  // loop must agree about the separator, or the pass vouches for strings that
+  // are not the ones scored.
+  const item = { context: "C", choices: ["a"], gold: 0 };
+  ok(withPreamble("", item) === "C", "with no shots the stem is the context itself");
+  ok(
+    withPreamble("P", item) === "P\n\nC",
+    "and with shots it is the preamble, a blank line, the context",
+  );
+
+  const rp = renderPair(TASKS["piqa"].render, "G", "S");
+  ok(rp.ctxOnly === "Question: G\nAnswer:", "the stem is the render with an empty choice, trimmed");
+  ok(rp.choiceText === " S", "and the choice is what the full render adds after it");
+  ok(
+    TASKS["piqa"].render("G", "S") === rp.ctxOnly + rp.choiceText,
+    "the two halves reassemble into exactly what the model sees",
+  );
+}
+
+// The PREMISE the bound rests on, against a real tokenizer rather than the
+// docblock: every token covers at least one UTF-8 byte, so encode(s).length is
+// never more than the byte length. The arithmetic cases above take that as
+// given, so a tokenizer that grew a prepended BOS would make the bound unsound
+// at its boundary and nothing else here would notice.
+{
+  const tok = new BPETokenizer();
+  // ASCII only, so a multi-byte character below has no merge to fall back on
+  // and decomposes into one token per byte: the case the byte bound exists for
+  // and the character bound gets wrong.
+  tok.train("the quick brown fox jumps over the lazy dog. ".repeat(40), 300);
+  const utf8 = new TextEncoder();
+  const cases = [
+    "hello world",
+    "caf\u00e9",
+    "\u2e3b".repeat(6),
+    "\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8",
+    "\ud83d\ude42",
+    "\ud800\udf48",
+    " ",
+    "",
+  ];
+  for (const c of cases) {
+    const t = tok.encode(c).length, b = utf8.encode(c).length;
+    ok(t <= b, `tokens (${t}) never exceed UTF-8 bytes (${b}) for ${JSON.stringify(c)}`);
+    // The other half, and the one that varies by vocab: encodeOrdinary DROPS a
+    // symbol whose id is missing, and a foreign vocab loaded through fromData is
+    // not guaranteed to carry all 256 base byte tokens. A non-empty string
+    // encoding to nothing would make the preflight's empty check, which is a
+    // string-emptiness proxy for zero tokens, stop meaning what it says.
+    if (c.length > 0) ok(t >= 1, `a non-empty string encodes to >= 1 token: ${JSON.stringify(c)}`);
+  }
+  // "" is the robust half of the upper bound: 1 token against 0 bytes fails
+  // under any vocab, while the multi-byte cases hold with equality rather than
+  // slack, so their power depends on this fixture's 300 merges over a pangram.
+  // And that characters really do NOT bound it, which is why this is in bytes:
+  // an untrained multi-byte character falls back to one token per byte.
+  const wide = "\u2e3b".repeat(6);
+  ok(
+    tok.encode(wide).length > wide.length,
+    `a byte-level fallback exceeds the character count: ${
+      tok.encode(wide).length
+    } > ${wide.length}`,
   );
 }
 
