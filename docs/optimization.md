@@ -1629,8 +1629,11 @@ six shapes of broken navigator. The error message was #84.
 Filed as #80 while closing lever 27, which named this case and let it stand. `pretrain`'s parity
 probe forwards, syncs and stops. It runs before the optimizer is built, so nothing had called
 `keepGradOnDevice` yet, and `sync()` stages the gradient of every touched external. Nothing reads
-them: `grep '\.grad' src/commands/pretrain.ts` returns nothing at all, and both GPU optimizers do
-their clipping and their step on device.
+them: no code in that file reads a host-side gradient, and both GPU optimizers do their clipping
+and their step on device. Nor is the exemption wider than the one the optimizer is about to make.
+Dense, it is `model.params()`, and both GPU optimizers keep everything in `paramGroups()`, which
+`tests/arch-roundtrip.ts` asserts is the same set for every registered arch, tied head or not. Under
+LoRA, `applyLora` freezes the base and hands the optimizer the adapters, which is what this keeps.
 
 Measured on a Qwen3-0.6B shape (596M params, `--seq-len 512 --recompute --loss-chunk 8192`, one
 step, `--reclaim`), two runs each:
@@ -1640,9 +1643,10 @@ step, `--reclaim`), two runs each:
 | as it stood  | 73.55 s, 74.23 s |
 | with the fix | 71.72 s, 73.11 s |
 
-Between 1.1 and 1.8 s depending on which pair you take, and 2,384,199,688 bytes of staging that
-never happens, printed by the probe's own `lastSyncReadbackBytes` before the fix. Small, once per
-run, and honest to describe as tidiness rather than a speed-up. What it is worth more than the
+Worth a second or so, which with two runs a side is under the after arm's own spread and not a
+number to lean on. The finding is the 2,384,199,688 bytes of staging that never happens, printed by
+the probe's own `lastSyncReadbackBytes` before the fix. Once per run, and honest to describe as
+tidiness rather than a speed-up. What it is worth more than the
 second is that it removes the last instance of the pattern levers 25, 27 and 32 exist to close.
 
 The fix is one loop, and the interesting part is where it lives. Under LoRA the base is frozen

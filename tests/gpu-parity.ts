@@ -1574,8 +1574,8 @@ async function generateFreezeGate() {
  * The probe forwards, syncs and never runs a backward, and it happens before the
  * optimizer exists, so nothing had called keepGradOnDevice yet and the sync
  * copied one gradient per parameter to the host for a backward that never comes.
- * Nothing reads them: `grep '\.grad' src/commands/pretrain.ts` finds nothing,
- * and both GPU optimizers clip and step on device.
+ * Nothing reads them: no code in that file reads a host-side gradient, and both
+ * GPU optimizers clip and step on device.
  *
  * The controls pass an empty adapter list, which is what the helper keeps with
  * its loop deleted, so an arm and its control coincide if the loop goes away.

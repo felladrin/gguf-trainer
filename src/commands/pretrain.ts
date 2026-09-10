@@ -101,18 +101,27 @@ const SAMPLE_PROMPTS = [
  * before the run starts. Only forward: the probe never calls backward, so the
  * grad, NN and TN sources first compile at step 0. Their offsets are covered by
  * fusedCeParity's multi-block shape, not here. Both graphs are built before the
- * single sync, because sync stages back the grad of every touched external and
- * syncing twice would read every parameter gradient twice.
+ * single sync: one fence rather than two, for two graphs neither of which needs
+ * the other's result. That used to be the stronger argument, back when a second
+ * sync meant a second whole-model gradient copy; the keep loop below took that
+ * cost away, and the shape is still right for the ordinary reason.
  *
- * The keep loop is why this is a function rather than a block. sync() stages a gradient
- * for every touched external whose grad is not kept on device, and at probe time
- * the optimizer does not exist yet to have said so, so the probe copied a whole
- * model of gradients back for a backward that never runs. Nothing in this file
- * reads `.grad`: both GPU optimizers clip and step on device. The optimizers
- * call keepGradOnDevice on everything they own a few dozen lines later, and the
- * set has no removal path, so this only says it earlier. Measured on a 596M
- * shape: 2.38 GB of staging that never happens, and about 1.3 s off the run.
- * probeReadbackGate is what notices if it goes away again.
+ * The keep loop is why this is a function rather than a block. sync() stages a
+ * gradient for every touched external whose grad is not kept on device, and at
+ * probe time the optimizer does not exist yet to have said so, so the probe
+ * copied a whole model of gradients back for a backward that never runs. No code
+ * in this file reads a host-side gradient; both GPU optimizers clip and step on
+ * device.
+ *
+ * The set is not wider than the optimizer's, in either mode. Dense, it is
+ * model.params(), and both GPU optimizers keep everything in paramGroups(),
+ * which arch-roundtrip.ts asserts is the same set for every registered arch,
+ * tied head or not. Under LoRA, applyLora freezes the base and hands the
+ * optimizer the adapters, which is what this keeps. So this only says earlier
+ * what the optimizer says a few dozen lines later, and the set has no removal
+ * path. Measured on a 596M shape: 2,384,199,688 bytes of staging that never
+ * happens, worth a second or so on a 74 s run. probeReadbackGate is what
+ * notices if it goes away again.
  */
 export async function probeGpuLosses(
   gpu: WebGPUBackend,
