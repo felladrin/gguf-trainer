@@ -31,30 +31,33 @@ jobs:
       - name: Tests
         run: deno task test
 
-  # Principle 1: everything the model itself needs runs on Deno, Bun and Node
-  # with no npm install. `deno task test:node` is the only thing that checks the
-  # Node half, and until #89 nothing here ran it, so a Deno-only API in the
-  # engine or a static npm import that puts a module out of Node's reach went
-  # green. That is not hypothetical: #83 was a static `hyparquet` import that
-  # kept three test files out of the Node task entirely.
+  # The two jobs below are principle 1: everything the model itself needs runs
+  # on Deno, Bun and Node with no npm install. `deno task test:node` and
+  # `deno task test:bun` are the only things that check the two non-Deno halves,
+  # and until #89 and #97 nothing here ran either, so a Deno-only API in the
+  # engine or a static npm import that puts a module out of reach went green.
+  # That is not hypothetical: #83 was a static `hyparquet` import that kept
+  # three test files out of the Node task entirely.
+
+  # Bun runs TypeScript natively rather than through Node's stripper, so this is
+  # a different check and not a stricter one: what it catches is a Web API or a
+  # node: builtin that behaves differently there, not syntax the stripper cannot
+  # erase.
   #
-  # The third runtime principle 1 names (#97). Bun runs TypeScript natively
-  # rather than through Node's stripper, so this is a different check and not a
-  # stricter one: what it catches is a Web API or a node: builtin that behaves
-  # differently there, not syntax the stripper cannot erase.
-  #
-  # `--no-install` is the load-bearing part, and it is in the task rather than
-  # here. Without it Bun silently downloads a missing npm package from the
-  # registry at runtime, so a job that ran the files plainly would satisfy
-  # "no npm install" by installing. Measured: `bun run tests/npm-deps.ts` passes
-  # by default and fails `--no-install` with `Cannot find module`.
+  # `--no-install` is the load-bearing part, and it lives in the task rather
+  # than here, so a contributor running `deno task test:bun` gets the promise CI
+  # gets. Without it Bun downloads a missing npm package from the registry at
+  # runtime, so a job that ran the files plainly would satisfy "no npm install"
+  # by installing. The version is pinned for the reason the Node matrix below
+  # gives: Bun has no LTS line, `latest` would turn this red on a release date
+  # rather than on a change, and lever 46's numbers name a version.
   bun:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: "1.4.2"
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -62,6 +65,17 @@ jobs:
         run: bun --version
       - name: Bun compatibility
         run: deno task test:bun
+      # Positive control for the Bun exemption in tests/task-coverage.ts. The
+      # whole value of `--no-install` is that this file cannot resolve without
+      # a network install; if it ever can, auto-install came back through some
+      # route (a warmed cache, a node_modules something now creates) and
+      # test:bun quietly stopped proving what it claims.
+      - name: Auto-install stays off
+        run: |
+          if bun run --no-install tests/npm-deps.ts; then
+            echo "npm-deps.ts resolved with no install; the Bun exemption is stale" >&2
+            exit 1
+          fi
 
   # Two versions, both pinned. 22.6.0 is the exact floor readme.md promises and
   # the first release with --experimental-strip-types, so this entry tests the

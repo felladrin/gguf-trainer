@@ -2345,9 +2345,24 @@ would go green while proving the opposite of what it claims. That is the #83 sha
 down: a check whose green means something other than what its name says.
 
 So `--no-install` is in the task rather than in the workflow, since it is a property of what the
-task asserts and not of where it runs. All 21 files still pass with it, which is what makes the
-flag free to take. `npm-deps.ts` is exempt under Bun for the same reason it is under Node, with the
-auto-install caveat recorded beside it so nobody "fixes" the exemption by deleting the flag.
+task asserts and not of where it runs: a contributor running `deno task test:bun` gets the promise
+CI gets. All 21 files still pass with it, which is what makes the flag free to take.
+
+**And the flag is checked, because a comment saying "do not delete this" is what already failed
+here.** Review's first finding on this change was that `--no-install` was load-bearing and
+unenforced: strip it from all 21 invocations and every check in the repo stayed green while the job
+went back to satisfying "no npm install" by installing. Note the asymmetry with Node, which does not
+need this: dropping `--experimental-strip-types` fails loudly on the 22.6.0 leg, so that task
+enforces its own flag. The Bun one cannot, so `tests/task-coverage.ts` carries a `needs` list per
+runtime and asserts every invocation still has it, and CI runs
+`bun run --no-install tests/npm-deps.ts` as a positive control that FAILS, so if auto-install ever
+comes back by another route (a warmed cache, a `node_modules` some future config materializes) the
+job says so instead of quietly proving nothing.
+
+`npm-deps.ts` is exempt under Bun for the same reason it is under Node, and that is structural
+rather than luck: Bun does not read `deno.json`'s `imports` and there is no tsconfig `paths` here,
+so under Bun a bare specifier can only resolve through `node_modules`. Any future test that imports
+one is exempt from both by construction.
 
 **`tests/task-coverage.ts` went from two lists to three, as a table rather than a third copy of the
 loop.** Its whole reason for existing is that two hand-maintained strings in `deno.json` drifted
@@ -2363,6 +2378,17 @@ add it to this file's exemption map with what fails
 
 Pasting `node tests/eta-fmt.ts` into the Bun string fails the same way, because the check matches
 the runner and not just the path.
+
+That last one had a hole the review found: the runner match was per FILE, so a wrong-runner path was
+invisible whenever the file was also listed correctly. Appending `&& node tests/eta-fmt.ts` to a
+complete `test:bun` fired nothing, because `eta-fmt.ts` was already listed by the invocation above
+it. A count of the `tests/` paths the string mentions against the count the runner claimed closes
+it: `mentions 22 tests/ paths but 21 are invoked by \`bun run --no-install\`; one is handed to
+another runtime`.
+
+The Bun version is pinned to 1.4.2 rather than `latest`, for the reason lever 44 gives for pinning
+the Node ceiling: Bun has no LTS line, so `latest` turns CI red on a release date rather than on a
+change, and a moving version makes the numbers in this lever unreproducible.
 
 **What the Bun job catches that the Node one cannot.** Not stricter syntax: Bun runs TypeScript
 natively rather than through Node's stripper, so it accepts things Node refuses. What it covers is a

@@ -31,16 +31,21 @@ const NODE_EXEMPT: Record<string, string> = {
 };
 
 /**
- * The same list for Bun, which is not the same list by assumption: Bun runs
- * TypeScript natively rather than through Node's stripper, so a file the
+ * The same list for Bun. It is a separate map because the reasons differ: Bun
+ * runs TypeScript natively rather than through Node's stripper, so a file the
  * stripper refuses could still run there.
  *
- * It happens to have the one entry Node has, for a reason worth being exact
- * about. `bun run --no-install tests/npm-deps.ts` fails with `Cannot find
- * module '@huggingface/jinja'`, the same shape as Node's. Without the flag it
- * PASSES, because Bun downloads the package from the registry at runtime, which
- * is the thing principle 1 exists to forbid. That is why `test:bun` passes
- * `--no-install` at all: the promise is enforced rather than assumed.
+ * That it holds the same one entry is structural rather than a coincidence.
+ * Bun does not read `deno.json`'s `imports`, and there is no tsconfig `paths`
+ * here, so under Bun a bare specifier can only resolve through `node_modules`.
+ * Any future test importing one is therefore exempt from both by construction.
+ *
+ * `bun run --no-install tests/npm-deps.ts` fails with `Cannot find module
+ * '@huggingface/jinja'`, the same shape as Node's. WITHOUT the flag it passes,
+ * because Bun downloads the package from the registry at runtime, which is the
+ * thing principle 1 exists to forbid. That is why `test:bun` passes
+ * `--no-install`, why `needs` below asserts the flag is still there, and why CI
+ * runs the same command as a positive control expecting it to fail.
  */
 const BUN_EXEMPT: Record<string, string> = {
   "npm-deps.ts":
@@ -93,20 +98,40 @@ const inTest = invoked("test", new RegExp(`deno run${FLAGS}`));
  * this file exists is that two hand-maintained lists drifted from `tests/` and
  * nothing compared them.
  */
-const RUNTIMES = [
+const RUNTIMES: {
+  task: string;
+  runner: RegExp;
+  listed: Set<string>;
+  exempt: Record<string, string>;
+  map: string;
+  how: string;
+  needs: string[];
+}[] = [
   {
     task: "test:node",
+    runner: new RegExp(`node${FLAGS}`),
     listed: invoked("test:node", new RegExp(`node${FLAGS}`)),
     exempt: NODE_EXEMPT,
+    map: "NODE_EXEMPT",
     how: "node --experimental-strip-types",
+    // Not listed: dropping it fails loudly on the 22.6.0 leg, which is the
+    // oldest Node whose stripper this repo claims to run on.
+    needs: [],
   },
   {
+    // `bun run x.ts` and `bun x.ts` are both valid, so the `run` is optional
+    // here; the flag is what has to be there, and `needs` is what says so.
     task: "test:bun",
-    listed: invoked("test:bun", new RegExp(`bun\\s+run${FLAGS}`)),
+    runner: new RegExp(`bun(?:\\s+run)?${FLAGS}`),
+    listed: invoked("test:bun", new RegExp(`bun(?:\\s+run)?${FLAGS}`)),
     exempt: BUN_EXEMPT,
+    map: "BUN_EXEMPT",
     how: "bun run --no-install",
+    // Load-bearing and otherwise unenforced: strip it and every check here
+    // still passes while the job satisfies "no npm install" by installing.
+    needs: ["--no-install"],
   },
-] as const;
+];
 
 /** Every .ts under tests/, at any depth, minus the fixture data. */
 function testFiles(dir: string, prefix = ""): string[] {
@@ -132,9 +157,9 @@ for (const f of onDisk) {
     const reason = rt.exempt[f];
     ok(
       rt.listed.has(f) || reason !== undefined,
-      `tests/${f} is not run by \`deno task ${rt.task}\` and has no exemption entry. Run ` +
+      `tests/${f} is not run by \`deno task ${rt.task}\` and has no ${rt.map} entry. Run ` +
         `\`${rt.how} tests/${f}\`: if it passes, add it to the task; if it cannot load, add it ` +
-        `to this file's exemption map with what fails`,
+        `to ${rt.map} with what fails`,
     );
     ok(
       !(rt.listed.has(f) && reason !== undefined),
@@ -151,17 +176,39 @@ for (const { task, listed } of ALL) {
   }
 }
 for (const rt of RUNTIMES) {
+  const body = cfg.tasks![rt.task] as string;
+  // Per PATH, not per file. The per-file check above passes as soon as a file
+  // is listed once, so `&& node tests/eta-fmt.ts` appended to test:bun hides
+  // behind the correct invocation on the line before it.
+  const mentioned = body.match(/tests\/[A-Za-z0-9._/-]+\.ts/g) ?? [];
+  ok(
+    mentioned.length === rt.listed.size,
+    `deno.json's ${rt.task} task mentions ${mentioned.length} tests/ paths but ` +
+      `${rt.listed.size} are invoked by \`${rt.how}\`; one is handed to another runtime`,
+  );
+  // Every invocation carries the flags the runtime's promise depends on. A
+  // flag in the task string is a claim, and nothing else here checks it.
+  for (const flag of rt.needs) {
+    for (const call of body.matchAll(new RegExp(`${rt.runner.source}\\s+tests/`, "g"))) {
+      ok(
+        call[0].includes(flag),
+        `deno.json's ${rt.task} invokes \`${call[0].trim()}\` without ${flag}, which is what ` +
+          `makes the task's promise real rather than assumed`,
+      );
+    }
+  }
   for (const [f, reason] of Object.entries(rt.exempt)) {
-    ok(onDisk.includes(f), `the ${rt.task} exemption map names tests/${f}, which is not on disk`);
+    ok(onDisk.includes(f), `${rt.map} names tests/${f}, which is not on disk`);
     // An empty string satisfies a presence check, and an exemption without a
     // reason is what the three wrong ones would have collapsed to.
-    ok(reason.trim().length > 20, `the ${rt.task} exemption for "${f}" needs a reason`);
+    ok(reason.trim().length > 20, `${rt.map}["${f}"] needs a reason, not a placeholder`);
   }
 }
 
 console.log(
   `task-coverage: ${onDisk.length} test files, ${inTest.size} under deno, ` +
     RUNTIMES.map((r) =>
-      `${r.listed.size} under ${r.task.slice(5)} (${Object.keys(r.exempt).length} exempt)`
+      `${r.listed.size} under ${r.task.replace(/^test:/, "")} ` +
+      `(${Object.keys(r.exempt).length} exempt)`
     ).join(", ") + " ✓",
 );
