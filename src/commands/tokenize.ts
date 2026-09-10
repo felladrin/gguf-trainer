@@ -2,9 +2,11 @@
 //
 // Trains a byte-level BPE vocab on a bounded sample of the corpus (BPE converges
 // on a few MB; encoding the whole thing to learn the vocab is wasteful), then
-// encodes the entire corpus document-by-document and writes two files:
+// encodes the entire corpus document-by-document and writes three files:
 //
 //   <out-prefix>.tokens          bare little-endian tokens (tokenBytes-wide)
+//   <out-prefix>.tokens.id       which tokenizer produced the stream, so a later
+//                                stage refuses a file built with a different one,
 //   <out-prefix>.tokenizer.json  exported vocab + merges (BPETokenizer.export),
 //                                so the training run and inference reuse the exact
 //                                vocab the corpus was tokenized with.
@@ -205,7 +207,8 @@ multi-GB. The vocab is trained on a sample of the first part.`,
       type: "string",
       placeholder: "PREFIX",
       required: true,
-      describe: "output prefix; writes <prefix>.tokens and <prefix>.tokenizer.json",
+      describe:
+        "output prefix; writes <prefix>.tokens, <prefix>.tokens.id and <prefix>.tokenizer.json",
     },
     {
       name: "vocab",

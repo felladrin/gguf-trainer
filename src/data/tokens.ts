@@ -137,9 +137,14 @@ export async function writeTokenFile(
   }
   // Any stamp beside this path described the file being overwritten, not this
   // one. Dropping it makes the invariant unconditional: a stamp never describes
-  // a file it did not see. Without this, detection rests on the byte size, which
-  // agrees whenever the new file lands on the same length, and a crash between
-  // here and stampTokenFile leaves the previous run's stamp looking valid.
+  // a file it did not see, whatever the new length turns out to be, and a crash
+  // between here and stampTokenFile leaves an unstamped file rather than the
+  // previous run's stamp looking valid.
+  //
+  // If the write below then fails, a correct stamp has been lost and the next
+  // run says "unstamped". That degrades toward the warning, never toward a pass,
+  // which is the direction this whole rule runs in; dropping afterwards instead
+  // would put the same-length false ok back.
   await removeIfPresent(tokenIdPath(path));
   await writeFileBytes(path, bytes);
 }
@@ -200,11 +205,11 @@ export interface TokenFileId {
   /**
    * Size of the token file when it was stamped.
    *
-   * Without it a stale stamp beside a rewritten file reports a false ok, which
-   * is worse than no stamp at all. A crash between writeTokenFile and
-   * stampTokenFile is handled by the other half of the same rule: the write
-   * drops any stamp it finds, so the window leaves an unstamped file rather than
-   * a valid-looking one.
+   * After the drop above, no writer here can leave a stale stamp beside a file
+   * it did not see, so the byte size is not what catches that. What it still
+   * catches is a change that came from outside these writers: an external
+   * truncation, an interrupted copy, a `.tokens` restored from backup while its
+   * `.id` stayed, or an `.id` moved beside a different file.
    */
   bytes: number;
 }

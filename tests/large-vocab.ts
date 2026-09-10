@@ -287,8 +287,9 @@ ok(
     `a width flip is refused even when the tokenizer matches: got ${flipped}`,
   );
 
-  // A stale stamp beside a rewritten file would report a false ok, which is
-  // worse than no stamp: the byte size is what makes that a detection.
+  // The byte size, for a file changed by something that is not one of this
+  // repo's writers, which all drop the stamp first: an external truncation, an
+  // interrupted copy, an `.id` moved beside a different file.
   await stampTokenFile(tokensPath, a.export(), a.vocabSize, tokenBytes(a.vocabSize));
   fs.writeFileSync(tokensPath, new Uint8Array([1, 0, 2, 0]));
   const resized = await verdict(a);

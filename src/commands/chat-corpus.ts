@@ -16,7 +16,8 @@
 // sends ChatML, and `/completions`, which sends a persona block and turn labels.
 // See src/data/transcript.ts for why the human's turns are masked out there.
 //
-// Writes <out>.tokens, <out>.mask, <out>.tokenizer.json, <out>.template.txt.
+// Writes <out>.tokens, <out>.tokens.id, <out>.mask, <out>.tokenizer.json and
+// <out>.template.txt.
 //
 // This NEVER trains a vocab: the embedding matrix froze at pretraining, so a new
 // vocab would be incompatible with the checkpoint. What the render needs is the
@@ -323,7 +324,8 @@ automatically.`,
       type: "string",
       placeholder: "PREFIX",
       required: true,
-      describe: "output prefix for the .tokens, .mask, .tokenizer.json and .template.txt",
+      describe:
+        "output prefix for the .tokens, .tokens.id, .mask, .tokenizer.json and .template.txt",
     },
     {
       name: "tokenizer",
