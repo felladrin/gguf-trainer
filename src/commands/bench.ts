@@ -48,7 +48,23 @@ interface Case {
   backward: boolean;
 }
 
-/** One timed pass: forward (+ backward), then a fence. */
+/**
+ * One timed pass: forward (+ backward), then a readback that is also the fence.
+ *
+ * `sync([])` passes no reads, so the only thing it can stage is the gradients of
+ * the touched externals, and it stages those because `randTensor` builds every
+ * case's inputs with `requiresGrad`. That is what the wall number means (it
+ * includes the gradient readback, per this file's header) and, since #87, also
+ * the only reason the pass is fenced at all: a `sync()` with nothing to stage
+ * submits and returns without awaiting the GPU.
+ *
+ * So the two properties stand or fall together, and the assertion below is what
+ * says so. A case with frozen inputs, or one calling `keepGradOnDevice` the way
+ * the resident training loop does, would stage nothing: the wall number would
+ * quietly stop including the readback AND stop waiting for the GPU tail, and it
+ * would still print a plausible time. That is the one failure this command
+ * cannot afford, since the number is the whole output.
+ */
 async function once(gpu: WebGPUBackend, c: Case) {
   for (const t of c.inputs) t.zeroGrad();
   const out = c.run(gpu);
@@ -58,6 +74,13 @@ async function once(gpu: WebGPUBackend, c: Case) {
     out._backward();
   }
   await gpu.sync([]);
+  if (gpu.lastSyncReadbackBytes === 0) {
+    throw new Error(
+      `bench: case "${c.name}" staged nothing, so its timing neither includes the gradient ` +
+        `readback nor waits for the GPU. Give the case inputs that carry gradients, or read ` +
+        `something back explicitly; do not leave the pass unfenced.`,
+    );
+  }
 }
 
 function fmt(ms: number): string {

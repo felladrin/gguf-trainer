@@ -2247,6 +2247,52 @@ The workflow also gained a `concurrency` group, because it went from one job to 
 superseded push now wastes three runners rather than one. It cancels on `pull_request` only: a
 cancelled main build leaves no record of whether that commit was ever green.
 
+### 45. `bench` fenced its timed pass by accident (2026-09-10)
+
+Filed as #99 while reviewing #98. `bench` times one pass per case like this:
+
+```ts
+/** One timed pass: forward (+ backward), then a fence. */
+async function once(gpu: WebGPUBackend, c: Case) {
+  ...
+  await gpu.sync([]);
+}
+```
+
+The comment says "then a fence", and there is one, but not for the reason the call looks like.
+`sync([])` passes no reads, so the only thing that can stage is `touchedExternals`, and every case's
+inputs come from `randTensor`, which builds them `requiresGrad`. Their gradients stage, the
+`mapAsync` awaits are real, and the pass waits for the GPU. Lever 41 is what makes that load-bearing
+rather than incidental trivia: a `sync()` with nothing staged submits and returns without awaiting
+anything.
+
+**The two things that would break it are both things a plausible new case would do.** Frozen inputs,
+which is what a forward-only or LoRA-shaped case naturally uses, or a call to `keepGradOnDevice`,
+which is what a case modelling the resident training loop would copy. Either empties `stagings`, and
+the pass is then timed to the submit rather than to completion. Everywhere else in the repo that
+failure produces a wrong result you can see. Here it produces a plausible number, in the one command
+whose entire output is numbers.
+
+**Fixed by asserting rather than by fencing, and the reason is what the number means.** An explicit
+`onSubmittedWorkDone()` would restore the wait and cost nothing today, but it would let such a case
+exist: this file's header defines the wall number as including the host-side graph build and the
+gradient readback, so a case that stages nothing has already stopped reporting what the column
+claims, fence or no fence. The two properties stand or fall together, so one check covers both:
+
+```
+bench: case "rmsnorm" staged nothing, so its timing neither includes the gradient readback nor
+waits for the GPU. Give the case inputs that carry gradients, or read something back explicitly;
+do not leave the pass unfenced.
+```
+
+Adding `gpu.keepGradOnDevice(t)` over the case inputs reproduces it exactly, which is the mutation
+that proves the check. The published numbers do not move: the assertion is a field read against
+zero, and every existing case passes it.
+
+No test file, deliberately. `bench` needs a GPU and is not in `deno task test`, and the check runs on
+every real invocation, which is where it belongs. The property it depends on, that
+`keepGradOnDevice` empties the staging list, is already pinned in `recycleReuseGate`.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
