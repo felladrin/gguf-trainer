@@ -2482,7 +2482,8 @@ lever's own rule rather than on its merits: every reading was taken under the sa
 join the discard pile. For the record they read 98-100% across three arms of very different
 throughput, which cannot be reconciled with lever 1c's 52.5%; whether that is the counter saturating
 or the load, this lever cannot say, and 1c's own note that its reading was taken uncontended is the
-first thing to check if anyone wants to.
+first thing to check if anyone wants to. Filed as #104, because five places in this file rest on
+that counter.
 
 To re-run the follow-up: `checkpoint()`'s passthrough at `if (!checkpointing) return fn()` needs the
 backend's `submit()`, which is private on `WebGPUBackend` and absent from the `RegionBackend`
