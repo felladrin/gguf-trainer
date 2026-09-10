@@ -680,8 +680,7 @@ export class WebGPUBackend implements OpsBackend {
    * written out as leg 2 at the release loop in sync(). Nothing is destroyed here; this only moves
    * entries between JS-side lists and the driver keeps every buffer alive.
    *
-   * `submit()` is NOT what makes it safe, and it is not redundant either: deleting it costs the
-   * recompute path 117 to 75 tok/s on lever 20's shape, measured in lever 47. What
+   * `submit()` is NOT what makes it safe, and it is not redundant either. What
    * saves a regionFree buffer that does reach a queue.writeBuffer is that the
    * write is issued after a submit, so it cannot run ahead of a reader: every
    * loss backward seeds its eo.grad that way, and seedGradFromHost does the
