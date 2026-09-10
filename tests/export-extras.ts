@@ -253,7 +253,8 @@ for (
     // navigator that fails at or before requestAdapter, since a throw is the
     // stack trace this whole change exists to replace. A junk adapter that gets
     // PAST requestAdapter can still throw out of the device request; that is
-    // older than this change and not claimed here. The polyfill route the docblock advertises is where partial
+    // older than this change and not claimed here. The polyfill route the docblock
+    // advertises is where partial
     // implementations show up, so the list is not hypothetical.
     for (
       const [label, nav] of [
