@@ -20,7 +20,7 @@ I trained [Minueza-3-95M-Base](https://huggingface.co/Felladrin/Minueza-3-95M-Ba
 
 Deno 2.x, which ships WebGPU natively (CI tests on it). No build step, no npm install.
 
-Node 22.6+ and Bun run the CPU reference path too, which is enough for the test suite (`deno task test:node`), though the CLI itself is Deno-only.
+Node 22.6+ and Bun (CI pins 1.4.2; no older version is claimed) run the CPU reference path too, which is enough for the test suite (`deno task test:node` and `deno task test:bun`; CI runs both), though the CLI itself is Deno-only.
 
 **A GPU adapter, for training.** `pretrain`, `finetune` and `bench` refuse to start without one, and training will not fall back to the CPU; see Honest limits below for why, and for what to use instead if a CPU is all you have. Everything else runs without one: `eval-loss`, `eval-choice` and `generate` take `--cpu`, and `demo` is CPU-only, so the install check below works on a machine with no GPU at all.
 

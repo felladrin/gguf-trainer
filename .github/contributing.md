@@ -6,17 +6,19 @@ Thanks for helping build a from-scratch, GGUF-native LLM trainer in TypeScript.
 
 1. **The engine stays dependency-free and runtime-agnostic.** Everything the model itself needs
    (`src/model/`, `src/arch/`, `src/train/`, `src/gguf/`, `src/tokenizer/`, `src/export/`) must run
-   on Deno, Bun and Node with no npm install. `deno task test:node` checks the Node half of that. Avoid
-   runtime-specific APIs; file I/O goes through `src/io.ts`. The two npm dependencies (hyparquet,
+   on Deno, Bun and Node with no npm install. `deno task test:node` and `deno task test:bun` check
+   the other two, and CI runs both (levers 44 and 46). Avoid runtime-specific APIs; file I/O goes
+   through `src/io.ts`. The two npm dependencies (hyparquet,
    @huggingface/jinja) belong to data fetching and chat templating only, in `src/data/` and
    `src/commands/`; do not let them reach the engine. In any module something under `tests/` can
    reach, import them where they are used rather than at the top: a static import makes every
    transitive importer unloadable under Node, which is how three test files went missing from
    `test:node` (lever 39). Four more were missing for the other reason, which
-   `tests/task-coverage.ts` now catches: nothing compared the two task lists to `tests/`. A test
-   file belongs in both tasks unless it has a load failure under Node you have actually seen. CI
-   runs `test:node` on Node 22.6 and 24, so a PR that breaks the Node half fails there
-   rather than on whoever runs it next (lever 44).
+   `tests/task-coverage.ts` now catches: nothing compared the task lists to `tests/`. A test file
+   belongs in all three tasks unless it has a load failure you have actually seen, recorded in
+   `tests/task-coverage.ts` with what fails. CI runs `test:node` on Node 22.6 and 24 and
+   `test:bun` on Bun 1.4.2, so a PR that breaks any of the three fails there rather than on
+   whoever runs it next.
 2. **GGUF loadability is a contract.** Each architecture's tensor names and metadata keys, in its
    own `src/arch/<name>.ts`, mirror what `llama.cpp` expects. Don't change them without validating
    the output loads in `llama-cli`.
@@ -37,7 +39,8 @@ are in [docs/adding-an-architecture.md](../docs/adding-an-architecture.md).
 Every new op in `src/model/autograd.ts` needs a **finite-difference gradient check** before it's
 trusted: add a case to `tests/gradcheck.ts` (it perturbs each input by ±ε and compares
 `(f(x+ε) − f(x−ε)) / 2ε` against the analytic gradient your `_backward` produces) and run
-`deno task test` plus `deno task test:node`. New ops also need an entry in the `OpsBackend`
+`deno task test`, `deno task test:node` and `deno task test:bun`. New ops also need an entry in
+the `OpsBackend`
 interface and a WebGPU implementation, or GPU graphs break.
 
 ## Adding a WebGPU kernel

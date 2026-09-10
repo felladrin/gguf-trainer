@@ -2317,6 +2317,106 @@ No test file, deliberately. `bench` needs a GPU and is not in `deno task test`, 
 every real invocation, which is where it belongs. The property it depends on, that
 `keepGradOnDevice` empties the staging list, is already pinned in `recycleReuseGate`.
 
+### 46. Bun, the runtime principle 1 named and nothing checked (2026-09-10)
+
+Filed as #97 while reviewing #94. Principle 1 says everything the model itself needs must run on
+Deno, Bun and Node with no npm install. There was a `test` task and a `test:node` task. Nothing for
+Bun, so #94 left the claim enforced for two runtimes out of the three it names.
+
+**The probe answered the first question immediately and the interesting one second.** All 21 files
+run clean under Bun 1.4.2 on `ubuntu-latest`, in 12s beside the Deno job's 19s, with the same skip
+profile as Node: `gpu-parity.ts` prints its no-WebGPU SKIP, `large-file-write.ts` leaves its big-IO
+case behind `GGUF_TRAINER_BIG_IO=1`. So a job was warranted rather than an edit to the principle.
+
+**Then `bun run tests/npm-deps.ts` passed, and that is the finding.** That file is the one Node
+cannot load: it statically imports `@huggingface/jinja`, a bare specifier that resolves through
+Deno's import map, and with no `node_modules` it is `ERR_MODULE_NOT_FOUND`. Under Bun it works. Not
+because Bun resolves it, but because Bun downloads the package from the registry at runtime:
+
+```
+bun run --no-install tests/npm-deps.ts
+  error: Cannot find module '@huggingface/jinja' from '.../tests/npm-deps.ts'
+bun run tests/npm-deps.ts
+  passes
+```
+
+A Bun job that ran the files plainly would therefore satisfy "no npm install" by installing, and
+would go green while proving the opposite of what it claims. That is the #83 shape again, one layer
+down: a check whose green means something other than what its name says.
+
+So `--no-install` is in the task rather than in the workflow, since it is a property of what the
+task asserts and not of where it runs: a contributor running `deno task test:bun` gets the promise
+CI gets. All 21 files still pass with it, which is what makes the flag free to take.
+
+**And the flag is checked, because a comment saying "do not delete this" is what already failed
+here.** Review's first finding on this change was that `--no-install` was load-bearing and
+unenforced: strip it from all 21 invocations and every check in the repo stayed green while the job
+went back to satisfying "no npm install" by installing. Note the asymmetry with Node, which does not
+need this: dropping `--experimental-strip-types` fails loudly on the 22.6.0 leg, so that task
+enforces its own flag. The Bun one cannot, so `tests/task-coverage.ts` carries a `needs` list per
+runtime and asserts every invocation still has it, and CI runs
+`bun run --no-install tests/npm-deps.ts` as a positive control that FAILS, so if auto-install ever
+comes back by another route (a warmed cache, a `node_modules` some future config materializes) the
+job says so instead of quietly proving nothing.
+
+`npm-deps.ts` is exempt under Bun for the same reason it is under Node, and that is structural
+rather than luck: Bun does not read `deno.json`'s `imports` and there is no tsconfig `paths` here,
+so under Bun a bare specifier can only resolve through `node_modules`. Any future test that imports
+one is exempt from both by construction.
+
+**`tests/task-coverage.ts` went from two lists to three, as a table rather than a third copy of the
+loop.** Its whole reason for existing is that two hand-maintained strings in `deno.json` drifted
+from `tests/` and nothing compared them, so growing it by copy-paste would have been the joke
+telling itself. Dropping a file from `test:bun` now fails with the file, the task and the command to
+run:
+
+```
+tests/eval-tasks.ts is not run by `deno task test:bun` and has no exemption entry. Run
+`bun run --no-install tests/eval-tasks.ts`: if it passes, add it to the task; if it cannot load,
+add it to this file's exemption map with what fails
+```
+
+Pasting `node tests/eta-fmt.ts` into the Bun string fails the same way, because the check matches
+the runner and not just the path.
+
+That last one had a hole the review found: the runner match was per FILE, so a wrong-runner path was
+invisible whenever the file was also listed correctly. Appending `&& node tests/eta-fmt.ts` to a
+complete `test:bun` fired nothing, because `eta-fmt.ts` was already listed by the invocation above
+it. A count of the `tests/` paths the string mentions against the count the runner claimed closes
+it, and the message names the three ways it can happen:
+
+```
+deno.json's test:bun task mentions 22 tests/ paths but 21 are invoked by "bun run --no-install";
+one is handed to another runtime, written ./tests/, or passed as an argument rather than as the
+entry point
+```
+
+It counts occurrences on both sides rather than against the `Set` of files, so a task that runs one
+file twice on purpose is not a false failure blaming a cause that is not there. `test` gets a row of
+its own for this check, since the hole was never Bun-specific.
+
+The Bun version is pinned to 1.4.2 rather than `latest`, for the reason lever 44 gives for pinning
+the Node ceiling: Bun has no LTS line, so `latest` turns CI red on a release date rather than on a
+change, and a moving version makes the numbers in this lever unreproducible. The pin buys a second
+thing, which is that the positive control can assert bun's actual wording. It checks the message
+rather than the exit code, because `if bun run ...; then fail` treats every nonzero exit as the
+expected one, and a broken import or a crash inside `npm-deps.ts` would then pass the control while
+auto-install was quietly back on. Unlike Node, no floor is claimed: `readme.md` says CI pins 1.4.2
+and that no older Bun is promised, because none was tested.
+
+**And one check closes the shape behind both #89 and #97.** Each was the same story: a task existed,
+was correct, and nothing on a runner invoked it, so its guarantee held only for whoever ran it by
+hand. `tests/task-coverage.ts` now reads `.github/workflows/test.yml` and asserts each of the three
+tasks appears as a `run:` step. Replace `deno task test:bun` in the workflow with anything else and
+it fails with "that task is checked only by whoever runs it by hand. That is what #89 and #97 were".
+It couples a test to a CI file, which is the objection; comparing two hand-maintained lists is what
+this file already exists to do, which is the answer.
+
+**What the Bun job catches that the Node one cannot.** Not stricter syntax: Bun runs TypeScript
+natively rather than through Node's stripper, so it accepts things Node refuses. What it covers is a
+Web API or a `node:` builtin behaving differently there, which is the half of principle 1 that had
+no check at all.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
