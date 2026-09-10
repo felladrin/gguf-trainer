@@ -101,6 +101,8 @@ export function backward(loss: Tensor, seed = 1) {
 // ---------------------------------------------------------------------------
 
 export interface OpsBackend {
+  /** The contracted dimension is validated by the `linear` wrapper, above this
+   * dispatch. */
   linear(x: Tensor, w: Tensor): Tensor;
   add(a: Tensor, b: Tensor): Tensor;
   mul(a: Tensor, b: Tensor): Tensor;
@@ -330,8 +332,9 @@ function linearRaw(x: Tensor, w: Tensor): Tensor {
   // path does pay is the two shape destructures above, which used to happen
   // only inside the backend. `linear` is the hottest op in the graph, so that
   // is worth a number rather than a shrug: 86 calls per step at 6 layers and
-  // batch 2, and 4.1 ns for two destructures and a compare, which is 0.00035 ms
-  // per step against a step measured in seconds.
+  // batch 2, 170 with --recompute since 42 of the 43 per micro-batch replay in
+  // backward, and 4.1 ns for two destructures and a compare, which is 0.0007 ms
+  // per step at the higher count against a step measured in seconds.
   if (inDim !== inDim2) {
     throw new Error(
       `linear dim mismatch: x is [${x.shape.join(", ")}] and w is [${w.shape.join(", ")}], ` +

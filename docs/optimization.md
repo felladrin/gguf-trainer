@@ -1914,9 +1914,9 @@ denominator and skips the validation, which is why nothing but a placement gate 
 
 **One instance of the gap shape remained, and it was not this one** (closed in lever 42).
 `linearRaw` checked `inDim !== inDim2` below its dispatch and `webgpu.ts` repeated the identical
-check with the identical message. No gap today, same as here, and hoisting it is a different change to a different function.
-Filed as #91 rather than folded in, since `linear` is the hottest op in the graph and "the check is
-free" wants measuring rather than asserting.
+check with the identical message. No gap at the time, same as here, and hoisting it was a different
+change to a different function. Filed as #91 rather than folded in, since `linear` is the hottest op
+in the graph and "the check is free" wanted measuring rather than asserting.
 
 Two duplicates in `fusedCrossEntropy`'s GPU path were a different leftover: `H !== H2` and
 `chunk <= 0` were repeated there with identical messages, and the wrapper had checked both above the
