@@ -2196,17 +2196,25 @@ async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
 /**
  * Out-of-range indices, refused on the host, with an installed backend.
  *
- * The two losses need one arm each because they validate BELOW the backend
- * dispatch, so each implementation carries its own call and this is what proves
- * the device ones are still there. The kernel could not catch it for them: the
+ * Every refusal arm here pins placement. Each guard sits ABOVE the backend
+ * dispatch, so no backend can skip it, and moving any of them below leaves the
+ * CPU cases in gradcheck passing while this fails. The two losses arrived last:
+ * they validated below the dispatch until lever 40, with each implementation
+ * carrying its own call, and these arms proved the device ones were still
+ * there. Now there are no device-side calls left to prove, and they pin what
+ * the other three pin. For those two the move is no longer expressible, since
+ * the dispatch reads the count the validator returns; the mutation that
+ * reproduces it is a bare counting loop in the validator's place, which lever
+ * 40 spells out.
+ *
+ * The `scores` conjunct is not one of them. It is the control: a guard that
+ * refused everything would pass all five refusal arms, and reading `loss.data`
+ * before the sync would pass on an unwritten buffer.
+ *
+ * No kernel could catch the loss cases, wherever the check is called from: the
  * logits buffer is bound whole, so `LOG[t * V + tgt]` with `tgt >= V` is an
  * in-bounds read of the next row, measured returning exactly the CPU's wrong
  * value.
- *
- * The embedding, softCE and rank arms are here for the opposite reason. Their
- * guards sit ABOVE the dispatch, so no backend can skip them, and what these
- * pin is that placement: move a call below and the CPU cases in gradcheck still
- * pass while this fails.
  */
 async function targetRangeGate(gpu: WebGPUBackend) {
   const T = 3, H = 4, V = 6;

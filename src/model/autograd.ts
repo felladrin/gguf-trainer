@@ -122,12 +122,21 @@ export interface OpsBackend {
     hd: number,
     window: number,
   ): Tensor;
-  crossEntropy(logits: Tensor, targets: number[]): Tensor;
+  /**
+   * Targets are validated by the `crossEntropy` wrapper, above this dispatch,
+   * which passes the kept-row count it counted on the way through. Taking
+   * `kept` rather than recounting is what let the validation move up: it is the
+   * loss denominator, so both implementations need the number, and a guard that
+   * lives under a dispatch has to be repeated in each one.
+   */
+  crossEntropy(logits: Tensor, targets: number[], kept: number): Tensor;
+  /** Same as `crossEntropy`: validated above the dispatch, `kept` passed down. */
   fusedCrossEntropy(
     hidden: Tensor,
     w: Tensor,
     targets: number[],
     chunk: number,
+    kept: number,
   ): Tensor;
   softCrossEntropy(
     logits: Tensor,
@@ -856,8 +865,16 @@ export function keptRowsInVocab(targets: number[], T: number, V: number, where: 
 /** Softmax cross-entropy over logits:[T,V] vs integer targets:[T]. Returns scalar. */
 export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
   assertMatrix(logits, "logits", "crossEntropy");
-  if (opsBackend) return opsBackend.crossEntropy(logits, targets);
   const [T, V] = logits.shape;
+  // Above the dispatch, like every id and shape validator in this file bar
+  // linearRaw's dim check (#91). It stayed below for as long as it did because
+  // it returns a value both implementations need as their loss denominator, so
+  // hoisting it means passing `kept` down rather than each backend calling it
+  // again. That is a smaller price than the shape that produced #61: a guard
+  // under a dispatch has to be repeated in every implementation, and the one
+  // nobody remembers is the one that ships unvalidated.
+  const kept = keptRowsInVocab(targets, T, V, "crossEntropy");
+  if (opsBackend) return opsBackend.crossEntropy(logits, targets, kept);
   const loss = Tensor.zeros([1]);
   const probs = new Float32Array(T * V);
   // A target < 0 marks an ignored position (e.g. prompt tokens under
@@ -865,7 +882,6 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
   // the mean is over kept rows only. With no ignored rows this is the plain
   // full-sequence mean (kept === T), so existing callers are unchanged.
   let total = 0;
-  const kept = keptRowsInVocab(targets, T, V, "crossEntropy");
   for (let t = 0; t < T; t++) {
     const b = t * V;
     let maxL = -Infinity;
@@ -944,11 +960,11 @@ export function fusedCrossEntropy(
         "path cannot apply. Put the readout in the aux param group, or use --loss-chunk 0.",
     );
   }
-  if (opsBackend) return opsBackend.fusedCrossEntropy(hidden, w, targets, chunk);
-  // Before the chunk loops, not after: an out-of-range target never falls inside
-  // any span, so `tgtLogit` would stay 0 and the loss would be quietly wrong
-  // rather than NaN.
+  // Above the dispatch, and on the CPU side before the chunk loops rather than
+  // after: an out-of-range target never falls inside any span, so `tgtLogit`
+  // would stay 0 and the loss would be quietly wrong rather than NaN.
   const kept = keptRowsInVocab(targets, T, V, "fusedCrossEntropy");
+  if (opsBackend) return opsBackend.fusedCrossEntropy(hidden, w, targets, chunk, kept);
   const loss = Tensor.zeros([1]);
 
   // Online softmax over the chunked vocab: a chunk whose maximum beats the
