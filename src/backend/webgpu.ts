@@ -246,6 +246,11 @@ class BufferPool {
     guardBufferSize(size, this.maxBinding);
     const buf = this.device.createBuffer({
       size,
+      // No MAP_READ or MAP_WRITE, and that is load-bearing beyond convenience:
+      // sync() recycles these while the GPU is still reading them, on the
+      // argument that every access to a pooled buffer is a queue-timeline
+      // command. A mappable pool buffer would let the host reach one out of
+      // turn and break it. Readback goes through copyToStaging instead.
       usage: USAGE.STORAGE | USAGE.COPY_SRC | USAGE.COPY_DST,
     });
     this.allocated += size;
@@ -493,8 +498,62 @@ export class WebGPUBackend implements OpsBackend {
     }
     if (this.prof && profTs > 0) await this.readProfile(profTs);
 
-    // The mapAsync completions above prove all submitted work finished, so
-    // every transient buffer is idle and safe to recycle.
+    // What makes this recycle safe is queue ordering, not a fence. The mapAsync
+    // completions above look like the fence, and they are not one: they only
+    // exist when something staged. With both parameter groups kept on device and
+    // clipping off, neither `reads` nor `touchedExternals` produces a staging,
+    // `stagings` is empty, and this method awaits nothing between submit() and the
+    // release below. How far behind the GPU can be at that point: an
+    // onSubmittedWorkDone() inserted here waited a median of 783 ms on a
+    // 6-layer 512-hidden step.
+    //
+    // No shipped path releases a live transient that way today. train-gpu takes
+    // the empty-staging path at every optimizer flush, but `transients` is
+    // already empty there, because the loss sync a few lines earlier drained it
+    // and recordStep allocates only optimizer state, which is not pooled; measured
+    // over four steps, all four empty-staging syncs released nothing. It is the
+    // public `sync()` that reaches this with work outstanding, which is what
+    // recycleReuseGate exercises, and it goes live in the trainer the day
+    // something keeps its gradients on device and syncs with transients up.
+    //
+    // Sound for three reasons that have nothing to do with waiting:
+    //
+    //   0. Everything that could touch a released buffer is already on the
+    //      queue. this.submit() above finished the encoder and nulled this.enc,
+    //      so no recorded-but-unsubmitted pass can still be holding one. This is
+    //      the premise the other two rest on, and the one a later edit would
+    //      break silently: a release path that does not submit first, this loop
+    //      hoisted above the submit, or work recorded between the two, would let
+    //      a writeBuffer issued after the release run ahead of a reader that had
+    //      not reached the queue yet. The third is only a window when something
+    //      stages or profiles, since those are the awaits, and no in-tree caller
+    //      records ops during one: the ops are synchronous, the same assumption
+    //      checkRegionMark's docstring flags.
+    //   1. A pooled buffer can only be touched on the queue timeline. The pool
+    //      creates them STORAGE | COPY_SRC | COPY_DST and nothing else (see
+    //      BufferPool.acquire), so no mapAsync can hand one to the host behind
+    //      the queue's back. Every read and every write of one is a dispatch, a
+    //      copy or clearBuffer command, or a queue.writeBuffer. Give pooled
+    //      buffers a MAP usage and this leg is gone.
+    //   2. Queue operations run in the order they were issued, and everything
+    //      that can touch a recycled buffer is one. A dispatch or copy is
+    //      recorded into a later encoder and reaches the queue in a later
+    //      submit, whose queue-timeline steps are "for each commandBuffer in
+    //      commandBuffers: execute each command in commandBuffer.[[command_list]]"
+    //      [1]. A host write is a queue.writeBuffer issued after the submit()
+    //      above, which is the case that matters most here: uploadU32 and
+    //      uploadF32 acquire a transient and write it immediately, so embedding
+    //      and fusedCrossEntropy do exactly this on every micro-batch. Neither
+    //      can overtake work submitted before it, which is the only hazard
+    //      recycling could introduce.
+    //
+    // Leg 2 is also why reusing a buffer across submits without a host fence is
+    // the ordinary way to drive WebGPU rather than a trick: every renderer
+    // rewrites its vertex and uniform buffers each frame and fences nothing.
+    // gpuweb#3809 asks for the ordering to be stated outright; what the spec
+    // writes down today is the ordered execution quoted above.
+    //
+    // [1] https://www.w3.org/TR/webgpu/#dom-gpuqueue-submit
     for (const tr of this.transients) this.pool.release(tr.size, tr.buf);
     this.transients = [];
     // Region buffers left unclaimed by a recompute are not in `transients`, so
@@ -527,9 +586,20 @@ export class WebGPUBackend implements OpsBackend {
    * boundary: ensureBackwardBegun flushed it, which also leaves
    * pendingGraphClears false, and droppedClearsForGraph would already have
    * thrown), so the deferred grad-clear timing and CPU/GPU parity are
-   * unchanged. Buffers are returned to the pool only after onSubmittedWorkDone
-   * proves the GPU finished the recorded work, so no in-flight pass still reads
-   * them. `keep` names tensors whose DATA buffer must survive to the end-of-step
+   * unchanged. The onSubmittedWorkDone below is NOT what makes releasing these
+   * safe; sync() releases the same buffers with no fence at all, on the queue
+   * ordering argument written out there, and this drain rests on it too. It is
+   * kept because removing it measured no win: at batch 4 on a 6-layer
+   * 512-hidden step it waits a median of 1113 ms per micro-batch boundary, and
+   * deleting it moved the step from 5111 ms to 4942 ms, 3.3% inside a 1007 ms
+   * within-arm spread that is 20% of the median. Do not read the wait as the
+   * saving: the CPU is waiting for work the GPU has to do either way. Nor is
+   * this a bet the repo has not already taken. endRegion releases live,
+   * in-flight transients onto regionFree with no fence at all and acquireRecycled
+   * hands them to the next makeOut, at every layer boundary of every --recompute
+   * run, gated by recomputeModelParity. The ordering argument is load-bearing in
+   * shipped code today; this drain is not what stands between the trainer and
+   * it. `keep` names tensors whose DATA buffer must survive to the end-of-step
    * sync() readback (the per-micro-batch loss scalars); their buffers are
    * retained in `this.transients` and released by that later sync().
    */
@@ -548,9 +618,9 @@ export class WebGPUBackend implements OpsBackend {
       else this.pool.release(tr.size, tr.buf);
     }
     this.transients = retained;
-    // Same reasoning as in sync(): onSubmittedWorkDone above proves the GPU is
-    // done, so anything the micro-batch's recompute regions left behind can go
-    // back to the pool rather than stranding until the end of the step.
+    // Same reasoning as in sync(): anything the micro-batch's recompute regions
+    // left behind can go back to the pool rather than stranding until the end of
+    // the step.
     for (const tr of this.regionFree) this.pool.release(tr.size, tr.buf);
     this.regionFree = [];
     if (this.deviceError) throw new Error(this.deviceError);
@@ -598,13 +668,20 @@ export class WebGPUBackend implements OpsBackend {
    * other, and passes within a command buffer execute in order (the shape the
    * profiling path produces, one pass per dispatch). The dense path has always
    * depended on the first of those, since every op reads the previous op's
-   * output out of the same pass. Nothing is destroyed here; this only moves
+   * output out of the same pass. Neither covers this method, which submits at
+   * every boundary, so a recycled buffer's previous readers sit in an EARLIER
+   * command buffer than its next writers; what covers that is submission order,
+   * written out as leg 2 at the release loop in sync(). Nothing is destroyed here; this only moves
    * entries between JS-side lists and the driver keeps every buffer alive.
    *
-   * `submit()` is NOT what makes it safe, and it is not redundant either. No
-   * regionFree buffer ever reaches a queue.writeBuffer call site (makeOut is the
-   * only consumer, and the two places that hand regionFree back to the pool
-   * fence first), so correctness does not need it. What it does is hand the
+   * `submit()` is NOT what makes it safe, and it is not redundant either. What
+   * saves a regionFree buffer that does reach a queue.writeBuffer is that the
+   * write is issued after a submit, so it cannot run ahead of a reader: every
+   * loss backward seeds its eo.grad that way, and seedGradFromHost does the
+   * same, on a buffer makeOut can have drawn from regionFree, and
+   * ensureBackwardBegun submits immediately before it. (This comment used to
+   * claim no regionFree buffer reaches a writeBuffer at all; lever 20 and 41
+   * carry why that was wrong.) What submit() does is hand the
    * recorded work to the GPU at every layer boundary instead of accumulating a
    * whole micro-batch into one pass, and that overlap is what lever 20 credits
    * for the throughput. Remove it and every test still passes while the headline
@@ -1548,9 +1625,12 @@ export class WebGPUBackend implements OpsBackend {
 
   private uploadU32(values: number[]): GpuBuffer {
     const buf = this.acquireTransient(values.length * 4);
-    // queue.writeBuffer executes before any later-submitted encoder, and this
-    // buffer can't appear in already-encoded (unsubmitted) passes: it was free
-    // in the pool until this call.
+    // Ordered on both sides. Forward: queue.writeBuffer executes before any
+    // later-submitted encoder, and this buffer can't appear in already-encoded
+    // (unsubmitted) passes, since it was free in the pool until this call.
+    // Backward, which is what makes recycling in sync() safe: the write cannot
+    // overtake an already-submitted pass that is still reading this buffer,
+    // because both are queue operations and the queue runs them in issue order.
     this.queue.writeBuffer(buf, 0, Uint32Array.from(values));
     return buf;
   }

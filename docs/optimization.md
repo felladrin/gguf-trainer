@@ -613,10 +613,16 @@ was measured, with two short `pretrain` runs differing only in the flag.
 If that reading is right, the same overlap is available without recomputing anything, by submitting
 at layer boundaries on the dense path too. That is the obvious follow-up and it is not done here.
 
-The corollary is a trap worth naming: the `submit()` in `endRegion` is not needed for correctness,
-since no region buffer ever reaches a `queue.writeBuffer` call site. It is what produces the
-overlap. Deleting it as redundant keeps the whole suite green and silently returns the throughput
-to the dense number, so the comment there says so.
+The corollary is a trap worth naming: the `submit()` in `endRegion` is not needed for correctness.
+It is what produces the overlap. Deleting it as redundant keeps the whole suite green and silently
+returns the throughput to the dense number, so the comment there says so.
+
+The reason it is not needed for correctness is not the one this lever gave. It said no region
+buffer ever reaches a `queue.writeBuffer` call site, and that is false: the loss backwards write
+their seed into an `eo.grad` that `makeOut` can and does draw from `regionFree` in a `--recompute`
+run. What saves it is that `ensureBackwardBegun` submits immediately before that write, so it
+cannot run ahead of a reader. The conclusion stands, the reason has been replaced, in `endRegion`'s
+docstring and here. Lever 41 has the general form of the argument.
 
 **This looks like it contradicts lever 3b, and does not.** 3b costs 23% by submitting once per
 micro-batch on the same host-bound step; 20 gains 2.3x by submitting once per layer on it. The
@@ -1915,6 +1921,122 @@ Two duplicates in `fusedCrossEntropy`'s GPU path are a different leftover: `H !=
 `chunk <= 0` are repeated there with identical messages, and the wrapper has checked both above the
 dispatch since before this change, so they were already unreachable. Dead rather than gap-shaped,
 and listed with #91.
+
+### 41. What makes buffer recycling safe is queue ordering, not the fence in the comment (2026-09-10)
+
+Filed as #87 while reviewing #86. `sync()` returns every transient buffer to the pool at the end of
+the window, and the comment that justified it read:
+
+```ts
+// The mapAsync completions above prove all submitted work finished, so
+// every transient buffer is idle and safe to recycle.
+```
+
+Those completions are the `await`s over `stagings`. When nothing stages there are none, so the
+sentence proved nothing: the loop released buffers on the strength of a fence that did not happen.
+`train-gpu.ts` calls `gpu.sync(normTensors)` at every optimizer flush with both parameter groups kept on device, and `normTensors` is empty unless MuonClip is on, so the ordinary training step takes the empty-await path once per step.
+
+**How far behind the GPU is at that point: a median of 783 ms.** Measured by inserting an
+`onSubmittedWorkDone()` on the empty path and timing it, on a 6-layer 512-hidden gemma3 step at
+batch 2 and sequence 512.
+
+**But no shipped path releases a live transient that way, which the issue got wrong and so did the
+first draft of this lever.** `this.transients` is already empty at that call site: `sync(losses)`
+one line earlier drained the list, and `opt.recordStep()` allocates only optimizer state, which does
+not come from the pool. Measured over four steps: nine syncs, four with nothing staged, and all four
+released zero transients. The release loop there is a no-op, so the 783 ms measures how far behind
+the GPU runs, not how long a live buffer sits exposed. Every in-tree release of a live transient
+today still happens behind a real fence, `mapAsync` when something stages or `onSubmittedWorkDone`
+in `reclaimStepTransients`. What reaches the fence-free path is the public bare `sync()`, which is
+what the gate below exercises, and the trainer joins it the day a caller keeps gradients on device
+and syncs with transients outstanding.
+
+That also gives a sharper answer than "the ordering holds": putting a fence on the empty path would
+cost about 783 ms per step at a call site that releases nothing at all.
+
+**It is sound, on three legs that have nothing to do with waiting.** The premise the other two rest
+on is that `submit()` runs first: it finishes the encoder and nulls `this.enc`, so by the release
+loop every command that could touch a released buffer is already on the queue. That is what a later
+edit would break silently, by adding a release path that does not submit first or by hoisting the
+loop, and it is why a `queue.writeBuffer` issued after the release cannot run ahead of a reader that
+had not reached the queue yet. Then: a pooled buffer can only ever be touched on the queue timeline,
+because `BufferPool.acquire` creates them `STORAGE | COPY_SRC | COPY_DST` with no `MAP_READ` or
+`MAP_WRITE`, so no host mapping can reach one behind the queue's back, and every access is a
+dispatch, a copy or `clearBuffer` command, or a `queue.writeBuffer`. Readback goes through
+`copyToStaging`, which makes its own mappable buffer. And queue operations run in issue order, all
+of those being queue operations. A dispatch, copy or clear is recorded into
+a later encoder and arrives in a later submit, whose queue-timeline steps are "for each
+commandBuffer in commandBuffers: execute each command in commandBuffer.[[command_list]]"
+([spec](https://www.w3.org/TR/webgpu/#dom-gpuqueue-submit)). A host write is a `queue.writeBuffer`
+issued after that `submit()`, which is the live case rather than a hypothetical one: `uploadU32` and
+`uploadF32` acquire a transient and write it immediately, so `embedding` and `fusedCrossEntropy` do
+it on every micro-batch. Neither can overtake work submitted before it.
+
+Leg 2 is also why this is the ordinary way to drive WebGPU rather than a trick: every renderer
+rewrites its vertex and uniform buffers each frame and fences nothing. gpuweb#3809 asks for the
+ordering to be stated outright; what the spec writes down today is the ordered execution quoted
+above.
+
+**So the fence in `reclaimStepTransients` is not what makes that path safe either, and removing it
+measured no win.** That path does drain, with `onSubmittedWorkDone()` at each micro-batch boundary,
+and the same argument says it does not have to. Measured at batch 4 on the same shape, 12 steps and
+three boundaries each: 36 waits, median 1113 ms and mean 1281 ms, 46.1 s of the run's 60.4 s spent
+blocked in it. Deleting it moved the median step from 5111 ms to 4942 ms, a 169 ms shift inside a
+within-arm spread of 1007 ms, itself 20% of the median. The wait is not the saving: the CPU is
+waiting for work the GPU has to do either way, and the only thing removing the drain recovers is the
+command recording that could have overlapped it.
+
+**It is kept because deleting it buys nothing, and for no reason beyond that.** An earlier draft of
+this lever claimed a second one, that `reclaimStepTransients` is the only place in shipped code
+releasing a live in-flight transient, so deleting the drain would put the ordering argument on the
+critical path for the first time. That is false, and the review that caught it produced a better
+sentence than the one it replaced. `endRegion` pushes still-in-flight transients onto `regionFree`
+after a `submit()` and nothing else, `acquireRecycled` hands them straight to the next `makeOut`,
+and its own docstring says so outright: "No fence, and none is needed." Every `--recompute` run does
+this at every layer boundary, and `recomputeModelParity` gates it by name, "the region free-list
+actually handing a released buffer to a later makeOut". Unfenced reuse of live buffers is already
+shipped, already exercised per layer, and already covered by a whole-model parity test.
+`sync()`'s release is the same mechanism, not a new bet.
+
+Which leaves the counter-argument standing on its own, and it deserves stating, because this file
+sets the opposite precedent elsewhere ("dead code that reads like a safeguard is worse than neither,
+so it went"): a fence whose docstring now says it is not the reason is that shape. It stays because
+the alternative measured no faster, and the docstring says that rather than pretending the drain is
+load-bearing.
+
+**The gate was asserting the wrong thing too.** `syncFenceGate` ran one `linear`, called `sync()`,
+then read the output back, under the name "sync() fences GPU even with no readback". It proved
+neither half: nothing was recycled and reused in between, and there is no fence to prove. It is now
+`recycleReuseGate`, which runs a forward and a backward, empties the pool with a bare `sync()`, and
+then reuses exactly the buffers that were released. Two assertions, one mutable and one not:
+
+- The pool does not grow across the second chain. Delete the release loop in `sync()` and this
+  fires: `pool grew 299763968 -> 299788544 on reuse`. This is what proves the reuse happens at all.
+- The first chain's gradients still match the CPU. No mutation inside this repo forces it, and the
+  gate says so: it fails only if an implementation lets a later submit overtake an earlier one.
+
+Getting the first arm to be empty needed `keepGradOnDevice` on all three inputs, which the first
+draft did not have. It staged 32768 bytes of gradients, the assertion caught it, and the path under
+test would otherwise not have been exercised at all.
+
+**The backward is what makes the second arm mean anything, and the first draft did not have it.**
+Forward-only, the four recycled `[T, HID]` buffers split into two disjoint sets: `makeOut` takes a
+data buffer then a gradient buffer, the pool pops LIFO, so the second chain's writes land on the
+first chain's gradient buffers, which a forward-only graph never touches, while the first chain
+reads only its data buffers. Nothing overlaps, so no ordering violation could have perturbed the
+result, and the arm passed for a reason unrelated to what it tested. That inversion is structural
+rather than incidental: the data-then-grad acquire order puts every pop on the wrong side. With the
+backward recorded, the second chain's two data buffers are both read by work still in flight, gelu's
+backward reading one and linear's backward reading the other twice, and both feed the gradients the
+comparison checks. Backward allocates nothing, so the pool assertion is unchanged: the mutation
+number confirms it independently, 299788544 - 299763968 = 24576 = 4 x 6144, exactly the four
+buffers and nothing else.
+
+Two smaller consequences of the same fix. The chain ends in a `crossEntropy` scalar, because
+`backward` seeds `loss.grad[0]` on the host and a non-scalar output never gets its seed to the
+device. And the gradients are read from the persistent accumulators rather than from a graph
+output, whose buffer the bare `sync()` has already returned to the pool: reading that would have
+been a second way for the arm to pass without proving anything.
 
 ## Quality levers
 
