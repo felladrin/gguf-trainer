@@ -292,11 +292,11 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     die(
       webgpuRuntime() === "no-runtime"
         ? "no WebGPU: training needs Deno (Node and Bun have no GPU backend here)"
-        : "no GPU adapter found, and training needs one. The CPU backend here is a " +
-          "single-threaded correctness reference, not a training path: measured on the same " +
-          "machine and shape, it runs 15.8 tok/s at 6M parameters against the GPU's 786, and " +
-          "1.6 tok/s at 32M. For CPU fine-tuning use transformers with peft instead. " +
-          "`eval-loss`, `eval-choice` and `generate` do take --cpu, at those speeds.",
+        : "no GPU adapter found, and training needs one. There is no CPU training path, " +
+          "and that is a refusal rather than a gap: the CPU backend is the correctness oracle " +
+          "the GPU kernels are checked against, and it is orders of magnitude short of usable " +
+          "at a real size (docs/optimization.md lever 36 has the measurements). For CPU " +
+          "fine-tuning, use transformers with peft.",
     );
   }
   console.log("Device:");

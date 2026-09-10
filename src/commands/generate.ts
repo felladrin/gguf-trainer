@@ -9,7 +9,7 @@ import { loadModelFromGGUF } from "../export/load-gguf.ts";
 import { readFileBytes } from "../io.ts";
 import { greedyComplete } from "../eval/generate.ts";
 import { freezeForScoring } from "../train/loss.ts";
-import { initWebGPU } from "../backend/webgpu.ts";
+import { initWebGPU, noGpuNote } from "../backend/webgpu.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
 
@@ -30,6 +30,7 @@ async function run(v: Values) {
   freezeForScoring(model);
 
   const gpu = v.bool("cpu") ? null : await initWebGPU();
+  if (!gpu && !v.bool("cpu")) console.log(noGpuNote());
   if (gpu) {
     gpu.install();
     gpu.uploadParams(model.params());

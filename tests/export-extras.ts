@@ -237,7 +237,10 @@ for (
 {
   // deno-lint-ignore no-explicit-any
   const g = globalThis as any;
-  const saved = g.navigator;
+  // The descriptor, not the value: `navigator` is an accessor on the global in
+  // both runtimes, so restoring it as a plain data property would leave
+  // something subtly different behind.
+  const saved = Object.getOwnPropertyDescriptor(g, "navigator");
   const set = (v: unknown) =>
     Object.defineProperty(g, "navigator", { value: v, configurable: true });
   try {
@@ -266,9 +269,19 @@ for (
       `and names the runtime when that is what is missing, got ${noGpuNote()}`,
     );
   } finally {
-    set(saved);
+    if (saved) Object.defineProperty(g, "navigator", saved);
+    else delete g.navigator;
   }
-  eq(webgpuRuntime(), saved?.gpu ? "ok" : "no-runtime", "and the stub is put back");
+  // Against the saved DESCRIPTOR, not against whatever navigator happens to be:
+  // comparing the global to itself passes no matter what the finally did, which
+  // is what the first version of this assertion got wrong in both runtimes.
+  const now = Object.getOwnPropertyDescriptor(g, "navigator");
+  ok(
+    saved === undefined
+      ? now === undefined
+      : !!now && saved.get === now.get && saved.value === now.value,
+    "the real navigator descriptor is back, accessor and all",
+  );
 }
 
 console.log("export_extras: all assertions passed");

@@ -1555,19 +1555,32 @@ most of them the device banner, the trust gate and the peak-memory line. `--reco
 **The reason is throughput.** Same machine, same shape, same steps, CPU `trainLM` against GPU
 `trainLMGpuResident`:
 
-| shape                              |        CPU |         GPU |
-| ---------------------------------- | ---------: | ----------: |
-| 6.0M params, vocab 8192, seq 256   | 15.8 tok/s | 786.4 tok/s |
-| 32.0M params, vocab 16384, seq 256 |  1.6 tok/s |             |
+| shape                                                            |       CPU |       GPU |
+| ---------------------------------------------------------------- | --------: | --------: |
+| 6.0M params, vocab 8192, hidden 256, 4 layers, seq 256, 2 steps  |  16 tok/s | 786 tok/s |
+| 32.0M params, vocab 16384, hidden 512, 6 layers, seq 256, 1 step | 1.6 tok/s |           |
 
-49x at 6M, and the gap widens with size rather than closing: 5.3x the parameters cost 9.9x the time,
-an exponent of about 1.4 over that range. Extrapolating the 32M figure LINEARLY to 596M, which is
-generous against a curve that is worse than linear, gives 0.086 tok/s, about 12 seconds per token.
-A 100k-token fine-tune is 13 days; 10M tokens is 3.7 years. The same 10M on the GPU, at the 108 tok/s
-measured on that exact Qwen3-0.6B shape, is 25.7 hours.
+49x at 6M, and the gap widens with size rather than closing: 5.3x the parameters cost 9.9x the time
+over that range. Two short timings at shapes differing in four variables are not a curve, so what
+follows is an order-of-magnitude argument and nothing finer. Carrying the 32M figure LINEARLY to
+596M, generous against a trend worse than linear, puts a 596M CPU step in the range of seconds per
+token: a 100k-token fine-tune runs into weeks, and 10M tokens into years.
 
-Threads do not rescue it. The loop is scalar single-threaded JS with no worker pool and no `--threads`
-flag, and a perfect 10x from ten cores still leaves 10M tokens at 135 days.
+For the GPU at that size no extrapolation is needed, since it was measured directly:
+
+```sh
+deno run -A cli.ts pretrain --data data/lambrp.tokens --out /tmp/tps.gguf --steps 2 --batch 1 \
+  --seq-len 2048 --arch qwen3 --hidden 1024 --layers 28 --heads 16 --head-dim 128 \
+  --recompute --loss-chunk 8192
+# Training: ... 108 tok/s, peak 15839MB gpu (pool 5903 + state 9936)
+```
+
+108 and 109 tok/s over two runs, so 10M tokens is about a day. The point is the ratio of orders of
+magnitude, not the third digit on either side.
+
+Threads do not rescue it either. The loop is scalar single-threaded JS with no worker pool and no
+`--threads` flag, and even a perfect 10x from ten cores leaves that 596M estimate months short of
+useful.
 
 So shipping `--cpu` for training would be a small change that produces a trap: a flag that accepts
 the run and then never finishes. Making CPU training genuinely useful is the several-new-files

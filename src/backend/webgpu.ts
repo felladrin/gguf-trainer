@@ -1696,11 +1696,6 @@ export class WebGPUBackend implements OpsBackend {
 }
 
 /**
- * Probe for a WebGPU device. Returns null when the runtime has no WebGPU
- * (Node and Bun today: run GPU work under Deno, or provide a navigator.gpu
- * polyfill); training then stays on the CPU reference backend.
- */
-/**
  * Whether this RUNTIME exposes WebGPU at all, which is the first of the two
  * reasons `initWebGPU` returns null and the only one a caller can tell apart
  * afterwards. Deno does; Node and Bun do not.
@@ -1727,6 +1722,19 @@ export function noGpuNote(): string {
     : "(no GPU adapter found; falling back to CPU forward)";
 }
 
+/**
+ * Probe for a WebGPU device. Returns null for TWO different reasons, and a
+ * caller that reports only one of them misdirects the other's user:
+ *
+ *   - the runtime has no WebGPU at all (Node and Bun today), which
+ *     `webgpuRuntime()` reports, and which is fixed by running under Deno or
+ *     providing a navigator.gpu polyfill;
+ *   - the runtime has WebGPU but the machine has no usable adapter, which is
+ *     what a null means when `webgpuRuntime()` still says "ok".
+ *
+ * Commands that fall back use `noGpuNote()` for the wording; the two that need
+ * a device name the cause themselves.
+ */
 export async function initWebGPU(): Promise<WebGPUBackend | null> {
   if (webgpuRuntime() !== "ok") return null;
   // deno-lint-ignore no-explicit-any
