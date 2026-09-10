@@ -259,8 +259,6 @@ async function run(v: Values) {
     `${outPrefix}.template.txt`,
     new TextEncoder().encode(DEFAULT_CHAT_TEMPLATE),
   );
-  await stampTokenFile(`${outPrefix}.tokens`, tok.export(), tok.vocabSize, bpt);
-
   const src = await diskTokenSource(`${outPrefix}.tokens`, bpt);
   const maskSrc = await diskTokenSource(`${outPrefix}.mask`, bpt);
   if (src.length !== len) die(`round-trip length mismatch: wrote ${len}, read ${src.length}`);
@@ -271,6 +269,12 @@ async function run(v: Values) {
   }
   src.close();
   maskSrc.close();
+
+  // After the round trip, not before it. A file that fails the check must not
+  // ship with a valid identity beside it, or the next run reports a match on
+  // bytes nobody verified. The byte size in the stamp cannot catch that one: the
+  // file is complete, just wrong, so its size agrees.
+  await stampTokenFile(`${outPrefix}.tokens`, tok.export(), tok.vocabSize, bpt);
 
   console.log(
     `\nwrote ${outPrefix}.tokens (${bpt}B/token, ${((len * bpt) / 1e6).toFixed(1)} MB), ` +

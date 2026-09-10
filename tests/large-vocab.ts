@@ -14,6 +14,7 @@ import * as path from "node:path";
 import {
   assertCorpusFitsVocab,
   checkTokenFileId,
+  checkTokenFileWidth,
   diskTokenSource,
   idArrayFor,
   memTokenSource,
@@ -275,8 +276,9 @@ ok(
   );
 
   // The width flip, which is checked on its own: the same tokenizer with a
-  // 4-byte stamp read as 2-byte still doubles the token count and reads every
-  // second id as 0, and diskTokenSource'''s `% 2` cannot see it.
+  // 4-byte stamp read as 2-byte still doubles the token count, and
+  // diskTokenSource's `% 2` cannot see it. What the halves hold is at the
+  // bottom of this block.
   await stampTokenFile(tokensPath, a.export(), a.vocabSize, 4);
   const flipped = await verdict(a);
   ok(
@@ -363,6 +365,35 @@ ok(
   ok(
     threw !== "",
     "a stamp path that cannot be read propagates rather than reporting an unstamped file",
+  );
+
+  // The width-only path, which is all eval-loss can check. It must not go quiet
+  // on a file its sibling refuses, which is the shape this whole entry exists to
+  // close.
+  const wOnly = path.join(dir, "wonly.tokens");
+  fs.writeFileSync(wOnly, new Uint8Array([1, 0, 2, 0]));
+  ok(
+    (await checkTokenFileWidth(wOnly, 2)).status === "unstamped",
+    "no stamp means the width cannot be checked either",
+  );
+  await stampTokenFile(wOnly, a.export(), a.vocabSize, 2);
+  ok((await checkTokenFileWidth(wOnly, 2)).status === "ok", "a matching width passes");
+  const wWrong = await checkTokenFileWidth(wOnly, 4);
+  ok(
+    wWrong.status === "mismatch" && wWrong.message.includes("read as 4"),
+    "a mismatched width is refused without a tokenizer in hand",
+  );
+  fs.writeFileSync(wOnly, new Uint8Array([1, 0]));
+  const wResized = await checkTokenFileWidth(wOnly, 2);
+  ok(
+    wResized.status === "mismatch" && wResized.message.includes("is 2 bytes"),
+    "and so is a file rewritten under its own stamp, which needs no tokenizer either",
+  );
+  fs.writeFileSync(tokenIdPath(wOnly), "null");
+  const wNull = await checkTokenFileWidth(wOnly, 2);
+  ok(
+    wNull.status === "mismatch" && wNull.message.includes("not readable JSON"),
+    "a malformed stamp is refused here too, rather than reported as absent",
   );
 
   fs.rmSync(dir, { recursive: true, force: true });

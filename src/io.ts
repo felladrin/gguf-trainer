@@ -71,6 +71,27 @@ export async function writeFileBytes(
   }
 }
 
+/**
+ * A file's text, or null when it is absent.
+ *
+ * Only ENOENT means absent. Turning every read failure into "not there" is the
+ * bug pretrain's optstate probe already paid for once, where decoding a
+ * multi-GB sidecar as UTF-8 overflowed and silently reported no optstate.
+ */
+export async function readFileTextIfPresent(path: string): Promise<string | null> {
+  try {
+    return await readFileText(path);
+  } catch (e) {
+    if ((e as { code?: string }).code === "ENOENT") return null;
+    throw e;
+  }
+}
+
+export async function fileSize(path: string): Promise<number> {
+  const fs = await import("node:fs");
+  return fs.statSync(path).size;
+}
+
 export async function readFileText(path: string): Promise<string> {
   const fs = await import("node:fs");
   return fs.readFileSync(path, "utf8");

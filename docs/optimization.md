@@ -1677,15 +1677,19 @@ each id into a low and a high half.
 
 The reuse that makes it reachable is in `pretrain`'s `.txt` branch, which keeps an existing
 `${stem}.tokens` rather than rewriting it, while `sharedTokenizer` retrains the vocab whenever
-`${stem}.tokenizer.json` is missing. Delete the json, or change `VOCAB`, and the run trains on a
-token file built from a vocab that no longer exists, with every gate green.
+`${stem}.tokenizer.json` is missing. Losing the json is the trigger, and then any difference in the retrain lands a different vocab,
+whether from `VOCAB`, from `CURRICULUM_SPECIALS`, or from the corpus sample itself. Changing `VOCAB`
+with the json in place does nothing, since `sharedTokenizer` reuses the json whenever it exists. The
+run then trains on a token file built from a vocab that no longer exists, with every gate green.
 
 Nothing about an id says which vocab produced it, so the vocab is stored instead:
 `<file>.tokens.id`, a small JSON holding a SHA-256 over the exported tokenizer plus the vocab size
 and the id width. `tokenize`, `chat-corpus` and `pretrain`'s own writer stamp it; `pretrain` checks
 it in both input branches and on `--inject`, which opens a second `.tokens` with the same tokenizer
-in hand and lands on the cooldown phase. `tokenize` stamps after its round-trip self-check rather
-than before, so a file that fails the round trip cannot ship with a valid identity beside it.
+in hand and lands on the cooldown phase. `tokenize` and `chat-corpus` both stamp after their round-trip
+self-checks rather than before, so a file that fails one cannot ship with a valid identity beside it.
+The byte size cannot substitute there: such a file is complete on disk and merely wrong, so its size
+agrees, and stamping first would turn what used to be an unstamped file into a false ok.
 The stamp also carries the file's byte size: without it a stale stamp beside a rewritten file
 reports a false ok, which is worse than no stamp, and a crash between the write and the stamp is
 indistinguishable from a legacy file. Hashing the whole export rather than the size catches the case a size
@@ -1704,8 +1708,8 @@ error: mini.tokens was tokenized with a different tokenizer: vocab 336 against t
 Exit 1, where before it trained.
 
 **An unstamped file is neither an error nor a pass.** Files written before this existed cannot be
-checked, and the run says so in a line of its own rather than staying quiet and implying a check
-happened. It is the shape of decision invariant 3 already makes for a missing `.optstate`, which
+checked, and both `pretrain` and `eval-loss` say so in a line of their own rather than staying quiet
+and implying a check happened. It is the shape of decision invariant 3 already makes for a missing `.optstate`, which
 re-warms rather than failing.
 
 Backfilling the 23 `.tokens` on this machine would be cheap, not the obstacle: 22 have a sibling
@@ -1741,7 +1745,7 @@ The cases live in `tests/large-vocab.ts`, beside the preflight's. Reporting an u
 dropping the width comparison, hashing only the vocab size, and treating an unparseable stamp as
 absent, dropping the byte-size comparison, dropping the object guard that keeps a stamp of `null`
 from throwing a TypeError instead of a message, and widening the read to treat every failure as
-absent rather than only ENOENT, each fail one. Two more pin what the rest of this entry asserts rather than leaving it as
+absent rather than only ENOENT. Seven mutations, seven distinct assertions. Two more pin what the rest of this entry asserts rather than leaving it as
 prose: that the fingerprint survives a json round trip through `fromData`, which is the failure that
 would refuse correct corpora rather than admit wrong ones; and the width flip itself, through
 `writeTokenFile` and `diskTokenSource`. That second one corrected this entry: reading a 4-byte file
@@ -1749,8 +1753,8 @@ as 2-byte splits each id into its low and high halves, and the high halves are 0
 65,536. "Every second id reads as 0" was the common case written up as the rule, and a corpus that
 crossed the u16 ceiling is precisely the one where it is false.
 
-What no test reaches is the call sites. Deleting `assertTokenFileId` from any of the four leaves the
-suite green; the end-to-end run above is the evidence, and it is not repeatable in CI.
+What no test reaches is the call sites. Deleting `assertTokenFileId` from any of the three leaves
+the suite green; the end-to-end runs above are the evidence, and they are not repeatable in CI.
 
 ## Quality levers
 

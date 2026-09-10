@@ -78,8 +78,14 @@ async function run(v: Values) {
   // bytesPerToken is a pure function of the vocab size both sides already agree
   // on, and it is exactly the mismatch assertCorpusFitsVocab catches only by
   // luck, when some low half of a 4-byte id happens to exceed the vocab.
-  const width = checkTokenFileWidth(tokensPath, tokenBytes(cfg.vocabSize));
+  const width = await checkTokenFileWidth(tokensPath, tokenBytes(cfg.vocabSize));
   if (width.status === "mismatch") die(width.message);
+  if (width.status === "unstamped") {
+    console.log(
+      `Token file: ${tokensPath} predates the .id stamp, so its id width cannot be checked ` +
+        `against this checkpoint. Rebuild it to get the check.`,
+    );
+  }
   const src = await diskTokenSource(tokensPath, tokenBytes(cfg.vocabSize));
   // Held-out region: the last `holdout` fraction of the stream. maxStart leaves
   // room for the input window plus its +1-shifted target.
