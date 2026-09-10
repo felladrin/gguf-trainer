@@ -409,14 +409,19 @@ async function run(v: Values) {
     // streaming loop below never does.
     let total = 0, encoded = 0;
     for (const it of evalItems) {
-      const pairs = it.choices.map((ch) => renderPair(task.render, withPreamble(preamble, it), ch));
+      const ctx = withPreamble(preamble, it);
+      const pairs = it.choices.map((ch) => renderPair(task.render, ctx, ch));
       const pre = preflightByBytes(pairs, cfg.maxSeq);
       if (pre.empty) {
         const which = pre.empty;
         const p = pairs.find((q) => (which === "stem" ? q.ctxOnly : q.choiceText).length === 0)!;
         die(
           `${taskName}: an item's ${which} rendered to nothing, so it cannot be scored. ` +
-            `The pair reads ${JSON.stringify(`${p.ctxOnly}|${p.choiceText}`.slice(0, 80))}`,
+            // The stem's TAIL: at any --shots its head is the preamble's opening,
+            // identical for every item, so the head would identify nothing.
+            `The pair reads ${
+              JSON.stringify(`${p.ctxOnly.slice(-60)}|${p.choiceText.slice(0, 40)}`)
+            }`,
         );
       }
       for (const p of pre.needExactCheck) {

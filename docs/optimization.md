@@ -1477,13 +1477,13 @@ proportionate gain.
 The check does not need a tokenizer, and that is what makes it free rather than cheap. This repo's
 BPE is byte-level, so **every token covers at least one UTF-8 byte**: a rendered choice under
 `maxSeq` bytes cannot reach `maxSeq` tokens, and a non-empty stem encodes to at least one. The pass
-walks strings the scoring loop was going to render anyway, and only a choice longer than the model's
+walks strings the scoring loop was going to render anyway, and only a choice whose byte count reaches the model's
 whole declared context gets encoded. On the shipped tasks that is none.
 
 **Bytes, and not characters, and I shipped characters first.** `String.length` counts UTF-16 units
 and does not bound the token count at all: a byte-level BPE falls back to one token per byte for
-anything its merges do not cover, so a single three-byte character can be three tokens and the ratio
-runs to 3x on non-ASCII. Measured against the 151936-entry Qwen3 vocab in
+anything its merges do not cover, so a single three-byte BMP character can be three tokens, which is
+the worst case by construction rather than a figure anyone measured. Measured against the 151936-entry Qwen3 vocab in
 `data/lambrp-hold.tokenizer.json`, `⸻` is one character and two tokens and `ᚠᚢᚦ` is three characters
 and six. The character version was unsound in the dangerous direction, quietly passing an item it was
 meant to catch, and both ARC and HellaSwag carry non-ASCII text.

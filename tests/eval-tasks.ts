@@ -256,8 +256,10 @@ for (const [nCtx, nChoice, maxSeq] of [[20, 10, 512], [100, 10, 105], [600, 10, 
 //
 // BYTES, not characters. This repo's BPE is byte-level, so every token covers at
 // least one UTF-8 byte and the byte count bounds the token count by
-// construction. `String.length` does not: measured with the repo's own
-// tokenizer, "\u2e3b" is one UTF-16 unit and two tokens.
+// construction. `String.length` does not: a character whose bytes no merge
+// covers decomposes to one token per byte, so U+2E3B is one UTF-16 unit and
+// three tokens under the ASCII-trained fixture below, and two under the
+// 151936-entry Qwen3 vocab. Either way, more than one.
 {
   const pair = (ctxOnly: string, choiceText: string) => ({ ctxOnly, choiceText });
   const maxSeq = 16;
