@@ -1844,10 +1844,10 @@ that is listed and broken. Worth noting that a Node job would not have caught #8
 `test:node` was green then, and would have been green in CI, because `eval-tasks.ts` was not in the
 list.
 
-### 40. The last two guards under a backend dispatch came up above it (2026-09-10)
+### 40. The loss guards came up above the backend dispatch (2026-09-10)
 
-Filed as #82, noted in lever 30 while fixing #61, and the last instance of the pattern those changes
-argued against. `crossEntropy` dispatched before it validated:
+Filed as #82, noted in lever 30 while fixing #61, and the last instance of that pattern in the loss
+path. `crossEntropy` dispatched before it validated:
 
 ```ts
 export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
@@ -1887,9 +1887,23 @@ Two things improve on the way. A malformed target now refuses before `beginForwa
 any `entryFor`, where it used to refuse after both, so nothing is left half-recorded and no pooled
 buffer is taken. And `webgpu.ts` drops its import of `keptRowsInVocab` entirely.
 
-`targetRangeGate` already had the arms, exactly as #82 predicted: pushing either guard back below
-its dispatch turns `dense true` into `dense false`, or `fused true` into `fused false`, while every
-CPU case still passes. Measured both ways.
+`targetRangeGate` already had the arms, exactly as #82 predicted. The mutation that reproduces the
+finding is no longer "move the call below the dispatch", which will not compile now that the
+dispatch line reads `kept`. It is the loophole above: give the dispatch a bare counting loop instead
+of the validator's return.
+
+```ts
+if (opsBackend) {
+  let n = 0;
+  for (let t = 0; t < T; t++) if (targets[t] >= 0) n++;
+  return opsBackend.crossEntropy(logits, targets, n);
+}
+```
+
+That turns `dense true` into `dense false`, and the same shape on the fused path turns `fused true`
+into `fused false`, while every CPU case passes. Measured both ways, and the detail worth keeping is
+that the legal arm's loss does not move: 1.6022 either way. The loophole computes the right
+denominator and skips the validation, which is why nothing but a placement gate catches it.
 
 **One instance of the gap shape remains, and it is not this one.** `linearRaw` checks
 `inDim !== inDim2` below its dispatch and `webgpu.ts` repeats the identical check with the identical

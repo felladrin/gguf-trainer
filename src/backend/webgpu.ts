@@ -1192,16 +1192,17 @@ export class WebGPUBackend implements OpsBackend {
   /**
    * As fusedCrossEntropy: validated above the dispatch, `kept` passed down.
    *
-   * The check itself cannot move onto the device, whoever calls it. The logits
+   * No kernel could make this check, wherever it is called from. The logits
    * buffer is bound whole, so LOG[t * V + tgt] with tgt >= V is an in-bounds
    * read of the next row, measured identical to the CPU's wrong value rather
    * than trapping.
    *
    * Validating in the wrapper also made a claim true that the old comment here
    * asserted and did not deliver: a refusal now leaves no pool state behind.
-   * The check used to sit after entryFor(logits), which for a first-seen host
-   * tensor takes two persistent buffers, writes the upload, registers an entry
-   * and queues a clear.
+   * The check used to sit after entryFor(logits), which for a first-seen
+   * trainable host tensor takes two persistent buffers, writes the upload,
+   * registers an entry and queues a clear. (A frozen one takes one buffer plus
+   * the shared stub and queues nothing, but every caller here is trainable.)
    */
   crossEntropy(logits: Tensor, targets: number[], kept: number): Tensor {
     this.beginForwardOp();
