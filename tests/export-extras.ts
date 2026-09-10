@@ -248,13 +248,42 @@ for (
     eq(webgpuRuntime(), "no-runtime", "no navigator at all is a runtime problem");
     set({});
     eq(webgpuRuntime(), "no-runtime", "a navigator without .gpu is too: Node has one");
-    // initWebGPU has to take this same test rather than its own copy, or the
-    // two drift and the message goes back to guessing. With a navigator that
-    // has no .gpu it must return null, not reach for nav.gpu.requestAdapter.
-    ok(
-      (await initWebGPU()) === null,
-      "initWebGPU returns null on a navigator without .gpu rather than throwing",
-    );
+    // initWebGPU must return null rather than throw for every shape of broken
+    // navigator, since a throw is the stack trace this whole change exists to
+    // replace. The polyfill route the docblock advertises is where partial
+    // implementations show up, so the list is not hypothetical.
+    for (
+      const [label, nav] of [
+        ["undefined", undefined],
+        ["no .gpu", {}],
+        ["gpu without requestAdapter", { gpu: {} }],
+        ["requestAdapter throws synchronously", {
+          gpu: {
+            requestAdapter: () => {
+              throw new Error("boom");
+            },
+          },
+        }],
+        ["requestAdapter rejects", {
+          gpu: { requestAdapter: () => Promise.reject(new Error("x")) },
+        }],
+        ["requestAdapter returns null", { gpu: { requestAdapter: () => null } }],
+      ] as [string, unknown][]
+    ) {
+      set(nav);
+      let threw = false;
+      let got: unknown = "not-null";
+      try {
+        got = await initWebGPU();
+      } catch {
+        threw = true;
+      }
+      ok(
+        !threw && got === null,
+        `initWebGPU returns null rather than throwing: navigator ${label}`,
+      );
+    }
+    set({});
     set({ gpu: {} });
     eq(webgpuRuntime(), "ok", "a navigator with .gpu is a runtime that could have an adapter");
     // Which is the whole point: "ok" here plus a null from initWebGPU means the

@@ -1700,10 +1700,15 @@ export class WebGPUBackend implements OpsBackend {
  * reasons `initWebGPU` returns null and the only one a caller can tell apart
  * afterwards. Deno does; Node and Bun do not.
  *
- * Exported so a caller that got null can say which exit was taken without
- * re-deriving the test, and used by `initWebGPU` itself so the two cannot
- * drift. If this says "ok" and `initWebGPU` still returned null, the machine
- * has no usable adapter.
+ * Exported for the caller that got null and has to say which exit was taken:
+ * if this says "ok" and `initWebGPU` still returned null, the machine has no
+ * usable adapter.
+ *
+ * `initWebGPU` does NOT call this. It used to, as a first-line guard, and the
+ * guard turned out to be unobservable once the adapter request was wrapped:
+ * measured across six shapes of broken navigator, from undefined through a
+ * `requestAdapter` that throws synchronously, removing it changed nothing. Dead
+ * code that reads like a safeguard is worse than neither, so it went.
  */
 export function webgpuRuntime(): "ok" | "no-runtime" {
   // deno-lint-ignore no-explicit-any
@@ -1736,13 +1741,22 @@ export function noGpuNote(): string {
  * a device name the cause themselves.
  */
 export async function initWebGPU(): Promise<WebGPUBackend | null> {
-  if (webgpuRuntime() !== "ok") return null;
   // deno-lint-ignore no-explicit-any
   const nav: any = (globalThis as any).navigator;
-  // Caught, not just null-checked: the spec resolves null on an adapterless
-  // machine, but a runtime that rejects instead would give the one user this
-  // whole change is for a stack trace rather than any of the five messages.
-  const adapter = await nav.gpu.requestAdapter().catch(() => null);
+  // The whole probe, not just the adapter's null: this is the ONLY exit for a
+  // runtime without WebGPU too, since `nav.gpu` is then undefined and the call
+  // throws in here. try/catch rather than `.catch` because a partial
+  // navigator.gpu polyfill, which the docblock advertises as supported, can
+  // reject, throw synchronously, be absent, or return a non-promise, and only
+  // the first of those is a rejection. All four reach the "no adapter" message
+  // rather than a stack trace.
+  // deno-lint-ignore no-explicit-any
+  let adapter: any = null;
+  try {
+    adapter = await nav.gpu.requestAdapter();
+  } catch {
+    adapter = null;
+  }
   if (!adapter) return null;
   // Request the adapter's own maximum buffer limits instead of the WebGPU
   // spec's conservative default (128 MiB per storage buffer binding).

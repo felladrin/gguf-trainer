@@ -1580,8 +1580,9 @@ reads stronger for conceding it.
 | 6.0M params, vocab 8192, hidden 256, 4 layers, seq 256, 2 steps  |  16 tok/s | 786 tok/s |
 | 32.0M params, vocab 16384, hidden 512, 6 layers, seq 256, 1 step | 1.6 tok/s |           |
 
-49x at 6M, and the gap widens with size rather than closing: 5.3x the parameters cost 9.9x the time
-over that range. Two short timings at shapes differing in four variables are not a curve, so what
+49x at 6M, and CPU throughput falls faster than the parameter count rises: 5.3x the parameters cost
+10x the time over that range. That pair says nothing about the GPU side, which is measured
+separately below; what widens the gap is that the GPU scales the other way. Two short timings at shapes differing in four variables are not a curve, so what
 follows is an order-of-magnitude argument and nothing finer. Carrying the 32M figure LINEARLY to
 596M, generous against a trend worse than linear, puts a 596M CPU step in the range of seconds per
 token: a 100k-token fine-tune runs into weeks, and 10M tokens into years.
