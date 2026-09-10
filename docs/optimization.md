@@ -2317,6 +2317,58 @@ No test file, deliberately. `bench` needs a GPU and is not in `deno task test`, 
 every real invocation, which is where it belongs. The property it depends on, that
 `keepGradOnDevice` empties the staging list, is already pinned in `recycleReuseGate`.
 
+### 46. Bun, the runtime principle 1 named and nothing checked (2026-09-10)
+
+Filed as #97 while reviewing #94. Principle 1 says everything the model itself needs must run on
+Deno, Bun and Node with no npm install. There was a `test` task and a `test:node` task. Nothing for
+Bun, so #94 left the claim enforced for two runtimes out of the three it names.
+
+**The probe answered the first question immediately and the interesting one second.** All 21 files
+run clean under Bun 1.4.2 on `ubuntu-latest`, in 12s beside the Deno job's 19s, with the same skip
+profile as Node: `gpu-parity.ts` prints its no-WebGPU SKIP, `large-file-write.ts` leaves its big-IO
+case behind `GGUF_TRAINER_BIG_IO=1`. So a job was warranted rather than an edit to the principle.
+
+**Then `bun run tests/npm-deps.ts` passed, and that is the finding.** That file is the one Node
+cannot load: it statically imports `@huggingface/jinja`, a bare specifier that resolves through
+Deno's import map, and with no `node_modules` it is `ERR_MODULE_NOT_FOUND`. Under Bun it works. Not
+because Bun resolves it, but because Bun downloads the package from the registry at runtime:
+
+```
+bun run --no-install tests/npm-deps.ts
+  error: Cannot find module '@huggingface/jinja' from '.../tests/npm-deps.ts'
+bun run tests/npm-deps.ts
+  passes
+```
+
+A Bun job that ran the files plainly would therefore satisfy "no npm install" by installing, and
+would go green while proving the opposite of what it claims. That is the #83 shape again, one layer
+down: a check whose green means something other than what its name says.
+
+So `--no-install` is in the task rather than in the workflow, since it is a property of what the
+task asserts and not of where it runs. All 21 files still pass with it, which is what makes the
+flag free to take. `npm-deps.ts` is exempt under Bun for the same reason it is under Node, with the
+auto-install caveat recorded beside it so nobody "fixes" the exemption by deleting the flag.
+
+**`tests/task-coverage.ts` went from two lists to three, as a table rather than a third copy of the
+loop.** Its whole reason for existing is that two hand-maintained strings in `deno.json` drifted
+from `tests/` and nothing compared them, so growing it by copy-paste would have been the joke
+telling itself. Dropping a file from `test:bun` now fails with the file, the task and the command to
+run:
+
+```
+tests/eval-tasks.ts is not run by `deno task test:bun` and has no exemption entry. Run
+`bun run --no-install tests/eval-tasks.ts`: if it passes, add it to the task; if it cannot load,
+add it to this file's exemption map with what fails
+```
+
+Pasting `node tests/eta-fmt.ts` into the Bun string fails the same way, because the check matches
+the runner and not just the path.
+
+**What the Bun job catches that the Node one cannot.** Not stricter syntax: Bun runs TypeScript
+natively rather than through Node's stripper, so it accepts things Node refuses. What it covers is a
+Web API or a `node:` builtin behaving differently there, which is the half of principle 1 that had
+no check at all.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

@@ -38,10 +38,16 @@ jobs:
   # green. That is not hypothetical: #83 was a static `hyparquet` import that
   # kept three test files out of the Node task entirely.
   #
-  # PROBE, not the shipped shape: does the suite run under Bun at all? Principle
-  # 1 names three runtimes and CI enforces two (#97). Nothing here is decided
-  # until this reports, including the exemption set, which has no reason to be
-  # the Node one: Bun runs TypeScript natively rather than through a stripper.
+  # The third runtime principle 1 names (#97). Bun runs TypeScript natively
+  # rather than through Node's stripper, so this is a different check and not a
+  # stricter one: what it catches is a Web API or a node: builtin that behaves
+  # differently there, not syntax the stripper cannot erase.
+  #
+  # `--no-install` is the load-bearing part, and it is in the task rather than
+  # here. Without it Bun silently downloads a missing npm package from the
+  # registry at runtime, so a job that ran the files plainly would satisfy
+  # "no npm install" by installing. Measured: `bun run tests/npm-deps.ts` passes
+  # by default and fails `--no-install` with `Cannot find module`.
   bun:
     runs-on: ubuntu-latest
     steps:
@@ -56,11 +62,6 @@ jobs:
         run: bun --version
       - name: Bun compatibility
         run: deno task test:bun
-      - name: PROBE, what needs auto-install
-        run: |
-          echo "--- npm-deps, the one file that imports npm packages ---"
-          bun run --no-install tests/npm-deps.ts && echo "PROBE: npm-deps passed --no-install" || echo "PROBE: npm-deps FAILED --no-install"
-          bun run tests/npm-deps.ts && echo "PROBE: npm-deps passed by default" || echo "PROBE: npm-deps FAILED by default"
 
   # Two versions, both pinned. 22.6.0 is the exact floor readme.md promises and
   # the first release with --experimental-strip-types, so this entry tests the

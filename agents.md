@@ -378,8 +378,9 @@ repo.
   `var<workgroup>` storage also needs an entry in `tests/kernel-limits.ts`, which asserts the
   emitted WGSL stays under WebGPU's 16 KiB portable floor: no runtime here validates that limit, so
   nothing else will tell you. All suites must pass: `deno task test`, which type-checks the tree
-  first (`deno task check`) because `deno run` does not, and `deno task test:node`, which CI runs
-  on Node 22.6 and 24.
+  first (`deno task check`) because `deno run` does not, `deno task test:node`, which CI runs on
+  Node 22.6 and 24, and `deno task test:bun`, which CI runs on the current Bun with
+  auto-install off.
 - The reference backend stays dependency-free and runtime-agnostic (Deno, Bun, Node).
 - The `gemma3` tensor names and metadata keys are a contract with llama.cpp. Changing them breaks
   every published checkpoint.
