@@ -884,8 +884,7 @@ export class WebGPUBackend implements OpsBackend {
     this.beginForwardOp();
     this.curLabel = "linear";
     const [T, inDim] = x.shape;
-    const [outDim, inDim2] = w.shape;
-    if (inDim !== inDim2) throw new Error(`linear dim mismatch ${inDim} vs ${inDim2}`);
+    const [outDim] = w.shape;
     const ex = this.entryFor(x);
     const ew = this.entryFor(w);
     const { t: out, e: eo } = this.makeOut([T, outDim], [x, w]);
@@ -1221,9 +1220,7 @@ export class WebGPUBackend implements OpsBackend {
     this.beginForwardOp();
     this.curLabel = "fusedCe";
     const [T, H] = hidden.shape;
-    const [V, H2] = w.shape;
-    if (H !== H2) throw new Error(`fusedCrossEntropy dim mismatch ${H} vs ${H2}`);
-    if (chunk <= 0) throw new Error(`fusedCrossEntropy chunk must be positive, got ${chunk}`);
+    const [V] = w.shape;
     const eh = this.entryFor(hidden);
     const ew = this.entryFor(w);
     const tgtBuf = this.uploadU32(targets); // a target of -1 uploads as 0xffffffff (ignore)

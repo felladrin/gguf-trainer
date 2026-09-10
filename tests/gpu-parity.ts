@@ -2182,7 +2182,7 @@ async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
 }
 
 /**
- * Out-of-range indices, refused on the host, with an installed backend.
+ * Malformed op inputs, refused on the host, with an installed backend.
  *
  * Every refusal arm here pins placement. Each guard sits ABOVE the backend
  * dispatch, so no backend can skip it, and moving any of them below leaves the
@@ -2195,8 +2195,14 @@ async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
  * reproduces it is a bare counting loop in the validator's place, which lever
  * 40 spells out.
  *
+ * Three arms are not about ids at all, and arrived with lever 42. `linear` is
+ * the same placement check for a shape rather than an index, and the last of
+ * that shape in the op set. `fusedDim` and `fusedChunk` pin the two wrapper
+ * guards whose GPU duplicates that lever deleted, which is what makes deleting
+ * them safe rather than merely tidy.
+ *
  * The `scores` conjunct is not one of them. It is the control: a guard that
- * refused everything would pass all five refusal arms, and reading `loss.data`
+ * refused everything would pass all eight refusal arms, and reading `loss.data`
  * before the sync would pass on an unwritten buffer.
  *
  * No kernel could catch the loss cases, wherever the check is called from: the
@@ -2250,12 +2256,40 @@ async function targetRangeGate(gpu: WebGPUBackend) {
       () => crossEntropy(flat, flatTargets),
       /^crossEntropy: logits must be 2-D/,
     );
-    const ok = dense && fused && embed && soft && rank && scores;
+    // linear's contracted-dimension check, hoisted above the dispatch in #91.
+    // It was the last guard in autograd.ts that lived in the CPU body, covered
+    // on the GPU path only because webgpu.ts repeated it with the same message.
+    // Put it back below `if (opsBackend)` and this arm turns false while every
+    // CPU caller keeps passing, which is what the duplicate was hiding.
+    const badW = randTensor([V, H + 1], mulberry32(41));
+    const linearDim = refused(() => linear(hid, badW), /^linear dim mismatch: x is \[/);
+    // fusedCrossEntropy's own dim and chunk guards. The wrapper has checked both
+    // above the dispatch since before #82, and webgpu.ts repeated them with the
+    // identical message until #91 deleted the copies. These two arms are what
+    // says the copies were dead rather than load-bearing: they fail if the
+    // wrapper ever stops checking, which is the only way deleting them bites.
+    const fusedDim = refused(
+      () => fusedCrossEntropy(hid, badW, [0, 1, 1], 2),
+      /^fusedCrossEntropy dim mismatch/,
+    );
+    // This one does not fail cleanly if the wrapper's guard goes: with a backend
+    // installed the dispatch reaches webgpu.ts's span builder, which never
+    // advances on a zero chunk and allocates until the heap is gone. The suite
+    // dies here with `Fatal JavaScript out of memory` and exit 133 rather than a
+    // mismatch line and exit 1. Caught either way, but do not go looking for the
+    // assertion that fired.
+    const fusedChunk = refused(
+      () => fusedCrossEntropy(hid, w, [0, 1, 1], 0),
+      /^fusedCrossEntropy chunk must be positive/,
+    );
+    const ok = dense && fused && embed && soft && rank && linearDim && fusedDim &&
+      fusedChunk && scores;
     if (!ok) failures++;
     console.log(
-      `  ${ok ? "ok " : "FAIL"} GPU refuses malformed loss inputs ` +
+      `  ${ok ? "ok " : "FAIL"} GPU refuses malformed op inputs ` +
         `(dense ${dense}, fused ${fused}, embedding ${embed}, softCE ${soft}, ` +
-        `rank ${rank}, V-1 scores ${good.data[0].toFixed(4)})`,
+        `rank ${rank}, linear ${linearDim}, fusedDim ${fusedDim}, ` +
+        `fusedChunk ${fusedChunk}, V-1 scores ${good.data[0].toFixed(4)})`,
     );
   } finally {
     // The legal arm above recorded work; draining here keeps the gate
