@@ -2214,6 +2214,13 @@ that all three worries were unfounded.** Measured by running it:
 Locally for comparison, `test:node` is 6.9s against `test`'s 14.8s, because the GPU parity file
 skips without a WebGPU adapter under Node.
 
+**What the job does not prove, since a green matrix entry is easy to over-read.** Of the 21 files,
+20 run their checks under Node; `gpu-parity.ts` prints `SKIP: no WebGPU in this runtime` and exits
+0, which is correct behaviour and also zero coverage there. `large-file-write.ts` runs its round
+trips but leaves its big-IO case behind `GGUF_TRAINER_BIG_IO=1`, skipped under both runners. The
+exit code does propagate: the task chains with `&&`, and an injected `process.exit(3)` in the first
+file surfaced as `task exit=3` rather than being swallowed.
+
 **Two versions rather than one.** `22` is the floor `--experimental-strip-types` needs, and the
 oldest supported runtime is where a syntax the stripper cannot erase shows up first. `lts/*` is what
 someone actually has installed, and catches a regression the floor cannot see. `fail-fast: false`
