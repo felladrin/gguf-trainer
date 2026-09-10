@@ -56,13 +56,14 @@ jobs:
         run: bun --version
       - name: Bun compatibility
         run: deno task test:bun
-      - name: PROBE, does npm-deps load under Bun
+      - name: PROBE, how does npm-deps resolve under Bun
         run: |
-          ls node_modules 2>/dev/null && echo "node_modules EXISTS" || echo "no node_modules"
-          bun run tests/npm-deps.ts && echo "PROBE: npm-deps PASSED under bun" \
-            || echo "PROBE: npm-deps FAILED under bun (exit $?)"
-          ls node_modules 2>/dev/null && echo "node_modules EXISTS AFTER" || echo "no node_modules after"
-
+          echo "--- cache before ---"; ls ~/.bun/install/cache 2>/dev/null | head -5 || echo none
+          echo "--- with auto-install off ---"
+          bun run --no-install tests/npm-deps.ts && echo "PROBE: passed with --no-install" || echo "PROBE: FAILED with --no-install"
+          echo "--- default ---"
+          bun run tests/npm-deps.ts && echo "PROBE: passed by default" || echo "PROBE: FAILED by default"
+          echo "--- cache after ---"; ls ~/.bun/install/cache 2>/dev/null | head -5 || echo none
 
   # Two versions, both pinned. 22.6.0 is the exact floor readme.md promises and
   # the first release with --experimental-strip-types, so this entry tests the
