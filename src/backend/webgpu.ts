@@ -346,7 +346,12 @@ export class WebGPUBackend implements OpsBackend {
    * Recycling mid-graph buffers through the pool would not break them, but it
    * would make every one of those call sites depend on the submit happening,
    * which is a thing a future change can quietly remove. A private list only
-   * `makeOut` draws from needs no such argument at any of them.
+   * `makeOut` draws from keeps those three off the argument.
+   *
+   * It does not put `makeOut` itself off it, which the payoff line above used
+   * to imply: the loss backwards write their seed into an eo.grad that came
+   * from here, so one writeBuffer site does depend on a submit having happened,
+   * and ensureBackwardBegun is what supplies it. See endRegion and lever 20.
    */
   private regionFree: { buf: GpuBuffer; size: number }[] = [];
   private regionsOpened = 0;
@@ -679,9 +684,14 @@ export class WebGPUBackend implements OpsBackend {
    * write is issued after a submit, so it cannot run ahead of a reader: every
    * loss backward seeds its eo.grad that way, and seedGradFromHost does the
    * same, on a buffer makeOut can have drawn from regionFree, and
-   * ensureBackwardBegun submits immediately before it. (This comment used to
-   * claim no regionFree buffer reaches a writeBuffer at all; lever 20 and 41
-   * carry why that was wrong.) What submit() does is hand the
+   * ensureBackwardBegun submits immediately before it. The always-true form is
+   * that a submit has happened since the buffer's last reader was recorded:
+   * ensureBackwardBegun early-returns once backwardBegun is set, and a repeat
+   * seedGradFromHost inside one backward gets no submit of its own, which is
+   * harmless only because nothing was recorded in between and this.enc is still
+   * null. (This comment used to claim no regionFree buffer reaches a writeBuffer
+   * at all; lever 20 carries why that was wrong, and lever 41 the ordering
+   * argument underneath.) What submit() does is hand the
    * recorded work to the GPU at every layer boundary instead of accumulating a
    * whole micro-batch into one pass, and that overlap is what lever 20 credits
    * for the throughput. Remove it and every test still passes while the headline

@@ -1934,15 +1934,17 @@ the window, and the comment that justified it read:
 
 Those completions are the `await`s over `stagings`. When nothing stages there are none, so the
 sentence proved nothing: the loop released buffers on the strength of a fence that did not happen.
-`train-gpu.ts` calls `gpu.sync(normTensors)` at every optimizer flush with both parameter groups kept on device, and `normTensors` is empty unless MuonClip is on, so the ordinary training step takes the empty-await path once per step.
+`train-gpu.ts` calls `gpu.sync(normTensors)` at every optimizer flush with both parameter groups
+kept on device, and `normTensors` is empty unless MuonClip is on, so the ordinary training step
+takes the empty-await path once per step.
 
 **How far behind the GPU is at that point: a median of 783 ms.** Measured by inserting an
 `onSubmittedWorkDone()` on the empty path and timing it, on a 6-layer 512-hidden gemma3 step at
 batch 2 and sequence 512.
 
 **But no shipped path releases a live transient that way, which the issue got wrong and so did the
-first draft of this lever.** `this.transients` is already empty at that call site: `sync(losses)`
-one line earlier drained the list, and `opt.recordStep()` allocates only optimizer state, which does
+first draft of this lever.** `this.transients` is already empty at that call site: the loss sync five lines
+earlier drained the list, and `opt.recordStep()` allocates only optimizer state, which does
 not come from the pool. Measured over four steps: nine syncs, four with nothing staged, and all four
 released zero transients. The release loop there is a no-op, so the 783 ms measures how far behind
 the GPU runs, not how long a live buffer sits exposed. Every in-tree release of a live transient
@@ -2008,16 +2010,15 @@ load-bearing.
 then read the output back, under the name "sync() fences GPU even with no readback". It proved
 neither half: nothing was recycled and reused in between, and there is no fence to prove. It is now
 `recycleReuseGate`, which runs a forward and a backward, empties the pool with a bare `sync()`, and
-then reuses exactly the buffers that were released. Two assertions, one mutable and one not:
+then reuses exactly the buffers that were released. Three checks, only one of them mutable from
+inside the repo:
 
+- The bare `sync()` stages nothing. Without it the gate is not on the path under test at all, which
+  is what the first draft got wrong: it staged 32768 bytes of gradients and this check caught it.
 - The pool does not grow across the second chain. Delete the release loop in `sync()` and this
   fires: `pool grew 299763968 -> 299788544 on reuse`. This is what proves the reuse happens at all.
 - The first chain's gradients still match the CPU. No mutation inside this repo forces it, and the
   gate says so: it fails only if an implementation lets a later submit overtake an earlier one.
-
-Getting the first arm to be empty needed `keepGradOnDevice` on all three inputs, which the first
-draft did not have. It staged 32768 bytes of gradients, the assertion caught it, and the path under
-test would otherwise not have been exercised at all.
 
 **The backward is what makes the second arm mean anything, and the first draft did not have it.**
 Forward-only, the four recycled `[T, HID]` buffers split into two disjoint sets: `makeOut` takes a

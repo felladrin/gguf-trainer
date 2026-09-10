@@ -160,7 +160,7 @@ Both backends are complete and pass end-to-end:
   - `tests/gpu-parity.ts`: GPU-vs-CPU forward and backward parity per op, finite differences run
     directly against GPU forwards, whole-model gradient parity, cross-micro-batch gradient
     accumulation, GPU trajectory parity vs CPU for Muon, WSD, MuonClip, and AdamW (with its
-    grad-norm clip), and sync() fence verification. 33 cases total. Skips cleanly where WebGPU is
+    grad-norm clip), and sync() fence verification [now the opposite check, #87]. 33 cases total. Skips cleanly where WebGPU is
     unavailable.
 
 Implemented overall: GGUF v3 writer/reader (+ checkpoint loader), F16/Q8_0/Q4_0 (de)quantizers,
@@ -177,6 +177,9 @@ disk-streaming token loader, and training loops for both backends.
 host `data`/`grad` arrays are stale until `await gpu.sync()`: the one unavoidable async point
 (WebGPU readback is async-only). `sync()` always fences GPU completion, even with nothing to read
 back (a 4-byte staging copy acts as the fence; see the fence comment in `webgpu.ts`).
+[Corrected 2026-09-10, #87: there is no sentinel copy and no fence on that path. `sync()` builds its
+staging list from the reads and the touched externals, so with nothing to stage it awaits nothing,
+and what makes the recycle safe is queue ordering. Lever 41.]
 
 The **device-resident training loop** (`trainLMGpuResident` in `src/backend/train-gpu.ts`) uses two
 syncs per step: the first flushes forward+backward and reads the loss scalars; the optimizer
