@@ -1912,17 +1912,16 @@ into `fused false`, while every CPU case passes. Measured both ways, and the det
 that the legal arm's loss does not move: 1.6022 either way. The loophole computes the right
 denominator and skips the validation, which is why nothing but a placement gate catches it.
 
-**One instance of the gap shape remains, and it is not this one** (closed in lever 42).
-`linearRaw` checks
-`inDim !== inDim2` below its dispatch and `webgpu.ts` repeats the identical check with the identical
-message. No gap today, same as here, and hoisting it is a different change to a different function.
+**One instance of the gap shape remained, and it was not this one** (closed in lever 42).
+`linearRaw` checked `inDim !== inDim2` below its dispatch and `webgpu.ts` repeated the identical
+check with the identical message. No gap today, same as here, and hoisting it is a different change to a different function.
 Filed as #91 rather than folded in, since `linear` is the hottest op in the graph and "the check is
 free" wants measuring rather than asserting.
 
-Two duplicates in `fusedCrossEntropy`'s GPU path are a different leftover: `H !== H2` and
-`chunk <= 0` are repeated there with identical messages, and the wrapper has checked both above the
+Two duplicates in `fusedCrossEntropy`'s GPU path were a different leftover: `H !== H2` and
+`chunk <= 0` were repeated there with identical messages, and the wrapper had checked both above the
 dispatch since before this change, so they were already unreachable. Dead rather than gap-shaped,
-and listed with #91.
+and listed with #91; both went in lever 42.
 
 ### 41. What makes buffer recycling safe is queue ordering, not the fence in the comment (2026-09-10)
 
@@ -2062,9 +2061,16 @@ on that path: the GPU copy ran on every call. Hoisting moves the comparison, it 
 What the GPU path genuinely gains is the two shape destructures above the dispatch, which used to
 happen only inside the backend, and that is small enough to put a number on rather than wave at.
 Counted through the real training loop, `linearRaw` runs 86 times per step at 6 layers and batch 2
-(43 per micro-batch: seven projections across six blocks, plus the readout). Two destructures and a
-compare measure 4.10 ns, so 0.00035 ms per step, against a step of seconds. A before/after step
-timing would have measured this machine's variance and nothing else.
+(43 per micro-batch: seven projections across six blocks, plus the readout), and 170 with
+`--recompute`, since 42 of the 43 sit inside a `checkpoint()` whose replay re-runs them in backward.
+Two destructures and a compare measure 4.10 ns, so 0.0007 ms per step at the higher count, against a
+step of seconds. A before/after step timing would have measured this machine's variance and nothing
+else: medians for the same configuration ranged 1222 ms to 2928 ms across runs.
+
+**It is a small improvement rather than break-even, by the argument the repo already makes.** The
+GPU refusal used to fire after `beginForwardOp()` and `curLabel = "linear"`; it now fires before the
+backend is entered at all, so a refusal leaves no profiler state behind. That is the property lever
+40 claims for `crossEntropy`.
 
 Unlike #82 there is no interface to widen: the check returns nothing, so the dispatch line is
 untouched.
@@ -2073,9 +2079,16 @@ The message now names both shapes, since after the hoist there is one copy and i
 the caller gets:
 
 ```
-linear dim mismatch: x is [24,64] and w is [40,65], so the contracted dimension is 64 on one side
-and 65 on the other. A LoRA adapter built for a different width is one way to get here.
+linear dim mismatch: x is [24, 64] and w is [40, 65], so the contracted dimension is 64 on one side
+and 65 on the other. A projection wired to the wrong config field is the usual cause.
 ```
+
+The cause it names is the one that can actually reach it. A LoRA adapter of the wrong width was the
+first draft's guess and cannot happen: `applyLora` derives both factors from `w.shape`, there is no
+adapter deserializer, and `--lora-rank` requires `--resume`, so the base is loaded and its config
+checked first. What reaches this throw is a projection wired to the wrong config field, or a
+hand-built graph in a test. The shapes print through `shape.join(", ")` to match `assertRank`
+rather than rendering `[3,4]` where the neighbouring guard renders `[3, 4]`.
 
 **Two dead checks went with it.** `WebGPUBackend.fusedCrossEntropy` repeated `H !== H2` and
 `chunk <= 0` with the wrapper's exact messages, and the wrapper has validated both above the
@@ -2090,10 +2103,12 @@ since `linear` is not a loss). What each one is worth is not the same:
   the gate has caught it.
 - `fusedDim`: deleting the wrapper's `H !== H2` turns `fusedDim true` into `fusedDim false`. Clean.
 - `fusedChunk`: deleting the wrapper's `chunk <= 0` does NOT turn this arm false. The suite dies
-  with `Fatal JavaScript out of memory` inside the arm, 13 checks in, because
-  `for (v0 = 0; v0 < V; v0 += chunk)` never advances on a zero chunk. Exit 133 rather than exit 1:
-  the regression is caught, but by exhaustion rather than by the assertion, and that is worth
-  knowing before someone reads a red suite and looks for a mismatch line.
+  with `Fatal JavaScript out of memory` inside the arm, 13 checks in. With the backend installed the
+  wrapper dispatches, so what spins is `webgpu.ts`'s span builder,
+  `for (v0 = 0; v0 < V; v0 += chunk) spans.push(...)`, which never advances on a zero chunk and
+  allocates without bound. Inside the very method whose duplicate this change deleted. Exit 133
+  rather than exit 1: the regression is caught, but by exhaustion rather than by the assertion, and
+  that is worth knowing before someone reads a red suite and looks for a mismatch line.
 
 **What the deletion gives up, stated plainly.** With the copies in place, a wrapper whose guard was
 removed still threw cleanly from the backend. With them gone, the wrapper is the only thing between

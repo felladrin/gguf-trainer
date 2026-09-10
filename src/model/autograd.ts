@@ -334,9 +334,9 @@ function linearRaw(x: Tensor, w: Tensor): Tensor {
   // per step against a step measured in seconds.
   if (inDim !== inDim2) {
     throw new Error(
-      `linear dim mismatch: x is [${x.shape}] and w is [${w.shape}], ` +
+      `linear dim mismatch: x is [${x.shape.join(", ")}] and w is [${w.shape.join(", ")}], ` +
         `so the contracted dimension is ${inDim} on one side and ${inDim2} on the other. ` +
-        `A LoRA adapter built for a different width is one way to get here.`,
+        `A projection wired to the wrong config field is the usual cause.`,
     );
   }
   if (opsBackend) return opsBackend.linear(x, w);

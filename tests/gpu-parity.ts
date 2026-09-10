@@ -2266,6 +2266,12 @@ async function targetRangeGate(gpu: WebGPUBackend) {
       () => fusedCrossEntropy(hid, badW, [0, 1, 1], 2),
       /^fusedCrossEntropy dim mismatch/,
     );
+    // This one does not fail cleanly if the wrapper's guard goes: with a backend
+    // installed the dispatch reaches webgpu.ts's span builder, which never
+    // advances on a zero chunk and allocates until the heap is gone. The suite
+    // dies here with `Fatal JavaScript out of memory` and exit 133 rather than a
+    // mismatch line and exit 1. Caught either way, but do not go looking for the
+    // assertion that fired.
     const fusedChunk = refused(
       () => fusedCrossEntropy(hid, w, [0, 1, 1], 0),
       /^fusedCrossEntropy chunk must be positive/,
