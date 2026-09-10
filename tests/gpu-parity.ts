@@ -2402,14 +2402,6 @@ async function recycleReuseGate(gpu: WebGPUBackend) {
 }
 
 /**
- * The two checkpoint triggers, and the fact that either one fires a write.
- * The wall-clock trigger exists because a step count is a proxy for time that
- * stops holding the moment step time changes, so a long run bounds what an
- * interruption costs in minutes instead. ANDing the triggers rather than ORing
- * them would quietly stretch that bound back out to the step cadence, which is
- * a silent failure everywhere except here.
- */
-/**
  * An all-ignored batch, on the GPU, for all three losses.
  *
  * `kept` is the loss denominator, and every path clamps it with the same
@@ -2423,9 +2415,16 @@ async function recycleReuseGate(gpu: WebGPUBackend) {
  * had nothing on either side. A masked batch is not exotic: assistant-only loss
  * masking produces one whenever a window lands entirely inside a prompt.
  *
- * What this pins is that a zero-kept batch is finite and zero on the device, and
- * that it matches the CPU. Delete any one of the three clamps in webgpu.ts and
- * the arm turns NaN.
+ * What this pins is the clamp and nothing more. At `kept == 0` the numerator is
+ * 0 too, so every divisor looks alike and no arm here can grip the count's
+ * VALUE; that is pinned elsewhere and on both paths, by the partial-mask cases
+ * above and by `chunked summed NLL` and `softCE summed NLL` in gradcheck, which
+ * check `mean * kept` against an independently summed numerator.
+ *
+ * Delete any one of the six clamps and the matching arm fails. On this adapter
+ * the device three turn NaN, but WGSL does not promise that `0.0 / 0.0` is NaN,
+ * so what makes those arms adapter-independent is the comparison against the
+ * CPU rather than the NaN itself.
  */
 async function allIgnoredGate(gpu: WebGPUBackend) {
   const T = 3, H = 4, V = 6, K = 2;
@@ -2434,17 +2433,19 @@ async function allIgnoredGate(gpu: WebGPUBackend) {
   const ignored = [-1, -1, -1];
   // Every teacher row ignored too: the first slot is the marker, the rest are
   // in-range pads the contract requires and nothing reads.
+  // The probabilities are NONZERO on purpose: with zeros, both bodies would
+  // return 0 for a second reason (`q === 0` skips the term on the CPU, `q != 0.0`
+  // in the kernel), and the row skip this arm is about would stop being
+  // load-bearing.
   const teacherIds = [-1, 0, -1, 0, -1, 0];
-  const teacherQ = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+  const teacherQ = [0.6, 0.4, 0.6, 0.4, 0.6, 0.4];
 
-  for (const t of [hid, w]) t.zeroGrad();
   const cpu = [
     crossEntropy(linear(hid, w), ignored).data[0],
     fusedCrossEntropy(hid, w, ignored, 2).data[0],
     softCrossEntropy(linear(hid, w), teacherIds, teacherQ, K).data[0],
   ];
 
-  for (const t of [hid, w]) t.zeroGrad();
   gpu.install();
   let ok = true;
   try {
@@ -2455,19 +2456,21 @@ async function allIgnoredGate(gpu: WebGPUBackend) {
     const names = ["dense", "fused", "softCE"];
     const got = [dense.data[0], fused.data[0], soft.data[0]];
     for (let i = 0; i < got.length; i++) {
-      // Both sides checked for finiteness, not just the GPU. A NaN reference
-      // makes `Math.abs(got - cpu) > 1e-6` FALSE, so comparing alone would let
-      // a missing CPU clamp through while pretending to cover it.
-      if (
-        !Number.isFinite(got[i]) || !Number.isFinite(cpu[i]) || Math.abs(got[i] - cpu[i]) > 1e-6
-      ) {
+      // `!== 0` rather than a tolerance, doing two jobs. Exact zero is guaranteed
+      // here rather than hoped for: every kernel writes 0 for an ignored row and
+      // the CPU totals are sums over no terms, so nothing accumulates and there
+      // is no float noise to absorb. And `NaN !== 0` is TRUE, so this catches a
+      // dropped clamp on either side without a separate finiteness test. Written
+      // the other way round, `Math.abs(got[i]) > 0` is FALSE for NaN, which is
+      // the trap the first draft fell into by comparing against a NaN oracle.
+      if (got[i] !== 0 || cpu[i] !== 0) {
         console.log(`    MISMATCH allIgnored.${names[i]}: gpu=${got[i]} cpu=${cpu[i]}`);
         ok = false;
       }
     }
     if (!ok) failures++;
     console.log(
-      `  ${ok ? "ok " : "FAIL"} an all-ignored batch divides by 1, not 0 ` +
+      `  ${ok ? "ok " : "FAIL"} an all-ignored batch is 0 on both sides, not NaN ` +
         `(dense ${got[0]}, fused ${got[1]}, softCE ${got[2]})`,
     );
   } finally {
@@ -2475,6 +2478,14 @@ async function allIgnoredGate(gpu: WebGPUBackend) {
   }
 }
 
+/**
+ * The two checkpoint triggers, and the fact that either one fires a write.
+ * The wall-clock trigger exists because a step count is a proxy for time that
+ * stops holding the moment step time changes, so a long run bounds what an
+ * interruption costs in minutes instead. ANDing the triggers rather than ORing
+ * them would quietly stretch that bound back out to the step cadence, which is
+ * a silent failure everywhere except here.
+ */
 async function checkpointCadence(gpu: WebGPUBackend) {
   const cfg = microConfig();
   const rngTok = mulberry32(0x5ec2);

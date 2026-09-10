@@ -2507,25 +2507,44 @@ no backend installed, so it only ever exercised the CPU copies. The three device
 driving them, and `softCrossEntropy` had nothing on either side. A masked batch is not exotic:
 assistant-only loss masking produces one whenever a training window lands entirely inside a prompt.
 
+**The sixth clamp needed its own case, in gradcheck rather than here.** `gpu-parity.ts` returns
+`SKIP` with no adapter, and CI has no GPU, so the device gate does not run there. The CPU clamps for
+the two hard-target losses are covered anyway by gradcheck's existing `every row ignored`, but the
+CPU `softCrossEntropy` clamp was covered by nothing that runs GPU-less: the `teacher id range`
+block's smallest kept count is 2. One case in that list closes it, and the whole point is that it
+runs where the suite actually runs.
+
 `allIgnoredGate` runs all three losses over a fully masked batch with the backend installed, and
 requires the device answer to be finite and to match the CPU. Six mutations, one per clamp, each
 failing in exactly its own arm:
 
-| clamp removed       | what the gate prints                        |
-| :------------------ | :------------------------------------------ |
-| `webgpu.ts` dense   | `dense NaN, fused 0, softCE 0`              |
-| `webgpu.ts` fused   | `dense 0, fused NaN, softCE 0`              |
-| `webgpu.ts` soft    | `dense 0, fused 0, softCE NaN`              |
-| `autograd.ts` dense | `MISMATCH allIgnored.dense: gpu=0 cpu=NaN`  |
-| `autograd.ts` fused | `MISMATCH allIgnored.fused: gpu=0 cpu=NaN`  |
-| `autograd.ts` soft  | `MISMATCH allIgnored.softCE: gpu=0 cpu=NaN` |
+| clamp removed       | what the gate prints                                                                                                      |
+| :------------------ | :------------------------------------------------------------------------------------------------------------------------ |
+| `webgpu.ts` dense   | `dense NaN, fused 0, softCE 0`                                                                                            |
+| `webgpu.ts` fused   | `dense 0, fused NaN, softCE 0`                                                                                            |
+| `webgpu.ts` soft    | `dense 0, fused 0, softCE NaN`                                                                                            |
+| `autograd.ts` dense | `MISMATCH allIgnored.dense: gpu=0 cpu=NaN`                                                                                |
+| `autograd.ts` fused | `MISMATCH allIgnored.fused: gpu=0 cpu=NaN`                                                                                |
+| `autograd.ts` soft  | `MISMATCH allIgnored.softCE: gpu=0 cpu=NaN`, and GPU-less, `teacher id range` reports `failed: every teacher row ignored` |
 
 **The bottom three needed a fix to the gate before they failed at all, and it is the interesting
-part.** The first draft checked `Number.isFinite(got[i]) || Math.abs(got[i] - cpu[i]) > 1e-6`, which
-looks symmetric and is not: with a NaN reference, `Math.abs(0 - NaN)` is NaN and `NaN > 1e-6` is
-false, so a missing CPU clamp passed while the arm claimed to cover it. Checking both sides for
-finiteness is what makes the reference side real. A comparison against a NaN oracle is not a weak
-test, it is a test that cannot fail.
+part.** The first draft checked `!Number.isFinite(got[i]) || Math.abs(got[i] - cpu[i]) > 1e-6`,
+which looks symmetric and is not: with a NaN reference, `Math.abs(0 - NaN)` is NaN and `NaN > 1e-6`
+is false, so a missing CPU clamp passed while the arm claimed to cover it. A comparison against a
+NaN oracle is not a weak test, it is a test that cannot fail.
+
+The fix went further than adding a second finiteness check. The arm now asserts exactly
+`got !== 0 || cpu !== 0`, which is stronger and shorter: exact zero is guaranteed rather than hoped
+for, since every kernel writes 0 for an ignored row and the CPU totals are sums over no terms, so
+nothing accumulates and there is no float noise to absorb; and `NaN !== 0` is true, so one
+comparison covers both sides with no finiteness test at all. Written the other way round,
+`Math.abs(got[i]) > 0` is false for NaN, which is the same trap again.
+
+Two limits worth stating. At `kept == 0` the numerator is 0 too, so no arm here can grip the count's
+VALUE, only the clamp; the value is pinned by the partial-mask parity cases and by
+`chunked summed NLL` and `softCE summed NLL`. And WGSL does not promise that `0.0 / 0.0` is NaN, so
+the three device rows above are what this adapter did; what makes them adapter-independent is the
+comparison against the CPU rather than the NaN.
 
 ## Quality levers
 
