@@ -707,6 +707,48 @@ async function main() {
     );
   }
   {
+    // The same identity for the soft-target loss, and it exists because #93 took
+    // the kept-row count away from both implementations and gave them one shared
+    // source. That is the right shape, and it costs the weak cross-check the old
+    // arrangement had: two independently written counts compared through a
+    // parity case are unlikely to be identically wrong, while one count feeding
+    // both scales the CPU and GPU losses together and the parity cases stay
+    // green. Every other softCE test is blind to it: the parity cases share the
+    // count, the finite-difference check scales with it, and the two single-row
+    // cases have T === kept.
+    //
+    // So the oracle is computed here and `kept` is written out as a literal
+    // rather than derived, which is what makes this fail when the helper counts
+    // the ignored row (or returns T) and pass otherwise.
+    const T = 4, V = 9, K = 2;
+    const logits = randTensor([T, V], rng);
+    const ids = [1, 4, -1, 0, 7, 2, 3, 3];
+    const q = [0.6, 0.3, 0.0, 0.0, 0.5, 0.2, 0.25, 0.25];
+    const kept = 3; // rows 0, 2 and 3; row 1 carries the -1 marker
+
+    let expected = 0;
+    for (let t = 0; t < T; t++) {
+      if (ids[t * K] < 0) continue;
+      let mx = -Infinity;
+      for (let v = 0; v < V; v++) mx = Math.max(mx, logits.data[t * V + v]);
+      let sum = 0;
+      for (let v = 0; v < V; v++) sum += Math.exp(logits.data[t * V + v] - mx);
+      for (let j = 0; j < K; j++) {
+        const weight = q[t * K + j];
+        if (weight === 0) continue;
+        expected += weight * (Math.log(sum) + mx - logits.data[t * V + ids[t * K + j]]);
+      }
+    }
+
+    const worst = Math.abs(softCrossEntropy(logits, ids, q, K).data[0] * kept - expected);
+    const ok = worst < 1e-4;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"softCE summed NLL".padEnd(24)}        ` +
+        `mean*kept == summed weighted NLL, ${kept} kept of ${T}  maxAbs=${worst.toExponential(2)}`,
+    );
+  }
+  {
     // Activation recomputation. Two claims, and the second is the one that
     // matters: the analytic gradient still matches finite differences THROUGH a
     // recompute boundary, and enabling it changes nothing. The recompute is a

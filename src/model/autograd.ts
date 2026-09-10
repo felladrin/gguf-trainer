@@ -729,8 +729,10 @@ export function attention(
 }
 
 /**
- * Everything `softCrossEntropy` needs checked, in one place ABOVE the backend
- * dispatch.
+ * Count the rows the KL anchor will keep, refusing any teacher id that is not
+ * the ignore marker or a row of the vocab. Everything `softCrossEntropy` needs
+ * checked, in one place ABOVE the backend dispatch, and the denominator both
+ * implementations divide by rather than each counting their own (#93).
  *
  * The two implementations carried the shape guards verbatim and only the CPU one
  * carried the id check, which is the omission the below-dispatch style invites

@@ -2165,12 +2165,24 @@ That turns `softCE true` into `softCE false` on `targetRangeGate` while every CP
 which is the signature of a guard that stopped covering the GPU path. The loophole computes the
 right denominator; what it drops is the validation.
 
-**The denominator itself was already pinned, which is worth stating because it is the half a
-placement gate cannot see.** The `softCrossEntropy` parity cases carry ignored rows (one of four,
-and one of three in the wide-V case), so the two paths' denominators are compared through the loss.
-Replacing the GPU divisor with `T` fails them at `gpu=2.3589 cpu=3.1453`, a ratio of exactly 3/4,
-and the gradient with it. So the two arms cover different failures: the parity cases catch a wrong
-count, and `targetRangeGate` catches a right count obtained without validating.
+**What this costs, and the test that pays it back.** The old arrangement had a weak cross-check
+nobody designed: two independently written counts, compared through a parity case that carries
+ignored rows, are unlikely to be identically wrong. One shared count scales the CPU and GPU losses
+together, so the parity cases go on passing. Measured rather than assumed: with `keptTeacherRows`
+changed to `return T`, the entire suite exits 0.
+
+That is #82's hazard, and #82 already carries the warning, at the top of its own oracle: "The oracle
+is computed here rather than taken from either loss: both draw their denominator from the helper, so
+comparing them to each other would agree on a wrong kept count." It shipped `chunked summed NLL` to
+close it. This ships `softCE summed NLL`, the same shape for the soft-target loss: a CPU-only case
+whose expected value is computed in the test and whose `kept` is written out as the literal 3 rather
+than derived. `return T` fails it and only it, at `maxAbs=1.44e+0`, and so does moving the `kept++`
+above the ignore-marker `continue`.
+
+The `T`-divisor mutation still has its own job, and it is a different one. Replacing the GPU divisor
+with `T` fails the parity cases at `gpu=2.3589 cpu=3.1453`, a ratio of exactly 3/4: that catches a
+consumer of the count diverging from the other consumer. The new case catches the shared producer
+being wrong, which nothing could see. Three mutations, three different failures.
 
 ## Quality levers
 
