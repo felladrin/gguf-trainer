@@ -8,11 +8,18 @@
 // The on-disk round-trip at both widths is covered by gradcheck.ts; this file is
 // about picking the width and about what goes wrong when it is picked wrong.
 // Run:  deno run tests/large-vocab.ts
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   assertCorpusFitsVocab,
+  checkTokenFileId,
   idArrayFor,
   memTokenSource,
+  stampTokenFile,
   tokenBytes,
+  tokenIdPath,
+  tokenizerFingerprint,
 } from "../src/data/tokens.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { encodeCorpus } from "../src/commands/pretrain.ts";
@@ -213,6 +220,75 @@ ok(
     "a window past the end is refused rather than padded with undefined",
   );
   throws(() => memTokenSource([1, 2, 3]).window(-1, 2), "out of range", "a negative start too");
+}
+
+// The other half of the same class: a stale .tokens whose ids are all legal.
+//
+// assertCorpusFitsVocab above catches a stale file only when its ids exceed the
+// new vocab. A same-size or larger vocab passes every range check, and so does a
+// narrower one that flips the file's id width, since the size check is only
+// `% bytesPerToken`. Nothing about an id says which vocab produced it, so the
+// tokenizer is stamped beside the file instead.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tokenid-"));
+  const tokensPath = path.join(dir, "corpus.tokens");
+  fs.writeFileSync(tokensPath, new Uint8Array([1, 0, 2, 0, 3, 0]));
+
+  const train = (text: string, vocab: number) => {
+    const t = new BPETokenizer();
+    t.train(text, vocab, []);
+    return t;
+  };
+  // 280 is below what either corpus saturates at, so both land on exactly 280:
+  // same size, different merges, which is the case a vocab-size check cannot see.
+  const a = train("the quick brown fox jumps over the lazy dog ".repeat(40), 280);
+  const b = train("lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(40), 280);
+
+  const verdict = (t: BPETokenizer) =>
+    checkTokenFileId(tokensPath, t.export(), t.vocabSize, tokenBytes(t.vocabSize));
+
+  ok(await verdict(a) === "unstamped", "an unstamped file reports that, rather than passing");
+
+  await stampTokenFile(tokensPath, a.export(), a.vocabSize, tokenBytes(a.vocabSize));
+  ok(await verdict(a) === "ok", "the tokenizer that stamped it matches");
+
+  ok(a.vocabSize === b.vocabSize, "the two tokenizers really are the same size");
+  const merges = await verdict(b);
+  ok(
+    typeof merges === "string" && merges.includes("different merges or specials"),
+    `same size, different merges is refused and named as such: got ${merges}`,
+  );
+
+  // The width flip, which is checked on its own: the same tokenizer with a
+  // 4-byte stamp read as 2-byte still doubles the token count and reads every
+  // second id as 0, and diskTokenSource'''s `% 2` cannot see it.
+  await stampTokenFile(tokensPath, a.export(), a.vocabSize, 4);
+  const flipped = await verdict(a);
+  ok(
+    typeof flipped === "string" && flipped.includes("4 bytes per token") &&
+      flipped.includes("read as 2"),
+    `a width flip is refused even when the tokenizer matches: got ${flipped}`,
+  );
+
+  fs.writeFileSync(tokenIdPath(tokensPath), "{not json");
+  const broken2 = await verdict(a);
+  ok(
+    typeof broken2 === "string" && broken2.includes("not readable JSON"),
+    `an unparseable stamp is an error, not a silent pass: got ${broken2}`,
+  );
+
+  // The fingerprint covers specials, which are neither vocab size nor merges.
+  const sample = "the quick brown fox jumps over the lazy dog ".repeat(40);
+  const plain = new BPETokenizer();
+  plain.train(sample, 280, []);
+  const special = new BPETokenizer();
+  special.train(sample, 280, ["<|extra|>"]);
+  ok(
+    await tokenizerFingerprint(plain.export()) !== await tokenizerFingerprint(special.export()),
+    "a reserved special changes the fingerprint, which neither merges nor a size check would show",
+  );
+
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 console.log("large-vocab: all checks passed");

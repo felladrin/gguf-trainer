@@ -1666,6 +1666,53 @@ loop, collapsing the LoRA branch to `model.params()`, and collapsing the non-LoR
 adapters each fail it. Moving the loop to just before the `sync()` does not, and should not:
 `keepGradOnDevice` is read at sync time, so anywhere before it is the same call.
 
+### 38. A token file now carries the tokenizer that produced it (2026-09-10)
+
+Filed as #81, recorded in lever 34 first, and the reason it needed its own entry is that lever 34's
+check cannot reach it. `assertCorpusFitsVocab` catches a stale `.tokens` only when its ids exceed
+the new vocab. A stale file's ids are all perfectly legal: a same-size or larger vocab passes every
+range check, and so does a narrower one that flips the id width, since `diskTokenSource`'s size check
+is only `% bytesPerToken`, so a 4-byte file read as 2-byte passes it, doubles the token count and
+reads every second id as 0.
+
+The reuse that makes it reachable is in `pretrain`'s `.txt` branch, which keeps an existing
+`${stem}.tokens` rather than rewriting it, while `sharedTokenizer` retrains the vocab whenever
+`${stem}.tokenizer.json` is missing. Delete the json, or change `VOCAB`, and the run trains on a
+token file built from a vocab that no longer exists, with every gate green.
+
+Nothing about an id says which vocab produced it, so the vocab is stored instead:
+`<file>.tokens.id`, a small JSON holding a SHA-256 over the exported tokenizer plus the vocab size
+and the id width. `tokenize`, `chat-corpus` and `pretrain`'s own writer stamp it; `pretrain` checks
+it in both input branches. Hashing the whole export rather than the size catches the case a size
+check misses entirely, a vocab of the same size whose merges retokenize the corpus differently, and
+the specials too. The id width is compared on its own rather than folded into the hash, because a
+width mismatch corrupts the read whatever the tokenizer says.
+
+Reproduced end to end rather than argued. A 144 KB corpus, one step, then the json deleted and one
+word changed so the retrain lands on a different vocab:
+
+```
+Tokenizer: trained to 337 tokens on 0.1M-char sample, 11 curriculum specials reserved
+error: mini.tokens was tokenized with a different tokenizer: vocab 336 against the current 337.
+```
+
+Exit 1, where before it trained.
+
+**An unstamped file is neither an error nor a pass.** Files written before this existed cannot be
+checked, and the run says so in a line of its own rather than staying quiet and implying a check
+happened. Refusing them instead would strand every corpus already on disk, 13 of them here, for a
+risk that has never been observed to fire; and the flows this guards against, deleting the tokenizer
+json or changing the vocab constant, leave the stamp in place, so they are caught either way. The
+gap that remains is deleting the stamp by hand, which is not something any flow does.
+
+`eval-loss` is deliberately not wired in. It reads a `.tokens` with no tokenizer in hand, only the
+checkpoint's vocab size, so the check available to it is a different and weaker one; lever 34's scan
+already covers it and this would be a second half-check pretending to be the same one.
+
+The cases live in `tests/large-vocab.ts`, beside the preflight's. Reporting an unstamped file as ok,
+dropping the width comparison, hashing only the vocab size, and treating an unparseable stamp as
+absent each fail one.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

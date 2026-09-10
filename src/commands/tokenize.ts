@@ -26,7 +26,7 @@
 import { BPETokenizer } from "../tokenizer/bpe.ts";
 import type { TokenizerData } from "../tokenizer/bpe.ts";
 import { readFileText, writeFileBytes } from "../io.ts";
-import { diskTokenSource, tokenBytes } from "../data/tokens.ts";
+import { diskTokenSource, stampTokenFile, tokenBytes } from "../data/tokens.ts";
 import { CURRICULUM_SPECIALS } from "../data/chat.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -143,6 +143,7 @@ async function run(v: Values) {
     fs.closeSync(fd);
   }
 
+  await stampTokenFile(tokensPath, tok.export(), tok.vocabSize, bpt);
   console.log(
     `\nWrote ${tokensPath} (${bpt} B/token, ${((totalTokens * bpt) / 1e6).toFixed(1)} MB, ` +
       `${totalDocs} docs); tokenizer already at ${tokenizerPath}`,

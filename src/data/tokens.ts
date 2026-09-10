@@ -13,7 +13,7 @@
 // when the vocab fits in u16, else 4. tokenBytes(vocabSize) picks the width;
 // the reader is told the width (the model's config carries the vocab size).
 
-import { chunkSpans, openReader, writeFileBytes } from "../io.ts";
+import { chunkSpans, openReader, readFileText, writeFileBytes } from "../io.ts";
 
 export interface TokenSource {
   /** Number of tokens in the corpus. */
@@ -163,4 +163,92 @@ export async function diskTokenSource(
       reader.close();
     },
   };
+}
+
+/**
+ * Tokenizer identity for a token file, written beside it as `<path>.id`.
+ *
+ * assertCorpusFitsVocab closes the case where a stale file holds ids the new
+ * vocab does not have. It cannot close the rest of the class, because a stale
+ * file's ids are all perfectly legal: a same-size or larger vocab passes every
+ * range check, and so does a narrower one that flips the file's id width, since
+ * the size check is only `% bytesPerToken`, so a 4-byte file read as 2-byte
+ * doubles the count and reads every second id as 0. Nothing about an id says
+ * which vocab it came from, so this stores the vocab instead.
+ *
+ * The hash is over the whole exported tokenizer, not just the vocab size, so it
+ * also catches the case a size check would miss: same number of tokens,
+ * different merges, which retokenizes the same corpus into different ids.
+ */
+export interface TokenFileId {
+  tokenizer: string;
+  vocabSize: number;
+  bytesPerToken: 2 | 4;
+}
+
+export function tokenIdPath(tokensPath: string): string {
+  return `${tokensPath}.id`;
+}
+
+/** SHA-256 over the exported tokenizer, which covers vocab, merges and specials. */
+export async function tokenizerFingerprint(data: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify(data));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Stamp a token file with the tokenizer that produced it. Call after writing. */
+export async function stampTokenFile(
+  tokensPath: string,
+  tokenizerData: unknown,
+  vocabSize: number,
+  bytesPerToken: 2 | 4,
+): Promise<void> {
+  const id: TokenFileId = {
+    tokenizer: await tokenizerFingerprint(tokenizerData),
+    vocabSize,
+    bytesPerToken,
+  };
+  await writeFileBytes(tokenIdPath(tokensPath), new TextEncoder().encode(JSON.stringify(id)));
+}
+
+/**
+ * Check a token file against the tokenizer about to read it.
+ *
+ * Returns "unstamped" for a file written before this existed, which is not an
+ * error and not a pass: the check cannot be made, and the caller says so rather
+ * than implying the file was verified. Refusing instead would strand every
+ * corpus already on disk for a risk that has never been observed to fire, and
+ * the flows this guards against (deleting the tokenizer json, changing the vocab
+ * constant) leave the stamp in place, so they are caught either way.
+ */
+export async function checkTokenFileId(
+  tokensPath: string,
+  tokenizerData: unknown,
+  vocabSize: number,
+  bytesPerToken: 2 | 4,
+): Promise<"ok" | "unstamped" | string> {
+  const raw = await readFileText(tokenIdPath(tokensPath)).catch(() => null);
+  if (raw === null) return "unstamped";
+  let id: TokenFileId;
+  try {
+    id = JSON.parse(raw) as TokenFileId;
+  } catch {
+    return `${tokenIdPath(tokensPath)} is not readable JSON; delete it and rebuild ${tokensPath}`;
+  }
+  const rebuild = `Delete it and let this run rebuild it, or point --data at a file that matches.`;
+  // Checked on its own rather than folded into the fingerprint, because this one
+  // corrupts the read whatever the tokenizer says: the size check in
+  // diskTokenSource is only `% bytesPerToken`, so a 4-byte file read as 2-byte
+  // passes it, doubles the token count, and reads every second id as 0.
+  if (id.bytesPerToken !== bytesPerToken) {
+    return `${tokensPath} was written ${id.bytesPerToken} bytes per token and is about to be ` +
+      `read as ${bytesPerToken}, which doubles or halves its token count silently. ${rebuild}`;
+  }
+  const want = await tokenizerFingerprint(tokenizerData);
+  if (id.tokenizer === want) return "ok";
+  const how = id.vocabSize !== vocabSize
+    ? `vocab ${id.vocabSize} against the current ${vocabSize}`
+    : `the same ${vocabSize} tokens but different merges or specials`;
+  return `${tokensPath} was tokenized with a different tokenizer: ${how}. ${rebuild}`;
 }

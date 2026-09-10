@@ -42,6 +42,7 @@ import {
   diskTokenSource,
   type IdArray,
   idArrayFor,
+  stampTokenFile,
   tokenBytes,
   writeTokenFile,
 } from "../data/tokens.ts";
@@ -258,6 +259,7 @@ async function run(v: Values) {
     `${outPrefix}.template.txt`,
     new TextEncoder().encode(DEFAULT_CHAT_TEMPLATE),
   );
+  await stampTokenFile(`${outPrefix}.tokens`, tok.export(), tok.vocabSize, bpt);
 
   const src = await diskTokenSource(`${outPrefix}.tokens`, bpt);
   const maskSrc = await diskTokenSource(`${outPrefix}.mask`, bpt);

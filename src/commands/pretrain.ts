@@ -45,8 +45,10 @@ import { llamaRunScript } from "../export/export-gguf.ts";
 import { wsdSchedule } from "../train/schedule.ts";
 import {
   assertCorpusFitsVocab,
+  checkTokenFileId,
   diskTokenSource,
   idArrayFor,
+  stampTokenFile,
   tokenBytes,
   writeTokenFile,
 } from "../data/tokens.ts";
@@ -203,6 +205,29 @@ async function sharedTokenizer(path: string, corpus: string): Promise<BPETokeniz
       `sample, ${CURRICULUM_SPECIALS.length} curriculum specials reserved -> ${path}`,
   );
   return tok;
+}
+
+/**
+ * Refuse a token file whose stamp names a different tokenizer than the one about
+ * to read it. Unstamped files predate the stamp and say so rather than passing
+ * quietly; see checkTokenFileId.
+ */
+async function assertTokenFileId(tokensPath: string, tok: BPETokenizer): Promise<void> {
+  const verdict = await checkTokenFileId(
+    tokensPath,
+    tok.export(),
+    tok.vocabSize,
+    tokenBytes(tok.vocabSize),
+  );
+  if (verdict === "ok") return;
+  if (verdict === "unstamped") {
+    console.log(
+      `Tokenizer match: ${tokensPath} predates the .id stamp, so it cannot be checked. ` +
+        `Rebuild it to get the check.`,
+    );
+    return;
+  }
+  die(verdict);
 }
 
 /** Load the tokenizer that `tokenize` wrote next to a .tokens file. */
@@ -369,6 +394,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   let srcPath: string;
   if (inputPath.endsWith(".tokens")) {
     tok = await siblingTokenizer(inputPath);
+    await assertTokenFileId(inputPath, tok);
     src = await diskTokenSource(inputPath, tokenBytes(tok.vocabSize));
     srcPath = inputPath;
     console.log(`Tokens: ${inputPath} (${(src.length / 1e6).toFixed(1)}M, pretokenized)`);
@@ -382,8 +408,15 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     tok = await sharedTokenizer(`${stem}.tokenizer.json`, corpus);
     const bpt = tokenBytes(tok.vocabSize);
     const tokensPath = `${stem}.tokens`;
-    if (!(await fileExists(tokensPath))) {
+    if (await fileExists(tokensPath)) {
+      // The reuse this guards. sharedTokenizer retrains the vocab whenever the
+      // json is missing, so deleting it, or changing VOCAB, leaves a .tokens
+      // built from a vocab that no longer exists. Every id in it is legal, so
+      // assertCorpusFitsVocab below cannot see it.
+      await assertTokenFileId(tokensPath, tok);
+    } else {
       await writeTokenFile(tokensPath, encodeCorpus(tok, corpus), bpt);
+      await stampTokenFile(tokensPath, tok.export(), tok.vocabSize, bpt);
     }
     src = await diskTokenSource(tokensPath, bpt);
     srcPath = tokensPath;
