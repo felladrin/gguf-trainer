@@ -38,6 +38,25 @@ jobs:
   # green. That is not hypothetical: #83 was a static `hyparquet` import that
   # kept three test files out of the Node task entirely.
   #
+  # PROBE, not the shipped shape: does the suite run under Bun at all? Principle
+  # 1 names three runtimes and CI enforces two (#97). Nothing here is decided
+  # until this reports, including the exemption set, which has no reason to be
+  # the Node one: Bun runs TypeScript natively rather than through a stripper.
+  bun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Bun version under test
+        run: bun --version
+      - name: Bun compatibility
+        run: deno task test:bun
+
   # Two versions, both pinned. 22.6.0 is the exact floor readme.md promises and
   # the first release with --experimental-strip-types, so this entry tests the
   # promise rather than whatever 22.x is newest; a bare "22" resolves to the
