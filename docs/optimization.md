@@ -34,14 +34,16 @@ against them; read the block below instead.
 | Peak GPU (pool + state) | 39.3 GB                   | trainer's own readout, unchanged                                      |
 | Profiled kernel time    | ~330 ms of a 10.6 s step  | `bench`, idle GPU, summed over a step's dispatches                    |
 
-[^busy]: Both are whole-device readings whose other users were not recorded, which lever 47
-    calibrated and sets aside; read them as ceilings on this trainer's share rather than as its
-    utilization. The per-process number is the ~330 ms of profiled kernel time in the row above.
+Both GPU-busy figures are whole-device readings whose other users were not recorded, which lever 47
+calibrated and sets aside; read them as ceilings on this trainer's share rather than as its
+utilization. The profiled kernel time is the per-process number.
 
 The two facts that now drive everything below:
 
-1. **The step is host-bound, not GPU-bound.** Profiled kernel time is ~330 ms of a 10.6 s step,
-   from `bench` summed over a step's dispatches, and that is the only per-process GPU number here.
+1. **The step is host-bound, not GPU-bound.** Profiled kernel time is ~330 ms against a step of
+   seconds: a reconstruction over the kernel families `bench` times, not a profile of a real step,
+   since `bench` builds no model and has no layer loop, and its per-dispatch profiling inflates
+   totals. The gap it has to close is roughly 30x, so it closes comfortably either way.
    Cheaper kernels can no longer raise tokens/second on this box; only cheaper host work can. See
    lever 1c, which is where the time actually goes.
 
@@ -381,8 +383,11 @@ What survives: the step really is host-bound. Re-measured uncontended at the sam
 step. (Lever 47 later calibrated that counter and narrowed what this sentence can claim: it is
 whole-device, "uncontended" here was not checked against `fuser -v /dev/dri/renderD128`, and the
 counter reads 43.2% mean with nothing training at all. Read 52.5% as a ceiling on this trainer's
-share, not as its utilization. Lever 47 also found a second tenant on this box's GPU, which
-independently corroborates the loose end below about the ten-hour run sharing the device.) The host time is in the dispatch path itself, not in allocating host arrays. Anyone taking
+share, not as its utilization. Lever 47 also found an unrecorded tenant on this box's GPU,
+which does not corroborate the loose end below about the ten-hour run, a different month and a
+different tenant, but does make it more plausible that this box has them.)
+
+The host time is in the dispatch path itself, not in allocating host arrays. Anyone taking
 this on next should profile bind-group and pipeline setup per dispatch, not memory.
 
 One loose end worth naming: this configuration reaches 0.161 st/s where the roleplay run logged
@@ -558,7 +563,8 @@ tolerance.
 
 **The throughput column is the surprising one.** An extra full readout matmul per step should cost
 something, and it costs nothing measurable, because lever 1c already found the step host-bound
-(`gpu_busy_percent` ~52.5%): the added GPU work lands in a gap that was already idle. Do not
+(`gpu_busy_percent` ~52.5%, a whole-device ceiling; lever 47): the added GPU work lands in a gap
+that was already idle. Do not
 generalize that to a GPU-bound shape.
 
 What it actually unlocks is context, not memory. At vocab 151936 the logits buffer is 1.16 GiB at
@@ -619,7 +625,8 @@ also reproduces lever 19's numbers (72 vs 73 tok/s, pool 14480 vs 14386), so it 
 control.
 
 The mechanism is inferred, not proven. Lever 1c found the step host-bound at `gpu_busy_percent`
-~52.5%, and `endRegion` ends the pass and submits at every layer boundary. Before this, a whole
+~52.5%, a whole-device ceiling rather than this trainer's share (lever 47), and `endRegion` ends
+the pass and submits at every layer boundary. Before this, a whole
 micro-batch was recorded into one compute pass and submitted once, so the GPU sat idle while the
 host recorded 28 layers and then raced to catch up. Now layer 1 executes while the host records
 layer 5. On that reading the extra forward pass is free because it lands in time the GPU was
@@ -2449,7 +2456,7 @@ measuring, which is the more useful half and is why this lever leads with it.
 **Whatever else is running on this box is worth 2x on this step.** Same binary, same shape, same
 flags, same seed:
 
-| arm           | machine otherwise unloaded | with other work running |
+| arm           | nothing else known running | with other work running |
 | :------------ | -------------------------: | ----------------------: |
 | dense         |                  113 tok/s |         54 and 58 tok/s |
 | `--recompute` |                  248 tok/s |               117 tok/s |
@@ -2537,13 +2544,11 @@ theirs. The 43.2% calibration above was taken with `fuser` listing only the comp
 `llama-server`, checked before and after; that is the standard the rest of the readings here do not
 meet.
 
-**That forces a correction to the paragraph above.** It attributes the 2x throughput swing to CPU
-contention from review agents, because that is what was known to be running. At least one other
-contender was on the GPU itself, intermittently, and was present during runs recorded as loaded and
-absent during ones recorded as quiet. The swing is real and reproduces; **which contention causes it
-is not established**, and CPU was named too confidently. A later attempt to settle it timed out
-because the other session's job restarted mid-run, which is itself the point: on a shared box the
-control has to be verified rather than assumed, before and after.
+**This is where the retraction at the top of the lever came from.** A draft named CPU contention as
+the cause because that is what was known to be running; the tenant above is a second candidate, and
+neither was checked per run. A later attempt to settle it timed out because the other session's job
+restarted mid-run, which is itself the point: on a shared box the control has to be verified rather
+than assumed, before and after.
 
 So the rule this lever leaves behind is not "run it quiet", which is unfalsifiable, but: record what
 else held the CPU and the render node, check both at the start and the end of the run, and treat any
@@ -2552,9 +2557,9 @@ number without that record as unusable.
 Read literally that voids this lever's own tok/s figures too, which have no such record. They
 survive on something the counter readings cannot offer: they come from the trainer's own output
 rather than a shared counter, and three independent builds agree within 3.6% (114, 110, 113). A
-single unlabelled reading of a whole-device counter has neither property. That includes the `~42%` in this file's summary table and
-the `~58%` idle figure derived from it, whose device conditions are not recorded; principle 1's
-claim survives on lever 1c's 52.5%, which is labelled uncontended, and is restated off that.
+single unlabelled reading of a whole-device counter has neither property. That includes the `~42%` in this file's summary table, whose
+device conditions are not recorded. Principle 1 does not rest on either reading: it rests on the
+profiled kernel time, and the counter appears there only as a ceiling.
 
 To re-run the follow-up: `checkpoint()`'s passthrough at `if (!checkpointing) return fn()` needs the
 backend's `submit()`, which is private on `WebGPUBackend` and absent from the `RegionBackend`
