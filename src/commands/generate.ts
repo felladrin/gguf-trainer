@@ -29,8 +29,11 @@ async function run(v: Values) {
   // helper, whether or not it would happen to be safe for today's callers.
   freezeForScoring(model);
 
-  const gpu = v.bool("cpu") ? null : await initWebGPU();
-  if (!gpu && !v.bool("cpu")) console.log(noGpuNote());
+  const useCpu = v.bool("cpu");
+  const gpu = useCpu ? null : await initWebGPU();
+  // stderr: --completion-only exists so stdout is the completion and nothing
+  // else, and a note on that stream would end up in whatever consumes it.
+  if (!gpu && !useCpu) console.error(noGpuNote());
   if (gpu) {
     gpu.install();
     gpu.uploadParams(model.params());

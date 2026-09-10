@@ -1548,9 +1548,29 @@ window sampling, backward, optimizer step, LR schedule, QK-clip, supervision mas
 token sources. `demo` trains with it, and `gpu-parity` runs it step-for-step against the GPU trainer
 to prove their trajectories match.
 
-Wiring it into `pretrain` would be modest too: 13 `gpu.` call sites across 8 methods in one file,
-most of them the device banner, the trust gate and the peak-memory line. `--recompute` and
-`--loss-chunk` are backend-agnostic already, and `--reclaim` is moot without a buffer pool.
+**Wiring it into `pretrain` is not the modest change a `gpu.` grep suggests**, and this entry said
+it was until review counted properly. The grep returns 13 lines, but four are imports: nine calls
+over seven methods, of which only `describeDevice` and `residentBytes` are trivially replaceable.
+What the grep cannot see is the rest:
+
+- the two optimizers are not interchangeable. `MuonOpts` and `MuonGpuOpts` are structurally
+  identical, so the constructor ports, but `MuonGpu` has `recordStep()` where `Muon` has `step()`,
+  so it does not satisfy `Optimizer` and `trainLM` cannot take it, while `trainLMGpuResident` types
+  its parameter as `MuonGpu` so `Muon` cannot go the other way.
+- `syncWeightsToHost()`, `exportState()` and `importState()` exist only on the GPU optimizers, so
+  the `--resume` optimizer sidecar, its size in the checkpoint log, and the LoRA stale-sidecar
+  removal have no CPU path at all.
+- the `--recompute` guard tests `gpu.regionCount()`, and there is no backend-agnostic count to
+  substitute, so that is a new API rather than a swap. `checkpoint()` itself is genuinely
+  backend-agnostic, degrading to plain recompute, so the flag would work; the guard around it would
+  throw.
+- the trust gate would compare the CPU against itself, `cpuLoss` and the probe both coming from the
+  same `model.forward`, so the difference is zero by construction and it prints a green line for a
+  comparison it never made. That is the exact failure its own comment warns about for
+  `--loss-chunk`.
+
+None of that is a big project. It is more than a banner and a memory line, and the argument below
+reads stronger for conceding it.
 
 **The reason is throughput.** Same machine, same shape, same steps, CPU `trainLM` against GPU
 `trainLMGpuResident`:

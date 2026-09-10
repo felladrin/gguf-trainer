@@ -1739,7 +1739,10 @@ export async function initWebGPU(): Promise<WebGPUBackend | null> {
   if (webgpuRuntime() !== "ok") return null;
   // deno-lint-ignore no-explicit-any
   const nav: any = (globalThis as any).navigator;
-  const adapter = await nav.gpu.requestAdapter();
+  // Caught, not just null-checked: the spec resolves null on an adapterless
+  // machine, but a runtime that rejects instead would give the one user this
+  // whole change is for a stack trace rather than any of the five messages.
+  const adapter = await nav.gpu.requestAdapter().catch(() => null);
   if (!adapter) return null;
   // Request the adapter's own maximum buffer limits instead of the WebGPU
   // spec's conservative default (128 MiB per storage buffer binding).
