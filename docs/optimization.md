@@ -2515,8 +2515,9 @@ block's smallest kept count is 2. One case in that list closes it, and the whole
 runs where the suite actually runs.
 
 `allIgnoredGate` runs all three losses over a fully masked batch with the backend installed, and
-requires the device answer to be finite and to match the CPU. Six mutations, one per clamp, each
-failing in exactly its own arm:
+requires both the device answer and the CPU reference to be exactly 0, with a scored batch beside
+them in the same readback as the control. Six mutations, one per clamp, each failing in exactly its
+own arm:
 
 | clamp removed       | what the gate prints                                                                                                      |
 | :------------------ | :------------------------------------------------------------------------------------------------------------------------ |
@@ -2526,6 +2527,9 @@ failing in exactly its own arm:
 | `autograd.ts` dense | `MISMATCH allIgnored.dense: gpu=0 cpu=NaN`                                                                                |
 | `autograd.ts` fused | `MISMATCH allIgnored.fused: gpu=0 cpu=NaN`                                                                                |
 | `autograd.ts` soft  | `MISMATCH allIgnored.softCE: gpu=0 cpu=NaN`, and GPU-less, `teacher id range` reports `failed: every teacher row ignored` |
+
+Each device row also prints the summary line and each CPU row also prints its `MISMATCH`; the table
+shows whichever is the more useful of the two.
 
 **The bottom three needed a fix to the gate before they failed at all, and it is the interesting
 part.** The first draft checked `!Number.isFinite(got[i]) || Math.abs(got[i] - cpu[i]) > 1e-6`,
@@ -2540,11 +2544,21 @@ nothing accumulates and there is no float noise to absorb; and `NaN !== 0` is tr
 comparison covers both sides with no finiteness test at all. Written the other way round,
 `Math.abs(got[i]) > 0` is false for NaN, which is the same trap again.
 
-Two limits worth stating. At `kept == 0` the numerator is 0 too, so no arm here can grip the count's
-VALUE, only the clamp; the value is pinned by the partial-mask parity cases and by
-`chunked summed NLL` and `softCE summed NLL`. And WGSL does not promise that `0.0 / 0.0` is NaN, so
-the three device rows above are what this adapter did; what makes them adapter-independent is the
-comparison against the CPU rather than the NaN.
+Three limits worth stating. At `kept == 0` the numerator is 0 too, so no arm here can grip the
+count's VALUE, only the clamp; the value is pinned by the partial-mask parity cases and by
+`chunked summed NLL` and `softCE summed NLL`.
+
+WGSL does not promise that `0.0 / 0.0` is NaN, and a draft of this paragraph said the CPU comparison
+made the device arms adapter-independent. It does not, and the truth is the reverse: the check is
+`got !== 0` and `cpu !== 0` independently, so an adapter that yields 0 there makes all three device
+mutations invisible, and the CPU oracle cannot rescue them because it is 0 too. The three device
+rows are what THIS adapter did.
+
+And the arm's pass condition is "everything is 0", which an unread host buffer also satisfies, since
+`makeOut` hands back a `Tensor.zeros`. Deleting the readback made the first version pass on
+unwritten memory. A scored batch now rides in the same `sync` and must be nonzero and match the CPU,
+which is the control `targetRangeGate` carries for the same reason; with the readback deleted it
+reports `scored control 0.0000, 0.0000, 0.0000` and fails.
 
 ## Quality levers
 

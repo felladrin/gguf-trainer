@@ -530,9 +530,17 @@ async function main() {
       // than 0/0, and `!== 0` catches a dropped clamp because NaN !== 0 is true.
       // This is the only GPU-less coverage the softCrossEntropy clamp has, and
       // CI has no adapter, so `allIgnoredGate` in gpu-parity does not run there.
+      // Wrapped like the two above it: a guard that wrongly refused this would
+      // report as a failed case rather than aborting the file.
       [
         "every teacher row ignored",
-        softCrossEntropy(logits, [-1, 0, -1, 0, -1, 0], probs, k).data[0] === 0,
+        (() => {
+          try {
+            return softCrossEntropy(logits, [-1, 0, -1, 0, -1, 0], probs, k).data[0] === 0;
+          } catch {
+            return false;
+          }
+        })(),
       ],
     ];
     const bad = cases.filter(([, ok]) => !ok).map(([name]) => name);

@@ -2422,17 +2422,19 @@ async function recycleReuseGate(gpu: WebGPUBackend) {
  * check `mean * kept` against an independently summed numerator.
  *
  * Delete any one of the six clamps and the matching arm fails. On this adapter
- * the device three turn NaN, but WGSL does not promise that `0.0 / 0.0` is NaN,
- * so what makes those arms adapter-independent is the comparison against the
- * CPU rather than the NaN itself.
+ * the device three turn NaN. WGSL does not promise that `0.0 / 0.0` is NaN,
+ * and the check is `got !== 0` and `cpu !== 0` independently rather than a
+ * comparison, so an adapter that yields 0 there would make those three
+ * mutations invisible and the CPU oracle could not rescue them, being 0 too.
  */
 async function allIgnoredGate(gpu: WebGPUBackend) {
   const T = 3, H = 4, V = 6, K = 2;
   const hid = randTensor([T, H], mulberry32(71));
   const w = randTensor([V, H], mulberry32(73));
   const ignored = [-1, -1, -1];
-  // Every teacher row ignored too: the first slot is the marker, the rest are
-  // in-range pads the contract requires and nothing reads.
+  // Every teacher row ignored too: the first slot is the marker, and the rest
+  // are in-range by choice rather than by contract, since keptTeacherRows does
+  // not look at slots >= 1 of an ignored row.
   // The probabilities are NONZERO on purpose: with zeros, both bodies would
   // return 0 for a second reason (`q === 0` skips the term on the CPU, `q != 0.0`
   // in the kernel), and the row skip this arm is about would stop being
@@ -2440,22 +2442,46 @@ async function allIgnoredGate(gpu: WebGPUBackend) {
   const teacherIds = [-1, 0, -1, 0, -1, 0];
   const teacherQ = [0.6, 0.4, 0.6, 0.4, 0.6, 0.4];
 
+  // The control, and it is not optional here: `makeOut` hands back a
+  // `Tensor.zeros`, so an unread host buffer is all zeros and "everything is 0"
+  // is exactly this arm's pass condition. Delete the sync below and the ignored
+  // arms would pass on unwritten memory. `targetRangeGate` carries the same
+  // control for the same reason. These three run in the SAME sync, so they
+  // cannot be satisfied by a readback the ignored three did not get.
+  const scoredTargets = [0, V - 1, 1];
+  const scoredIds = [0, 1, 2, 3, 4, 5];
+
   const cpu = [
     crossEntropy(linear(hid, w), ignored).data[0],
     fusedCrossEntropy(hid, w, ignored, 2).data[0],
     softCrossEntropy(linear(hid, w), teacherIds, teacherQ, K).data[0],
+    crossEntropy(linear(hid, w), scoredTargets).data[0],
+    fusedCrossEntropy(hid, w, scoredTargets, 2).data[0],
+    softCrossEntropy(linear(hid, w), scoredIds, teacherQ, K).data[0],
   ];
 
   gpu.install();
   let ok = true;
   try {
-    const dense = crossEntropy(linear(hid, w), ignored);
-    const fused = fusedCrossEntropy(hid, w, ignored, 2);
-    const soft = softCrossEntropy(linear(hid, w), teacherIds, teacherQ, K);
-    await gpu.sync([dense, fused, soft]);
+    const out = [
+      crossEntropy(linear(hid, w), ignored),
+      fusedCrossEntropy(hid, w, ignored, 2),
+      softCrossEntropy(linear(hid, w), teacherIds, teacherQ, K),
+      crossEntropy(linear(hid, w), scoredTargets),
+      fusedCrossEntropy(hid, w, scoredTargets, 2),
+      softCrossEntropy(linear(hid, w), scoredIds, teacherQ, K),
+    ];
+    await gpu.sync(out);
     const names = ["dense", "fused", "softCE"];
-    const got = [dense.data[0], fused.data[0], soft.data[0]];
-    for (let i = 0; i < got.length; i++) {
+    const got = out.map((t) => t.data[0]);
+    for (let i = 3; i < got.length; i++) {
+      // The control: a scored batch must be nonzero and must match the CPU.
+      if (!(Math.abs(got[i]) > 1e-6) || Math.abs(got[i] - cpu[i]) > 1e-4) {
+        console.log(`    MISMATCH allIgnored.scored.${names[i - 3]}: gpu=${got[i]} cpu=${cpu[i]}`);
+        ok = false;
+      }
+    }
+    for (let i = 0; i < 3; i++) {
       // `!== 0` rather than a tolerance, doing two jobs. Exact zero is guaranteed
       // here rather than hoped for: every kernel writes 0 for an ignored row and
       // the CPU totals are sums over no terms, so nothing accumulates and there
@@ -2471,7 +2497,8 @@ async function allIgnoredGate(gpu: WebGPUBackend) {
     if (!ok) failures++;
     console.log(
       `  ${ok ? "ok " : "FAIL"} an all-ignored batch is 0 on both sides, not NaN ` +
-        `(dense ${got[0]}, fused ${got[1]}, softCE ${got[2]})`,
+        `(dense ${got[0]}, fused ${got[1]}, softCE ${got[2]}; ` +
+        `scored control ${got[3].toFixed(4)}, ${got[4].toFixed(4)}, ${got[5].toFixed(4)})`,
     );
   } finally {
     gpu.uninstall();
