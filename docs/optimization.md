@@ -1690,9 +1690,12 @@ in hand and lands on the cooldown phase. `tokenize` and `chat-corpus` both stamp
 self-checks rather than before, so a file that fails one cannot ship with a valid identity beside it.
 The byte size cannot substitute there: such a file is complete on disk and merely wrong, so its size
 agrees, and stamping first would turn what used to be an unstamped file into a false ok.
-The stamp also carries the file's byte size: without it a stale stamp beside a rewritten file
-reports a false ok, which is worse than no stamp, and a crash between the write and the stamp is
-indistinguishable from a legacy file. Hashing the whole export rather than the size catches the case a size
+The stamp also carries the file's byte size, and the rule has a second half: every writer drops any
+stamp it finds before writing. Without the byte size, a stale stamp beside a rewritten file reports
+a false ok, which is worse than no stamp; without the drop, that detection would rest entirely on
+the size agreeing, and a crash between the write and the stamp would leave the previous run's stamp
+looking valid. Together they make it unconditional, so a stamp never describes a file it did not
+see, and the crash window leaves an unstamped file rather than a wrong one. Hashing the whole export rather than the size catches the case a size
 check misses entirely, a vocab of the same size whose merges retokenize the corpus differently, and
 the specials too. The id width is compared on its own rather than folded into the hash, because a
 width mismatch corrupts the read whatever the tokenizer says.
@@ -1745,7 +1748,9 @@ The cases live in `tests/large-vocab.ts`, beside the preflight's. Reporting an u
 dropping the width comparison, hashing only the vocab size, and treating an unparseable stamp as
 absent, dropping the byte-size comparison, dropping the object guard that keeps a stamp of `null`
 from throwing a TypeError instead of a message, and widening the read to treat every failure as
-absent rather than only ENOENT. Seven mutations, seven distinct assertions. Two more pin what the rest of this entry asserts rather than leaving it as
+absent rather than only ENOENT, and the width path reporting a malformed stamp as absent or skipping
+the byte size, the write no longer dropping a stale stamp, and the width path hashing the tokenizer
+after all. Eleven mutations, eleven distinct assertions. Two more pin what the rest of this entry asserts rather than leaving it as
 prose: that the fingerprint survives a json round trip through `fromData`, which is the failure that
 would refuse correct corpora rather than admit wrong ones; and the width flip itself, through
 `writeTokenFile` and `diskTokenSource`. That second one corrected this entry: reading a 4-byte file
@@ -1754,7 +1759,8 @@ as 2-byte splits each id into its low and high halves, and the high halves are 0
 crossed the u16 ceiling is precisely the one where it is false.
 
 What no test reaches is the call sites. Deleting `assertTokenFileId` from any of the three leaves
-the suite green; the end-to-end runs above are the evidence, and they are not repeatable in CI.
+the suite green, and so does moving either producer's stamp back above its round-trip check. The
+end-to-end runs above are the evidence, and they are not repeatable in CI.
 
 ## Quality levers
 

@@ -259,6 +259,7 @@ async function run(v: Values) {
     `${outPrefix}.template.txt`,
     new TextEncoder().encode(DEFAULT_CHAT_TEMPLATE),
   );
+
   const src = await diskTokenSource(`${outPrefix}.tokens`, bpt);
   const maskSrc = await diskTokenSource(`${outPrefix}.mask`, bpt);
   if (src.length !== len) die(`round-trip length mismatch: wrote ${len}, read ${src.length}`);
@@ -278,7 +279,7 @@ async function run(v: Values) {
 
   console.log(
     `\nwrote ${outPrefix}.tokens (${bpt}B/token, ${((len * bpt) / 1e6).toFixed(1)} MB), ` +
-      `${outPrefix}.mask, .tokenizer.json, .template.txt`,
+      `${outPrefix}.mask, .tokens.id, .tokenizer.json, .template.txt`,
   );
   console.log(`round-trip: disk token file matches the encoded head ✓`);
   console.log(
@@ -290,14 +291,15 @@ export const chatCorpusCommand: Command = {
   name: "chat-corpus",
   summary: "Turn a chat dataset into SFT tokens plus an assistant-only loss mask.",
   details: `Renders every conversation through the exporter's own chat template, encodes it with
-the BASE MODEL'S tokenizer, and writes four files:
+the BASE MODEL'S tokenizer, and writes five files:
 
   <out>.tokens         the token stream
+  <out>.tokens.id      which tokenizer produced it; later stages refuse a mismatch
   <out>.mask           1 where a token is part of an assistant turn, 0 elsewhere
   <out>.tokenizer.json the same vocab, with EOS moved to <|im_end|>
   <out>.template.txt   the chat template to embed in the fine-tuned GGUF
 
-Feed all four to \`finetune\`. The tokenizer is REUSED, never retrained: the embedding matrix
+Feed all five to \`finetune\`. The tokenizer is REUSED, never retrained: the embedding matrix
 froze when pretraining started, so a new vocab would not match the checkpoint. The command
 aborts if the tokenizer lacks the ChatML specials.
 

@@ -350,6 +350,20 @@ ok(
   asWritten.close();
   asNarrow.close();
 
+  // The other half of the byte-size rule: a rewrite of the same length would
+  // leave the stamp agreeing on bytes and reporting a false ok, so the write
+  // drops it. The invariant is unconditional, not size-dependent.
+  const rewritten = path.join(dir, "rewritten.tokens");
+  await writeTokenFile(rewritten, [1, 2, 3], 2);
+  await stampTokenFile(rewritten, a.export(), a.vocabSize, 2);
+  ok(fs.existsSync(tokenIdPath(rewritten)), "the stamp is there to begin with");
+  await writeTokenFile(rewritten, [4, 5, 6], 2);
+  const after = await checkTokenFileId(rewritten, a.export(), a.vocabSize, 2);
+  ok(
+    after.status === "unstamped",
+    `a same-length rewrite leaves no stamp rather than a matching one: got ${after.status}`,
+  );
+
   // Only ENOENT means absent. Treating every read failure as "no stamp" is the
   // bug pretrain's optstate probe already paid for once, where decoding a
   // multi-GB sidecar as UTF-8 overflowed and reported no optstate.
@@ -389,6 +403,20 @@ ok(
     wResized.status === "mismatch" && wResized.message.includes("is 2 bytes"),
     "and so is a file rewritten under its own stamp, which needs no tokenizer either",
   );
+  // Back to a file its stamp describes, so the byte size is not what is being
+  // measured below.
+  await stampTokenFile(wOnly, a.export(), a.vocabSize, 2);
+
+  // The asymmetry lever 38 spends a paragraph defending: a different tokenizer
+  // of the same width is refused by the full check and passed by the width one.
+  // Without this, "improving" the width path to hash the tokenizer would refuse
+  // correct corpora in eval-loss with the suite green.
+  const sameWidth = await checkTokenFileId(wOnly, b.export(), b.vocabSize, 2);
+  ok(
+    sameWidth.status === "mismatch" && (await checkTokenFileWidth(wOnly, 2)).status === "ok",
+    "a different tokenizer of the same width: refused by the full check, passed by the width one",
+  );
+
   fs.writeFileSync(tokenIdPath(wOnly), "null");
   const wNull = await checkTokenFileWidth(wOnly, 2);
   ok(

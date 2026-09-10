@@ -13,7 +13,14 @@
 // when the vocab fits in u16, else 4. tokenBytes(vocabSize) picks the width;
 // the reader is told the width (the model's config carries the vocab size).
 
-import { chunkSpans, fileSize, openReader, readFileTextIfPresent, writeFileBytes } from "../io.ts";
+import {
+  chunkSpans,
+  fileSize,
+  openReader,
+  readFileTextIfPresent,
+  removeIfPresent,
+  writeFileBytes,
+} from "../io.ts";
 
 export interface TokenSource {
   /** Number of tokens in the corpus. */
@@ -128,6 +135,12 @@ export async function writeTokenFile(
     if (bytesPerToken === 2) dv.setUint16(i * 2, tokens[i], true);
     else dv.setUint32(i * 4, tokens[i], true);
   }
+  // Any stamp beside this path described the file being overwritten, not this
+  // one. Dropping it makes the invariant unconditional: a stamp never describes
+  // a file it did not see. Without this, detection rests on the byte size, which
+  // agrees whenever the new file lands on the same length, and a crash between
+  // here and stampTokenFile leaves the previous run's stamp looking valid.
+  await removeIfPresent(tokenIdPath(path));
   await writeFileBytes(path, bytes);
 }
 
@@ -188,8 +201,10 @@ export interface TokenFileId {
    * Size of the token file when it was stamped.
    *
    * Without it a stale stamp beside a rewritten file reports a false ok, which
-   * is worse than no stamp at all, and a crash between writeTokenFile and
-   * stampTokenFile is indistinguishable from a file that predates the stamp.
+   * is worse than no stamp at all. A crash between writeTokenFile and
+   * stampTokenFile is handled by the other half of the same rule: the write
+   * drops any stamp it finds, so the window leaves an unstamped file rather than
+   * a valid-looking one.
    */
   bytes: number;
 }
@@ -256,7 +271,10 @@ export async function checkTokenFileId(
   }
   // JSON.parse("null") and JSON.parse("3") both succeed, and the field reads
   // below would throw out of the function rather than say what is wrong.
-  if (typeof id !== "object" || id === null) {
+  if (
+    typeof id !== "object" || id === null ||
+    (id.bytesPerToken !== 2 && id.bytesPerToken !== 4)
+  ) {
     return bad(
       `${tokenIdPath(tokensPath)} is not readable JSON; delete it and rebuild ${tokensPath}`,
     );

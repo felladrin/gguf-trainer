@@ -25,8 +25,8 @@
 
 import { BPETokenizer } from "../tokenizer/bpe.ts";
 import type { TokenizerData } from "../tokenizer/bpe.ts";
-import { readFileText, writeFileBytes } from "../io.ts";
-import { diskTokenSource, stampTokenFile, tokenBytes } from "../data/tokens.ts";
+import { readFileText, removeIfPresent, writeFileBytes } from "../io.ts";
+import { diskTokenSource, stampTokenFile, tokenBytes, tokenIdPath } from "../data/tokens.ts";
 import { CURRICULUM_SPECIALS } from "../data/chat.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
@@ -108,6 +108,10 @@ async function run(v: Values) {
   // 2. Encode part by part, appending each part's tokens to the output as we go
   //    so peak memory stays O(one part) however large the whole corpus is.
   const tokensPath = `${outPrefix}.tokens`;
+  // This writer opens the fd itself rather than going through writeTokenFile,
+  // so it drops any stale stamp the same way: a stamp must never describe a file
+  // it did not see, including a run that dies before reaching the stamp below.
+  await removeIfPresent(tokenIdPath(tokensPath));
   const fd = fs.openSync(tokensPath, "w");
   let totalTokens = 0, totalChars = 0, totalDocs = 0;
   const probes: { offset: number; ids: number[] }[] = [];
@@ -171,10 +175,11 @@ export const tokenizeCommand: Command = {
   name: "tokenize",
   summary: "Turn a text corpus into the binary token stream the trainer reads.",
   details: `Trains a byte-level BPE vocab on a bounded sample of the corpus, then encodes the
-whole thing and writes two files:
+whole thing and writes three files:
 
   <out>.tokens           the token stream the trainer memory-maps
   <out>.tokenizer.json   the vocab and merges, which every later stage MUST reuse verbatim
+  <out>.tokens.id        which tokenizer produced the stream; later stages refuse a mismatch
 
 Pass --curriculum-specials when the model will later be fine-tuned for chat, reasoning or
 tool calls. The vocab and embedding matrix freeze when pretraining starts, so those special

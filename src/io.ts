@@ -87,6 +87,12 @@ export async function readFileTextIfPresent(path: string): Promise<string | null
   }
 }
 
+/** Delete a file if it is there. Absence is the desired end state, not an error. */
+export async function removeIfPresent(path: string): Promise<void> {
+  const fs = await import("node:fs");
+  fs.rmSync(path, { force: true });
+}
+
 export async function fileSize(path: string): Promise<number> {
   const fs = await import("node:fs");
   return fs.statSync(path).size;
