@@ -2471,6 +2471,13 @@ async function allIgnoredGate(gpu: WebGPUBackend) {
       fusedCrossEntropy(hid, w, scoredTargets, 2),
       softCrossEntropy(linear(hid, w), scoredIds, teacherQ, K),
     ];
+    // Seeded per tensor so each of the six proves individually that the readback
+    // wrote it. Without this, an op that never reaches the device leaves its
+    // host `Tensor.zeros` untouched and passes an arm whose expected value IS
+    // zero; the scored control cannot see that, because it took the real path.
+    // `NaN !== 0` fails an ignored arm and `!(Math.abs(NaN) > 1e-6)` fails a
+    // control arm, so nothing here can be satisfied by an unwritten buffer.
+    for (const t of out) t.data[0] = NaN;
     await gpu.sync(out);
     const names = ["dense", "fused", "softCE"];
     const got = out.map((t) => t.data[0]);

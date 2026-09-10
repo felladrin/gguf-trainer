@@ -2556,9 +2556,13 @@ rows are what THIS adapter did.
 
 And the arm's pass condition is "everything is 0", which an unread host buffer also satisfies, since
 `makeOut` hands back a `Tensor.zeros`. Deleting the readback made the first version pass on
-unwritten memory. A scored batch now rides in the same `sync` and must be nonzero and match the CPU,
-which is the control `targetRangeGate` carries for the same reason; with the readback deleted it
-reports `scored control 0.0000, 0.0000, 0.0000` and fails.
+unwritten memory. Two things close that. A scored batch rides in the same `sync` and must be nonzero
+and match the CPU, which is the control `targetRangeGate` carries for the same reason; with the
+readback deleted it reports `scored control 0.0000, 0.0000, 0.0000`. And every one of the six host
+scalars is seeded to `NaN` first, so each proves individually that the readback wrote it: `NaN !== 0`
+fails an ignored arm and `!(Math.abs(NaN) > 1e-6)` fails a control arm. The control alone would not
+have caught an op that never reached the device at all, since it takes the real path; the seed does.
+With the sync deleted, all six now report.
 
 ## Quality levers
 
