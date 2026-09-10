@@ -120,7 +120,8 @@ const SAMPLE_PROMPTS = [
  * optimizer the adapters, which is what this keeps. So this only says earlier
  * what the optimizer says a few dozen lines later, and the set has no removal
  * path. Measured on a 596M shape: 2,384,199,688 bytes of staging that never
- * happens, worth a second or so on a 74 s run. probeReadbackGate is what
+ * happens, and a second or so on a 74 s run, which is within the run-to-run
+ * spread and not the reason to do it. probeReadbackGate is what
  * notices if it goes away again.
  */
 export async function probeGpuLosses(

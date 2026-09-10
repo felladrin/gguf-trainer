@@ -1643,8 +1643,8 @@ step, `--reclaim`), two runs each:
 | as it stood  | 73.55 s, 74.23 s |
 | with the fix | 71.72 s, 73.11 s |
 
-Worth a second or so, which with two runs a side is under the after arm's own spread and not a
-number to lean on. The finding is the 2,384,199,688 bytes of staging that never happens, printed by
+Worth a second or so: 1.48 s between the means, against 1.39 s of spread within the after arm
+itself, which with two runs a side is not a number to lean on. The finding is the 2,384,199,688 bytes of staging that never happens, printed by
 the probe's own `lastSyncReadbackBytes` before the fix. Once per run, and honest to describe as
 tidiness rather than a speed-up. What it is worth more than the
 second is that it removes the last instance of the pattern levers 25, 27 and 32 exist to close.
@@ -1657,8 +1657,11 @@ duplicating it, and a duplicate goes green no matter what the real caller picks.
 half is now `probeGpuLosses`, taking the LoRA handle rather than a tensor list, so both branches of
 the decision run inside the function the test calls.
 
-`probeReadbackGate` in `tests/gpu-parity.ts` pins it, controls included: each arm's control passes
-an empty adapter list, which is exactly what the helper keeps with its loop deleted. Deleting the
+`probeReadbackGate` in `tests/gpu-parity.ts` pins it, controls included. The dense control passes an
+empty adapter list, exactly what the helper keeps with its loop deleted; the LoRA one passes `null`,
+so the helper keeps the frozen base, which is a no-op twice over and leaves the adapters staging.
+What the gate does not reach is the call site: `pretrain` passes `lora` to the helper and the test
+passes its own argument, so the branch is pinned and the decision to hand it the handle is not. Deleting the
 loop, collapsing the LoRA branch to `model.params()`, and collapsing the non-LoRA branch to the
 adapters each fail it. Moving the loop to just before the `sync()` does not, and should not:
 `keepGradOnDevice` is read at sync time, so anywhere before it is the same call.

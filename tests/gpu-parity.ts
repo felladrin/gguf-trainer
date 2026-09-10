@@ -1577,19 +1577,25 @@ async function generateFreezeGate() {
  * Nothing reads them: no code in that file reads a host-side gradient, and both
  * GPU optimizers clip and step on device.
  *
- * The controls pass an empty adapter list, which is what the helper keeps with
- * its loop deleted, so an arm and its control coincide if the loop goes away.
- * That is the whole point: without a measurement the line is invisible, since
- * the losses are identical either way and every other gate stays green while the
- * probe copies the model. The LoRA arm covers the other half of the same
- * decision, that the adapters and not the frozen base are what to keep.
+ * The two controls reach "keeps nothing" by different routes. The dense one
+ * passes an empty adapter list, which is what the helper keeps with its loop
+ * deleted, so that arm and its control coincide if the loop goes away. The LoRA
+ * one passes null, so the helper takes the model.params() branch and keeps the
+ * frozen base, which is a no-op twice over: the adapters stage either way. That
+ * is the whole point, in both cases. Without a measurement the line is
+ * invisible, since the losses are identical either way and every other gate
+ * stays green while the probe copies the model.
+ *
+ * What this does not reach is the call site. `pretrain` passes `lora` to the
+ * helper, and the test passes its own argument, so changing that one argument to
+ * null would put a LoRA run back to staging its adapters with every gate green.
+ * The refactor shrank that residue rather than closing it: the branch itself is
+ * pinned here, the decision to hand it the handle is not.
  */
 async function probeReadbackGate() {
   const cfg = gemma3Config(64, 64, 4, 256, 16);
   const probeIn = [3, 11, 29, 5, 17, 2, 41, 8];
   const probeTgt = [11, 29, 5, 17, 2, 41, 8, 13];
-  // The control passes an empty adapter list, which is what the helper keeps
-  // with its loop deleted.
   const arm = async (keepThem: boolean, lossChunk: number) => {
     const gpu = (await initWebGPU())!;
     const m = new Gemma3Model(cfg, mulberry32(5));
