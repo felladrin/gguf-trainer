@@ -69,9 +69,9 @@ function parseCSV(text: string, delim: string): Row[] {
 }
 
 async function parseParquet(bytes: Uint8Array): Promise<Row[]> {
-  // Imported here, not at the top: a static import made every transitive
-  // importer of this file unloadable under Node, which is where three test
-  // files went missing from `deno task test:node`. See lever 39.
+  // Imported here, not at the top: a static import makes every transitive
+  // importer of this file unloadable under Node, which is how three test files
+  // went missing from `deno task test:node`. See lever 39.
   const { parquetReadObjects } = await import("hyparquet");
   // hyparquet reads via an AsyncBuffer ({ byteLength, slice }); wrap the in-memory
   // bytes. ArrayBuffer.slice is synchronous but a sync return satisfies the await.

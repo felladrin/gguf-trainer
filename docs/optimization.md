@@ -1794,17 +1794,23 @@ package when a parquet file is actually read, `deno check` still resolves the ty
 dynamic specifier, and `eval-choice --task piqa`, which takes the JSON loader, stops paying for a
 reader it never calls.
 
-The issue named one file; the fix reached two, and looking properly found five more that were never
-blocked at all. `tests/style-pipeline.ts` was out for the identical reason, through `style-seed.ts`.
-`tests/generate-penalty.ts` had simply never been added. And three of the exemptions written into
-the first version of the guard turned out to be false: `endpoint-score.ts`, `rp-battery-score.ts`
-and `rp-chats.ts` were each recorded as blocked by a Deno API in the script they test, when every
-one of those sits behind an `import.meta.main` guard and never runs on import. All three passed
-under Node the moment anyone tried. `test:node` went from 14 files to 21.
+The issue named one file. Restoring the static import and running each candidate says the truth:
+three were blocked by it, `eval-tasks.ts`, `style-pipeline.ts` (through `style-seed.ts`) and
+`rp-chats.ts` (through `scripts/build-rp-chats.ts`). Four were not blocked by anything.
+`generate-penalty.ts` had simply never been added, and three had exemptions written for them in the
+first version of the guard: `endpoint-score.ts`, `rp-battery-score.ts` and `rp-chats.ts` were each
+recorded as blocked by a Deno API in the script they test, when every one of those sits behind an
+`import.meta.main` guard and never runs on import. Two of the three passed under Node the moment
+anyone tried.
 
-The check this leaves behind is the tests themselves: three files join `test:node`, so putting the
-static import back fails two of them with the same `ERR_MODULE_NOT_FOUND`. Verified by doing exactly
-that. Parquet reading is unchanged, checked against `tests/fixtures/tiny.parquet` under Deno,
+`rp-chats.ts` is the interesting one, because it was on both lists: its exemption named the wrong
+cause while the file really was unloadable. A reason that is wrong about why is invisible even when
+it happens to be right about whether, which is worth more as a warning than either half alone.
+`test:node` went from 14 files to 21.
+
+The check this leaves behind is the tests themselves: seven files join `test:node`, and putting the
+static import back fails three of them with the same `ERR_MODULE_NOT_FOUND` while the other four
+pass. Verified by doing exactly that, file by file. Parquet reading is unchanged, checked against `tests/fixtures/tiny.parquet` under Deno,
 including the `subarray` path that exercises the `byteOffset` slice.
 
 **The static import is only half of why those assertions were invisible.** It made `eval-tasks.ts`
@@ -1816,6 +1822,11 @@ failure per file. It matches the runner and not just the path, so pasting `deno 
 into the `test:node` string cannot report Node coverage that does not exist. One exemption survives:
 `npm-deps.ts` statically imports `@huggingface/jinja`, and exercising the npm dependencies is the
 point of that file, so the import cannot move inside a function.
+
+Two static npm imports remain outside `parse.ts`, in `corpus.ts` and `chat-corpus.ts`. Both are
+reachable only through `src/cli/registry.ts` and so only from `cli.ts`, which is Deno-only anyway,
+and no test imports either. They are not a coverage problem today, and the rule for the day one is:
+move the import, do not earn an exemption.
 
 The exemption list is where this bug can come back, which is why the bar written into it is a load
 failure someone has seen rather than a guess. Its own first version is the cautionary case: five

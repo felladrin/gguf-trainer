@@ -38,8 +38,12 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const testsDir = path.join(root, "tests");
 
 const cfg = JSON.parse(fs.readFileSync(path.join(root, "deno.json"), "utf8")) as {
-  tasks: Record<string, unknown>;
+  tasks?: Record<string, unknown>;
 };
+// Renaming the task is covered below; renaming or dropping the block around it
+// would otherwise be a bare TypeError, and Deno reads deno.json as JSONC, so a
+// comment someone adds is a bare SyntaxError from the parse above.
+ok(cfg.tasks !== undefined, "deno.json has no `tasks` block; this check reads both task strings");
 /**
  * Filenames a task actually hands to a given runner.
  *
@@ -48,7 +52,7 @@ const cfg = JSON.parse(fs.readFileSync(path.join(root, "deno.json"), "utf8")) as
  * that does not exist, which is the false signal this file was written to stop.
  */
 function invoked(task: string, runner: RegExp): Set<string> {
-  const body = cfg.tasks[task];
+  const body = cfg.tasks![task];
   ok(
     typeof body === "string",
     `deno.json's "${task}" task is ${
@@ -59,8 +63,12 @@ function invoked(task: string, runner: RegExp): Set<string> {
   return new Set(Array.from((body as string).matchAll(re), (m) => m[1]));
 }
 
-const inTest = invoked("test", /deno run(?:\s+-A)?/);
-const inNode = invoked("test:node", /node --experimental-strip-types/);
+// Any flags, not just today's: `deno run --allow-read` or `node
+// --experimental-strip-types --no-warnings` would otherwise make a listed file
+// look missing, and the error would point at the wrong thing.
+const FLAGS = "(?:\\s+--?[\\w=./-]+)*";
+const inTest = invoked("test", new RegExp(`deno run${FLAGS}`));
+const inNode = invoked("test:node", new RegExp(`node${FLAGS}`));
 
 /** Every .ts under tests/, at any depth, minus the fixture data. */
 function testFiles(dir: string, prefix = ""): string[] {
