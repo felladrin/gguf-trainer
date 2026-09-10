@@ -39,7 +39,8 @@ are in [docs/adding-an-architecture.md](../docs/adding-an-architecture.md).
 Every new op in `src/model/autograd.ts` needs a **finite-difference gradient check** before it's
 trusted: add a case to `tests/gradcheck.ts` (it perturbs each input by ±ε and compares
 `(f(x+ε) − f(x−ε)) / 2ε` against the analytic gradient your `_backward` produces) and run
-`deno task test` plus `deno task test:node`. New ops also need an entry in the `OpsBackend`
+`deno task test`, `deno task test:node` and `deno task test:bun`. New ops also need an entry in
+the `OpsBackend`
 interface and a WebGPU implementation, or GPU graphs break.
 
 ## Adding a WebGPU kernel

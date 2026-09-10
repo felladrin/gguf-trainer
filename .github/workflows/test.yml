@@ -70,12 +70,24 @@ jobs:
       # a network install; if it ever can, auto-install came back through some
       # route (a warmed cache, a node_modules something now creates) and
       # test:bun quietly stopped proving what it claims.
+      # The message, not the exit code: `if bun run ...; then fail` treats every
+      # nonzero exit as the expected one, so a broken import or a bun crash
+      # would pass this control while auto-install was quietly back on. Matching
+      # bun's wording is only safe because the version is pinned, which is a
+      # second thing the pin buys.
       - name: Auto-install stays off
         run: |
-          if bun run --no-install tests/npm-deps.ts; then
+          if out=$(bun run --no-install tests/npm-deps.ts 2>&1); then
+            printf '%s\n' "$out" >&2
             echo "npm-deps.ts resolved with no install; the Bun exemption is stale" >&2
             exit 1
           fi
+          printf '%s\n' "$out"
+          case "$out" in
+            *"Cannot find module '@huggingface/jinja'"*) ;;
+            *) echo "it failed for some other reason; the control proved nothing" >&2
+               exit 1 ;;
+          esac
 
   # Two versions, both pinned. 22.6.0 is the exact floor readme.md promises and
   # the first release with --experimental-strip-types, so this entry tests the

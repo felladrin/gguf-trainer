@@ -91,7 +91,13 @@ function invoked(task: string, runner: RegExp): Set<string> {
 // --experimental-strip-types --no-warnings` would otherwise make a listed file
 // look missing, and the error would point at the wrong thing.
 const FLAGS = "(?:\\s+--?[\\w=./-]+)*";
-const inTest = invoked("test", new RegExp(`deno run${FLAGS}`));
+// Written once each: the flag check below re-derives its regex from `runner`,
+// and the two have to be the same pattern for that derivation to cover exactly
+// the invocations `invoked` counted.
+const DENO_RUNNER = new RegExp(`deno run${FLAGS}`);
+const NODE_RUNNER = new RegExp(`node${FLAGS}`);
+const BUN_RUNNER = new RegExp(`bun(?:\\s+run)?${FLAGS}`);
+const inTest = invoked("test", DENO_RUNNER);
 /**
  * The non-Deno runtimes, each with the list it is checked against. Adding a
  * fourth means adding a row, not another copy of the loop below: the reason
@@ -109,8 +115,8 @@ const RUNTIMES: {
 }[] = [
   {
     task: "test:node",
-    runner: new RegExp(`node${FLAGS}`),
-    listed: invoked("test:node", new RegExp(`node${FLAGS}`)),
+    runner: NODE_RUNNER,
+    listed: invoked("test:node", NODE_RUNNER),
     exempt: NODE_EXEMPT,
     map: "NODE_EXEMPT",
     how: "node --experimental-strip-types",
@@ -122,8 +128,8 @@ const RUNTIMES: {
     // `bun run x.ts` and `bun x.ts` are both valid, so the `run` is optional
     // here; the flag is what has to be there, and `needs` is what says so.
     task: "test:bun",
-    runner: new RegExp(`bun(?:\\s+run)?${FLAGS}`),
-    listed: invoked("test:bun", new RegExp(`bun(?:\\s+run)?${FLAGS}`)),
+    runner: BUN_RUNNER,
+    listed: invoked("test:bun", BUN_RUNNER),
     exempt: BUN_EXEMPT,
     map: "BUN_EXEMPT",
     how: "bun run --no-install",
@@ -169,22 +175,39 @@ for (const f of onDisk) {
   }
 }
 
-const ALL = [{ task: "test", listed: inTest }, ...RUNTIMES];
+/** `test` under the same checks, minus the exemptions it does not have. */
+const DENO_ROW = {
+  task: "test",
+  runner: DENO_RUNNER,
+  listed: inTest,
+  exempt: {} as Record<string, string>,
+  map: "",
+  how: "deno run",
+  needs: [] as string[],
+};
+const ALL = [DENO_ROW, ...RUNTIMES];
 for (const { task, listed } of ALL) {
   for (const f of listed) {
     ok(onDisk.includes(f), `\`deno task ${task}\` runs tests/${f}, which is not on disk`);
   }
 }
-for (const rt of RUNTIMES) {
+for (const rt of ALL) {
   const body = cfg.tasks![rt.task] as string;
   // Per PATH, not per file. The per-file check above passes as soon as a file
   // is listed once, so `&& node tests/eta-fmt.ts` appended to test:bun hides
   // behind the correct invocation on the line before it.
   const mentioned = body.match(/tests\/[A-Za-z0-9._/-]+\.ts/g) ?? [];
+  const claimed = body.match(
+    new RegExp(`${rt.runner.source}\\s+tests/[A-Za-z0-9._/-]+\\.ts`, "g"),
+  ) ?? [];
+  // Occurrences against occurrences, not against `listed`, which is a Set: a
+  // file invoked twice on purpose would otherwise be a false failure blaming a
+  // cause that is not there.
   ok(
-    mentioned.length === rt.listed.size,
+    mentioned.length === claimed.length,
     `deno.json's ${rt.task} task mentions ${mentioned.length} tests/ paths but ` +
-      `${rt.listed.size} are invoked by \`${rt.how}\`; one is handed to another runtime`,
+      `${claimed.length} are invoked by "${rt.how}"; one is handed to another runtime, ` +
+      `written ./tests/, or passed as an argument rather than as the entry point`,
   );
   // Every invocation carries the flags the runtime's promise depends on. A
   // flag in the task string is a claim, and nothing else here checks it.
@@ -203,6 +226,22 @@ for (const rt of RUNTIMES) {
     // reason is what the three wrong ones would have collapsed to.
     ok(reason.trim().length > 20, `${rt.map}["${f}"] needs a reason, not a placeholder`);
   }
+}
+
+/**
+ * Every task here is run by CI. This is the check #89 and #97 both needed and
+ * neither had: in both, the task existed, was correct, and nothing on a runner
+ * invoked it, so its guarantee held only for whoever ran it by hand. It couples
+ * a test to a workflow file, which is the objection; comparing two
+ * hand-maintained lists is what this file already does, which is the answer.
+ */
+const workflow = fs.readFileSync(path.join(root, ".github/workflows/test.yml"), "utf8");
+for (const rt of ALL) {
+  ok(
+    new RegExp(`run:\\s+deno task ${rt.task}\\s*$`, "m").test(workflow),
+    `.github/workflows/test.yml has no \`run: deno task ${rt.task}\` step, so that task is ` +
+      `checked only by whoever runs it by hand. That is what #89 and #97 were`,
+  );
 }
 
 console.log(

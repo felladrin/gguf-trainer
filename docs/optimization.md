@@ -2383,12 +2383,34 @@ That last one had a hole the review found: the runner match was per FILE, so a w
 invisible whenever the file was also listed correctly. Appending `&& node tests/eta-fmt.ts` to a
 complete `test:bun` fired nothing, because `eta-fmt.ts` was already listed by the invocation above
 it. A count of the `tests/` paths the string mentions against the count the runner claimed closes
-it: `mentions 22 tests/ paths but 21 are invoked by \`bun run --no-install\`; one is handed to
-another runtime`.
+it, and the message names the three ways it can happen:
+
+```
+deno.json's test:bun task mentions 22 tests/ paths but 21 are invoked by "bun run --no-install";
+one is handed to another runtime, written ./tests/, or passed as an argument rather than as the
+entry point
+```
+
+It counts occurrences on both sides rather than against the `Set` of files, so a task that runs one
+file twice on purpose is not a false failure blaming a cause that is not there. `test` gets a row of
+its own for this check, since the hole was never Bun-specific.
 
 The Bun version is pinned to 1.4.2 rather than `latest`, for the reason lever 44 gives for pinning
 the Node ceiling: Bun has no LTS line, so `latest` turns CI red on a release date rather than on a
-change, and a moving version makes the numbers in this lever unreproducible.
+change, and a moving version makes the numbers in this lever unreproducible. The pin buys a second
+thing, which is that the positive control can assert bun's actual wording. It checks the message
+rather than the exit code, because `if bun run ...; then fail` treats every nonzero exit as the
+expected one, and a broken import or a crash inside `npm-deps.ts` would then pass the control while
+auto-install was quietly back on. Unlike Node, no floor is claimed: `readme.md` says CI pins 1.4.2
+and that no older Bun is promised, because none was tested.
+
+**And one check closes the shape behind both #89 and #97.** Each was the same story: a task existed,
+was correct, and nothing on a runner invoked it, so its guarantee held only for whoever ran it by
+hand. `tests/task-coverage.ts` now reads `.github/workflows/test.yml` and asserts each of the three
+tasks appears as a `run:` step. Replace `deno task test:bun` in the workflow with anything else and
+it fails with "that task is checked only by whoever runs it by hand. That is what #89 and #97 were".
+It couples a test to a CI file, which is the objection; comparing two hand-maintained lists is what
+this file already exists to do, which is the answer.
 
 **What the Bun job catches that the Node one cannot.** Not stricter syntax: Bun runs TypeScript
 natively rather than through Node's stripper, so it accepts things Node refuses. What it covers is a

@@ -400,7 +400,8 @@ _(Subgroup-matrix GEMM is dropped from the roadmap: unavailable in Deno's wgpu, 
 
 ## Validation gate (required for every op/kernel change)
 
-- `deno task test` (and `deno task test:node`), finite-difference gradient checks + GPU parity. A
+- `deno task test` (and `deno task test:node`, `deno task test:bun`), finite-difference gradient
+  checks + GPU parity. A
   new CPU op gets a case in `tests/gradcheck.ts`; a new or changed kernel gets a case in
   `tests/gpu-parity.ts`. A GPU op is not trusted until it matches CPU within tolerance.
 - **GGUF check**: after any export change, load the file in `llama-cli` and confirm it runs.
@@ -618,6 +619,7 @@ deno task webui       # build the React client + serve the training wizard at :8
 deno task webui:dev   # client hot-reload (Vite :5173); run webui:server alongside it
 deno task test        # gradcheck + GPU parity
 deno task test:node   # gradcheck on Node (parity prints SKIP: no WebGPU)
+deno task test:bun    # the same under Bun, with auto-install off (#97)
 ```
 
 Read `docs/design.md` for the reasoning behind the optimizer choice (Muon) and the technique
