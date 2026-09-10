@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# This workflow went from one job to three, so a superseded push used to waste
+# one runner and now wastes three. Cancel only on pull_request: a main build
+# that gets cancelled leaves no record of whether that commit was ever green.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -23,3 +30,40 @@ jobs:
       # every CI runner; the gradient checks are the real coverage here.
       - name: Tests
         run: deno task test
+
+  # Principle 1: everything the model itself needs runs on Deno, Bun and Node
+  # with no npm install. `deno task test:node` is the only thing that checks the
+  # Node half, and until #89 nothing here ran it, so a Deno-only API in the
+  # engine or a static npm import that puts a module out of Node's reach went
+  # green. That is not hypothetical: #83 was a static `hyparquet` import that
+  # kept three test files out of the Node task entirely.
+  #
+  # Two versions, both pinned. 22.6.0 is the exact floor readme.md promises and
+  # the first release with --experimental-strip-types, so this entry tests the
+  # promise rather than whatever 22.x is newest; a bare "22" resolves to the
+  # latest and never exercises the older stripper, which is the whole point of
+  # having a floor. 24 is the ceiling, moved by a PR about moving the ceiling.
+  # `lts/*` would do the same job until the LTS line rolls to the next major,
+  # at which point it turns this red on a calendar rather than on a change.
+  # Separate job rather than a step, so it runs beside the Deno suite.
+  node:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["22.6.0", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      # Deno is here only to read `test:node` out of deno.json. Spelling the
+      # file list into the workflow instead would make it a third copy of a list
+      # tests/task-coverage.ts exists to keep at two.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Node version under test
+        run: node --version
+      - name: Node compatibility
+        run: deno task test:node

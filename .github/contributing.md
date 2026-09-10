@@ -14,7 +14,9 @@ Thanks for helping build a from-scratch, GGUF-native LLM trainer in TypeScript.
    transitive importer unloadable under Node, which is how three test files went missing from
    `test:node` (lever 39). Four more were missing for the other reason, which
    `tests/task-coverage.ts` now catches: nothing compared the two task lists to `tests/`. A test
-   file belongs in both tasks unless it has a load failure under Node you have actually seen.
+   file belongs in both tasks unless it has a load failure under Node you have actually seen. CI
+   runs `test:node` on Node 22.6 and 24, so a PR that breaks the Node half fails there
+   rather than on whoever runs it next (lever 44).
 2. **GGUF loadability is a contract.** Each architecture's tensor names and metadata keys, in its
    own `src/arch/<name>.ts`, mirror what `llama.cpp` expects. Don't change them without validating
    the output loads in `llama-cli`.
