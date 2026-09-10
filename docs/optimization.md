@@ -2247,6 +2247,76 @@ The workflow also gained a `concurrency` group, because it went from one job to 
 superseded push now wastes three runners rather than one. It cancels on `pull_request` only: a
 cancelled main build leaves no record of whether that commit was ever green.
 
+### 45. `bench` fenced its timed pass by accident (2026-09-10)
+
+Filed as #99 while reviewing #98. `bench` times one pass per case like this:
+
+```ts
+/** One timed pass: forward (+ backward), then a fence. */
+async function once(gpu: WebGPUBackend, c: Case) {
+  ...
+  await gpu.sync([]);
+}
+```
+
+The comment says "then a fence", and there is one, but not for the reason the call looks like.
+`sync([])` passes no reads, so the only thing that can stage is `touchedExternals`, and every case's
+inputs come from `randTensor`, which builds them `requiresGrad`. Their gradients stage, the
+`mapAsync` awaits are real, and the pass waits for the GPU. Lever 41 is what makes that load-bearing
+rather than incidental trivia: a `sync()` with nothing staged submits and returns without awaiting
+anything.
+
+**The two things that would break it are both things a plausible new case would do.** Frozen inputs,
+which is what a forward-only or LoRA-shaped case naturally uses, or a call to `keepGradOnDevice`,
+which is what a case modelling the resident training loop would copy. Either empties `stagings`, and
+the pass is then timed to the submit rather than to completion. Everywhere else in the repo that
+failure produces a wrong result you can see. Here it produces a plausible number, in the one command
+whose entire output is numbers.
+
+**Fixed by asserting rather than by fencing, and the reason is what the number means.** An explicit
+`onSubmittedWorkDone()` would restore the wait and cost nothing today, but it would let such a case
+exist: this file's header defines the wall number as including the host-side graph build and the
+gradient readback, so a case that stages nothing has already stopped reporting what the column
+claims, fence or no fence. A fence keeps one half of the header's promise true while the other goes
+quietly false for one row of a column whose other rows keep it, which is a worse artifact than a
+hard failure and the same class of bug as #99 itself.
+
+**Byte-exact, not `> 0`, and the first draft got that wrong.** `lastSyncReadbackBytes` sums every
+touched external, so one live input keeps it non-zero. A case that freezes only SOME of its inputs
+therefore keeps the fence and loses part of the readback, and a zero check waves it through. That
+partial shape is the likelier mistake, not the rarer one: the natural additions here are
+LoRA-shaped or inference-shaped, where some tensor is frozen. So the check compares against what
+`Case.inputs` declares, summed as `t.size * 4` and deduped, computed once per case in `timeCase` so
+the measured window is untouched.
+
+Both modes reproduce, on the `rmsnorm` case whose inputs are 5245440 bytes of gradient:
+
+| mutation                                   | reported                    | caught by `> 0`? |
+| :----------------------------------------- | :-------------------------- | :--------------- |
+| `keepGradOnDevice` on every input          | `read back 0 of 5245440`    | yes              |
+| `keepGradOnDevice` on the first input only | `read back 2560 of 5245440` | **no**           |
+
+The published numbers do not move: the assertion is one integer compare on a path that allocates
+nothing, and `bench --suite all` passes every case with the exact equality, which is also the
+measurement that confirms `sync()` stages exactly `t.size * 4` per live external.
+
+The assertion is two-sided by construction, and the message says so: fewer bytes than declared means
+an input is frozen or kept on device, more means `run` touched an external that `inputs` does not
+list, which also missed its `zeroGrad`. `Case.inputs` now documents that contract, since it is the
+declaration being checked rather than a note about what to keep alive.
+
+**One review suggestion declined.** The error used to offer "or read something back explicitly",
+which `Case` has no way to express, so the advice was unreachable; the suggestion was to add a
+`reads?: Tensor[]` field and forward it to `sync()`. Declined on caller count, and the second round
+gave the better reason: those bytes would have to count toward the expected total, and then a
+gradient-free case satisfies the assertion with a DATA readback while the header promises the wall
+number carries the gradient one. The field would buy the fence back at the cost of the property the
+assertion exists to protect. The message now names only the option that exists.
+
+No test file, deliberately. `bench` needs a GPU and is not in `deno task test`, and the check runs on
+every real invocation, which is where it belongs. The property it depends on, that
+`keepGradOnDevice` empties the staging list, is already pinned in `recycleReuseGate`.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
