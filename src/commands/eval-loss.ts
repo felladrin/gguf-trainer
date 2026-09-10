@@ -31,7 +31,12 @@ import {
   lossChunkValueError,
   sequenceLoss,
 } from "../train/loss.ts";
-import { assertCorpusFitsVocab, diskTokenSource, tokenBytes } from "../data/tokens.ts";
+import {
+  assertCorpusFitsVocab,
+  checkTokenFileWidth,
+  diskTokenSource,
+  tokenBytes,
+} from "../data/tokens.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
 import { initWebGPU, noGpuNote } from "../backend/webgpu.ts";
@@ -63,6 +68,24 @@ async function run(v: Values) {
   const badForModel = lossChunkModelError(lossChunk, cfg.vocabSize, cfg.arch, model);
   if (badForModel) die(badForModel);
 
+  // Width only, which is all this command can check. It has a tokenizer, since
+  // loadModelFromGGUF returns one, but a GGUF-derived export() is not guaranteed
+  // equal to the json-derived one the stamp was written from: on export
+  // token_type is assigned by the shape of the token text, and on import
+  // specials are recovered from token_type in vocab order rather than from a
+  // declared list, so a foreign base round-trips to a different `specials`. A
+  // fingerprint gate here would refuse correct corpora. The width cannot:
+  // bytesPerToken is a pure function of the vocab size both sides already agree
+  // on, and it is exactly the mismatch assertCorpusFitsVocab catches only by
+  // luck, when some low half of a 4-byte id happens to exceed the vocab.
+  const width = await checkTokenFileWidth(tokensPath, tokenBytes(cfg.vocabSize));
+  if (width.status === "mismatch") die(width.message);
+  if (width.status === "unstamped") {
+    console.log(
+      `Token file: ${tokensPath} predates the .id stamp, so its id width cannot be checked ` +
+        `against this checkpoint. Rebuild it to get the check.`,
+    );
+  }
   const src = await diskTokenSource(tokensPath, tokenBytes(cfg.vocabSize));
   // Held-out region: the last `holdout` fraction of the stream. maxStart leaves
   // room for the input window plus its +1-shifted target.
