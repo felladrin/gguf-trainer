@@ -1061,10 +1061,11 @@ aux group like any other trainable tensor. The narrow version of #66 is nil too:
 frees an accumulator, and these already exist from training, so there was nothing to reclaim on
 either half.
 
-`pretrain` does still stage a whole model of gradients in one place, its trust gate, which forwards
-before the optimizer exists to keep anything on device. A LoRA run stages only its adapters there,
+`pretrain` did still stage a whole model of gradients in one place, its trust gate, which forwards
+before the optimizer exists to keep anything on device. A LoRA run staged only its adapters there,
 since `applyLora`'s freeze is deliberately placed before the gate. Once per run rather than per
-token either way, and the comment there says so.
+token either way, which is why this paragraph read as a note rather than a finding. Lever 37 closed
+it anyway.
 
 ### 28. The clear queue re-armed itself for frozen parameters, and it buys no time (2026-09-09)
 
@@ -1622,6 +1623,41 @@ told to use Deno, which is exactly #41's situation. `webgpuRuntime()` tells them
 `initWebGPU` does not consult it: the `try`/`catch` around its adapter request already covers every
 runtime without WebGPU, and a first-line guard duplicating the predicate proved unobservable across
 six shapes of broken navigator. The error message was #84.
+
+### 37. The trust gate staged a whole model of gradients for a backward it never runs (2026-09-10)
+
+Filed as #80 while closing lever 27, which named this case and let it stand. `pretrain`'s parity
+probe forwards, syncs and stops. It runs before the optimizer is built, so nothing had called
+`keepGradOnDevice` yet, and `sync()` stages the gradient of every touched external. Nothing reads
+them: `grep '\.grad' src/commands/pretrain.ts` returns nothing at all, and both GPU optimizers do
+their clipping and their step on device.
+
+Measured on a Qwen3-0.6B shape (596M params, `--seq-len 512 --recompute --loss-chunk 8192`, one
+step, `--reclaim`), two runs each:
+
+|              | wall clock       |
+| ------------ | ---------------- |
+| as it stood  | 73.55 s, 74.23 s |
+| with the fix | 71.72 s, 73.11 s |
+
+Between 1.1 and 1.8 s depending on which pair you take, and 2,384,199,688 bytes of staging that
+never happens, printed by the probe's own `lastSyncReadbackBytes` before the fix. Small, once per
+run, and honest to describe as tidiness rather than a speed-up. What it is worth more than the
+second is that it removes the last instance of the pattern levers 25, 27 and 32 exist to close.
+
+The fix is one loop, and the interesting part is where it lives. Under LoRA the base is frozen
+before the gate and stages nothing, so the tensors to keep are the adapters, which `model.params()`
+does not return. Putting that choice at the call site made it untestable: the gate sits inside a
+500-line command that reads files and parses flags, so a test can reach the probe only by
+duplicating it, and a duplicate goes green no matter what the real caller picks. The probe's GPU
+half is now `probeGpuLosses`, taking the LoRA handle rather than a tensor list, so both branches of
+the decision run inside the function the test calls.
+
+`probeReadbackGate` in `tests/gpu-parity.ts` pins it, controls included: each arm's control passes
+an empty adapter list, which is exactly what the helper keeps with its loop deleted. Deleting the
+loop, collapsing the LoRA branch to `model.params()`, and collapsing the non-LoRA branch to the
+adapters each fail it. Moving the loop to just before the `sync()` does not, and should not:
+`keepGradOnDevice` is read at sync time, so anywhere before it is the same call.
 
 ## Quality levers
 

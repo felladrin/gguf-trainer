@@ -28,6 +28,7 @@ import { applyLora } from "../train/lora.ts";
 import { readFileBytes, readFileText, writeFileBytes } from "../io.ts";
 import { fmtEta } from "../eta.ts";
 import { crossEntropy, mulberry32, setCheckpointing } from "../model/autograd.ts";
+import type { Tensor } from "../model/autograd.ts";
 import type { Architecture, LanguageModel } from "../model/arch.ts";
 import {
   archFromGGUF,
@@ -89,6 +90,53 @@ const SAMPLE_PROMPTS = [
   "Once upon a time, there was a little",
   "The old man walked slowly toward the",
 ];
+
+/**
+ * The trust gate's GPU half: forward the dense loss and, when --loss-chunk is
+ * on, the chunked one, then read both back in a single sync.
+ *
+ * The op that runs every step is not the one the CPU side checks, so this checks
+ * it too: at 16 tokens the dense side still fits whatever the run's seq-len would
+ * have blown, and this exercises every FORWARD span offset at the real vocab
+ * before the run starts. Only forward: the probe never calls backward, so the
+ * grad, NN and TN sources first compile at step 0. Their offsets are covered by
+ * fusedCeParity's multi-block shape, not here. Both graphs are built before the
+ * single sync, because sync stages back the grad of every touched external and
+ * syncing twice would read every parameter gradient twice.
+ *
+ * The keep loop is why this is a function rather than a block. sync() stages a gradient
+ * for every touched external whose grad is not kept on device, and at probe time
+ * the optimizer does not exist yet to have said so, so the probe copied a whole
+ * model of gradients back for a backward that never runs. Nothing in this file
+ * reads `.grad`: both GPU optimizers clip and step on device. The optimizers
+ * call keepGradOnDevice on everything they own a few dozen lines later, and the
+ * set has no removal path, so this only says it earlier. Measured on a 596M
+ * shape: 2.38 GB of staging that never happens, and about 1.3 s off the run.
+ * probeReadbackGate is what notices if it goes away again.
+ */
+export async function probeGpuLosses(
+  gpu: WebGPUBackend,
+  model: LanguageModel,
+  lora: { groups: { aux: Tensor[] } } | null,
+  probeIn: number[],
+  probeTgt: number[],
+  lossChunk: number,
+): Promise<{ gpuLoss: number; fusedLoss: number | null }> {
+  // Under LoRA the base is already frozen and stages nothing, and the adapters,
+  // the only tensors left with a live accumulator, are not in model.params().
+  // The choice lives here rather than at the call site so probeReadbackGate can
+  // exercise both halves of it.
+  for (const p of lora ? lora.groups.aux : model.params()) gpu.keepGradOnDevice(p);
+  gpu.install();
+  try {
+    const l = crossEntropy(model.forward(probeIn), probeTgt);
+    const f = lossChunk > 0 ? sequenceLoss(model, probeIn, probeTgt, lossChunk) : null;
+    await gpu.sync(f ? [l, f] : [l]);
+    return { gpuLoss: l.data[0], fusedLoss: f ? f.data[0] : null };
+  } finally {
+    gpu.uninstall();
+  }
+}
 
 /**
  * End-of-run samples with the GPU forward (one sync/token); each stops at eos.
@@ -410,28 +458,14 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   // Trust gate: GPU forward+loss must match the CPU reference at init.
   const probeIn = src.window(0, 16), probeTgt = src.window(1, 16);
   const cpuLoss = crossEntropy(model.forward(probeIn), probeTgt).data[0];
-  gpu.install();
-  let gpuLoss: number;
-  let fusedLoss: number | null = null;
-  try {
-    const l = crossEntropy(model.forward(probeIn), probeTgt);
-    // The op that runs every step is not the one checked above, so check it too:
-    // at 16 tokens the dense side still fits whatever the run's seq-len would
-    // have blown, and this exercises every FORWARD span offset at the real vocab
-    // before the run starts. Only forward: the probe never calls backward, so the
-    // grad, NN and TN sources first compile at step 0. Their offsets are covered
-    // by fusedCeParity's multi-block shape, not here. Both graphs are built
-    // before the single sync: sync stages
-    // back the grad of every touched external, and at probe time the optimizer
-    // does not exist yet to keep them on device, so syncing twice would read
-    // every parameter gradient twice.
-    const f = lossChunk > 0 ? sequenceLoss(model, probeIn, probeTgt, lossChunk) : null;
-    await gpu.sync(f ? [l, f] : [l]);
-    gpuLoss = l.data[0];
-    if (f) fusedLoss = f.data[0];
-  } finally {
-    gpu.uninstall();
-  }
+  const { gpuLoss, fusedLoss } = await probeGpuLosses(
+    gpu,
+    model,
+    lora,
+    probeIn,
+    probeTgt,
+    lossChunk,
+  );
   const drift = Math.abs(gpuLoss - cpuLoss);
   console.log(
     `Parity probe: CPU ${cpuLoss.toFixed(4)} vs GPU ${gpuLoss.toFixed(4)} (|Δ|=${
