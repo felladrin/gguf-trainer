@@ -1844,6 +1844,46 @@ that is listed and broken. Worth noting that a Node job would not have caught #8
 `test:node` was green then, and would have been green in CI, because `eval-tasks.ts` was not in the
 list.
 
+### 40. The last two guards under a backend dispatch came up above it (2026-09-10)
+
+Filed as #82, noted in lever 30 while fixing #61, and the last instance of the pattern those changes
+argued against. `crossEntropy` dispatched before it validated:
+
+```ts
+export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
+  assertMatrix(logits, "logits", "crossEntropy");
+  if (opsBackend) return opsBackend.crossEntropy(logits, targets);
+  const [T, V] = logits.shape;
+  const kept = keptRowsInVocab(targets, T, V, "crossEntropy");
+```
+
+The rank check was above, from #72. The id check was not: it ran in the CPU body, and the GPU path
+was covered only because `webgpu.ts` called it separately. Same for `fusedCrossEntropy`, which
+called it in both places. There was no live gap, and that is the point: a guard under a dispatch has
+to be repeated in every implementation, and the one nobody remembers is the one that ships
+unvalidated. That is what #61 was.
+
+**What kept it down there was a real cost, not an oversight.** `keptRowsInVocab` returns the
+kept-row count, which both backends need as their loss denominator, so hoisting the call means
+either recomputing it on the GPU path, an extra O(T) pass, or widening the interface. This takes the
+second: `OpsBackend.crossEntropy` and `.fusedCrossEntropy` gain a `kept` parameter. Widening an
+interface for a guard is the objection, and the answer is that `kept` is not a guard, it is a value
+both implementations already needed and both were computing for themselves.
+
+Two things improve on the way. A malformed target now refuses before `beginForwardOp` and before
+any `entryFor`, where it used to refuse after both, so nothing is left half-recorded and no pooled
+buffer is taken. And `webgpu.ts` drops its import of `keptRowsInVocab` entirely.
+
+`targetRangeGate` already had the arms, exactly as #82 predicted: pushing either guard back below
+its dispatch turns `dense true` into `dense false`, or `fused true` into `fused false`, while every
+CPU case still passes. Measured both ways.
+
+**One instance of the shape remains, and it is not this one.** `linearRaw` checks
+`inDim !== inDim2` below its dispatch and `webgpu.ts` repeats the identical check with the identical
+message. No gap today, same as here, and hoisting it is a different change to a different function.
+Filed as #91 rather than folded in, since `linear` is the hottest op in the graph and "the check is
+free" wants measuring rather than asserting.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
