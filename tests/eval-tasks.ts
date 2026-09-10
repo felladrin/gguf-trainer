@@ -14,6 +14,7 @@ import {
   renderPair,
   TASKS,
 } from "../src/commands/eval-choice.ts";
+import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 
 function ok(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -306,6 +307,43 @@ for (const [nCtx, nChoice, maxSeq] of [[20, 10, 512], [100, 10, 105], [600, 10, 
   ok(
     TASKS["piqa"].render("G", "S") === rp.ctxOnly + rp.choiceText,
     "the two halves reassemble into exactly what the model sees",
+  );
+}
+
+// The PREMISE the bound rests on, against a real tokenizer rather than the
+// docblock: every token covers at least one UTF-8 byte, so encode(s).length is
+// never more than the byte length. The arithmetic cases above take that as
+// given, so a tokenizer that grew a prepended BOS would make the bound unsound
+// at its boundary and nothing else here would notice.
+{
+  const tok = new BPETokenizer();
+  // ASCII only, so a multi-byte character below has no merge to fall back on
+  // and decomposes into one token per byte: the case the byte bound exists for
+  // and the character bound gets wrong.
+  tok.train("the quick brown fox jumps over the lazy dog. ".repeat(40), 300);
+  const utf8 = new TextEncoder();
+  const cases = [
+    "hello world",
+    "caf\u00e9",
+    "\u2e3b".repeat(6),
+    "\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8",
+    "\ud83d\ude42",
+    "\ud800\udf48",
+    " ",
+    "",
+  ];
+  for (const c of cases) {
+    const t = tok.encode(c).length, b = utf8.encode(c).length;
+    ok(t <= b, `tokens (${t}) never exceed UTF-8 bytes (${b}) for ${JSON.stringify(c)}`);
+  }
+  // And that characters really do NOT bound it, which is why this is in bytes:
+  // an untrained multi-byte character falls back to one token per byte.
+  const wide = "\u2e3b".repeat(6);
+  ok(
+    tok.encode(wide).length > wide.length,
+    `a byte-level fallback exceeds the character count: ${
+      tok.encode(wide).length
+    } > ${wide.length}`,
   );
 }
 

@@ -1468,9 +1468,11 @@ the half-word case above. Closing the class needs tokenizer identity, a hash bes
 ### 35. `eval-choice` refuses an unscoreable item before the first forward (2026-09-09)
 
 Filed as #57 while fixing #52. `choiceNLL` refuses a window it cannot score, which is right, but it
-does it on the item that holds one: after the GGUF is loaded, after the GPU is initialized, and after
-however many items sit ahead of it. On a full HellaSwag set that is hours of forwards before the
-command exits with a usage error.
+does it on the item that holds one: after the GGUF is loaded and after however many items sit ahead
+of it. On a full HellaSwag set that is hours of forwards before the command exits with a usage error.
+The new pass runs after the GPU comes up too, which is a few seconds on a run that was going to fail;
+moving it earlier would put the dataset's network fetch in front of the backend install for no
+proportionate gain.
 
 The check does not need a tokenizer, and that is what makes it free rather than cheap. This repo's
 BPE is byte-level, so **every token covers at least one UTF-8 byte**: a rendered choice under
@@ -1499,11 +1501,22 @@ the case that pins it, and swapping bytes back for characters fails a different 
 so the arithmetic is testable without a tokenizer or a model, which is the same split
 `choiceMaskStart` and `choiceWindowError` already use.
 
+The pass runs per item rather than over the whole grid. At 10-shot the preamble repeats in every
+pair's stem and `choiceText` is a `slice` that retains its parent string, so materializing all 40168
+at once would hold hundreds of MB the streaming loop below never does.
+
 `renderPair` is the other half, and it is the one that keeps the pass honest. The two lines that
 define where the stem ends and the choice begins used to exist twice, in the preflight and in the
 scoring loop. If they drifted, the preflight would print its tick for strings that are not the ones
 being scored, which is worse than not having the pass at all. Both sites call the same helper now,
 and a test reassembles its two halves into exactly what the model sees.
+
+The premise itself has a test, which matters more than the arithmetic does: the byte bound rests on
+`encode` never emitting more tokens than the input has UTF-8 bytes, and the cases above take that
+from a docblock. One check encodes an ASCII, an accented, an untrained multi-byte, a CJK and an
+astral string against a real trained tokenizer and requires `tokens <= bytes` for each. Making
+`encode` prepend a BOS, an ordinary thing for a tokenizer to grow, fails it at `café`, 6 tokens
+against 5 bytes.
 
 ## Quality levers
 

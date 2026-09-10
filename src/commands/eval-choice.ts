@@ -383,22 +383,24 @@ async function run(v: Values) {
     const preamble = shotItems.map((s) => task.render(s.context, s.choices[s.gold])).join("\n\n");
 
     // Before any forward. choiceNLL refuses an unscoreable window, but it does
-    // it on the item that holds one, which on a full set is hours in. The
-    // character bound settles almost every pair without a tokenizer; only a
-    // choice longer than the whole context needs encoding.
-    const checked = (() => {
-      // Scoped so the grid of rendered strings is not held for the whole run;
-      // only the counts and the few pairs that need encoding escape.
-      const pairs = evalItems.flatMap((it) => {
-        const ctx = preamble ? `${preamble}\n\n${it.context}` : it.context;
-        return it.choices.map((ch) => renderPair(task.render, ctx, ch));
-      });
+    // it on the item that holds one, which on a full set is hours in. The BYTE
+    // bound settles almost every pair without a tokenizer; only a choice whose
+    // bytes reach the context length needs encoding.
+    //
+    // Per item rather than over the whole grid: at 10-shot the preamble repeats
+    // in every pair's ctxOnly, and choiceText is a slice that retains its parent
+    // string, so materializing 40168 of them at once holds hundreds of MB the
+    // streaming loop below never does.
+    let total = 0, encoded = 0;
+    for (const it of evalItems) {
+      const ctx = preamble ? `${preamble}\n\n${it.context}` : it.context;
+      const pairs = it.choices.map((ch) => renderPair(task.render, ctx, ch));
       const pre = preflightByBytes(pairs, cfg.maxSeq);
       if (pre.empty) {
-        const bad = pre.empty;
-        const p = pairs.find((q) => (bad === "stem" ? q.ctxOnly : q.choiceText).length === 0)!;
+        const which = pre.empty;
+        const p = pairs.find((q) => (which === "stem" ? q.ctxOnly : q.choiceText).length === 0)!;
         die(
-          `${taskName}: an item's ${bad} rendered to nothing, so it cannot be scored. ` +
+          `${taskName}: an item's ${which} rendered to nothing, so it cannot be scored. ` +
             `The pair reads ${JSON.stringify(`${p.ctxOnly}|${p.choiceText}`.slice(0, 80))}`,
         );
       }
@@ -408,13 +410,16 @@ async function run(v: Values) {
           tok.encode(p.choiceText).length,
           cfg.maxSeq,
         );
-        if (bad) die(`${bad}. The choice reads ${JSON.stringify(p.choiceText.slice(0, 60))}`);
+        if (bad) {
+          die(`${taskName}: ${bad}. The choice reads ${JSON.stringify(p.choiceText.slice(0, 60))}`);
+        }
       }
-      return { total: pairs.length, encoded: pre.needExactCheck.length };
-    })();
+      total += pairs.length;
+      encoded += pre.needExactCheck.length;
+    }
     console.log(
-      `Windows: none of ${checked.total} choices exceeds the ${cfg.maxSeq}-token context ` +
-        `(${checked.encoded} needed encoding) \u2713`,
+      `Windows: none of ${total} choices exceeds the ${cfg.maxSeq}-token context ` +
+        `(${encoded} needed encoding) \u2713`,
     );
 
     let correctNorm = 0, correctRaw = 0, done = 0;
