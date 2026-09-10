@@ -48,6 +48,7 @@ import { MAX_WG } from "../src/backend/wgsl.ts";
 import { MuonGpu, newtonSchulzGpu } from "../src/backend/muon-gpu.ts";
 import { AdamWGpu } from "../src/backend/adamw-gpu.ts";
 import { trainLMGpuResident } from "../src/backend/train-gpu.ts";
+import { probeGpuLosses } from "../src/commands/pretrain.ts";
 
 // Same math, different summation order: f32 accumulation differences grow with
 // reduction depth, so backward (which chains more reductions) gets more slack.
@@ -684,6 +685,7 @@ async function main() {
   await evalFreezeGate();
   await generateFreezeGate();
   await residentReadbackGate();
+  await probeReadbackGate();
   await frozenClearGate();
   await forwardOnlyClearGate();
   await clearRearmPredicateGate();
@@ -1563,6 +1565,111 @@ async function generateFreezeGate() {
     `  ${ok ? "ok " : "FAIL"} generate freeze: readback ${mb(hot.readback)} MB -> ` +
       `${cold.readback} B (logits alone ${lastLogits} B, params ${mb(paramBytes)} MB), ` +
       `pool ${mb(hot.pool)} -> ${mb(cold.pool)} MB, ids ${cold.ids}`,
+  );
+}
+
+/**
+ * What pretrain's trust gate stages back, measured through the real function.
+ *
+ * The probe forwards, syncs and never runs a backward, and it happens before the
+ * optimizer exists, so nothing had called keepGradOnDevice yet and the sync
+ * copied one gradient per parameter to the host for a backward that never comes.
+ * Nothing reads them: no code in that file reads a host-side gradient, and both
+ * GPU optimizers clip and step on device.
+ *
+ * The two controls reach "keeps nothing" by different routes. The dense one
+ * passes an empty adapter list, which is what the helper keeps with its loop
+ * deleted, so that arm and its control coincide if the loop goes away. The LoRA
+ * one passes null, so the helper takes the model.params() branch and keeps the
+ * frozen base, which is a no-op twice over: the adapters stage either way. That
+ * is the whole point, in both cases. Without a measurement the line is
+ * invisible, since the losses are identical either way and every other gate
+ * stays green while the probe copies the model.
+ *
+ * What this does not reach is the call site. `pretrain` passes `lora` to the
+ * helper, and the test passes its own argument, so changing that one argument to
+ * null would put a LoRA run back to staging its adapters with every gate green.
+ * The refactor shrank that residue rather than closing it: the branch itself is
+ * pinned here, the decision to hand it the handle is not.
+ */
+async function probeReadbackGate() {
+  const cfg = gemma3Config(64, 64, 4, 256, 16);
+  const probeIn = [3, 11, 29, 5, 17, 2, 41, 8];
+  const probeTgt = [11, 29, 5, 17, 2, 41, 8, 13];
+  const arm = async (keepThem: boolean, lossChunk: number) => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    try {
+      const { gpuLoss, fusedLoss } = await probeGpuLosses(
+        gpu,
+        m,
+        keepThem ? null : { groups: { aux: [] } },
+        probeIn,
+        probeTgt,
+        lossChunk,
+      );
+      return {
+        readback: gpu.lastSyncReadbackBytes,
+        gpuLoss,
+        fusedLoss,
+        paramBytes: m.params().reduce((a, t) => a + t.size * 4, 0),
+      };
+    } finally {
+      gpu.destroy();
+    }
+  };
+  const dense = await arm(true, 0);
+  const chunked = await arm(true, 32);
+  const bare = await arm(false, 0);
+  // The LoRA arm picks a different set, because applyLora freezes everything the
+  // model already had and puts the only live accumulators in tensors that
+  // model.params() does not return. Keeping the frozen base instead is a no-op
+  // twice over, and the adapters stage.
+  const loraArm = async (keepAdapters: boolean) => {
+    const gpu = (await initWebGPU())!;
+    const m = new Gemma3Model(cfg, mulberry32(5));
+    const l = applyLora(m, 4, 8, mulberry32(4321));
+    try {
+      await probeGpuLosses(
+        gpu,
+        m,
+        keepAdapters ? l : null,
+        probeIn,
+        probeTgt,
+        0,
+      );
+      return {
+        readback: gpu.lastSyncReadbackBytes,
+        adapterBytes: l.groups.aux.reduce((a, t) => a + t.size * 4, 0),
+      };
+    } finally {
+      clearLora(m);
+      gpu.destroy();
+    }
+  };
+  const adapters = await loraArm(true);
+  const base = await loraArm(false);
+
+  // One scalar for the dense loss, two when --loss-chunk adds the chunked one.
+  const denseScalarOnly = dense.readback === 4;
+  const chunkedTwoScalars = chunked.readback === 8;
+  const controlCopies = bare.readback >= dense.paramBytes;
+  // The line changes what is staged, not what is computed.
+  const sameLoss = Math.abs(dense.gpuLoss - bare.gpuLoss) < 1e-6;
+
+  const loraScalarOnly = adapters.readback === 4;
+  const loraControlCopies = base.readback >= adapters.adapterBytes;
+
+  const ok = denseScalarOnly && chunkedTwoScalars && controlCopies && sameLoss &&
+    loraScalarOnly && loraControlCopies;
+  if (!ok) failures++;
+  const mb = (n: number) => (n / 1e6).toFixed(2);
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} probe readback: dense ${dense.readback} B, ` +
+      `--loss-chunk ${chunked.readback} B, against ${mb(bare.readback)} MB with ` +
+      `nothing kept (params ${mb(dense.paramBytes)} MB), loss ` +
+      `${dense.gpuLoss.toFixed(6)} either way; LoRA ${adapters.readback} B against ` +
+      `${base.readback} B keeping the frozen base (adapters ${adapters.adapterBytes} B)`,
   );
 }
 
