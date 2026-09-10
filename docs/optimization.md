@@ -2190,6 +2190,40 @@ with `T` fails the parity cases at `gpu=2.3589 cpu=3.1453`, a ratio of exactly 3
 consumer of the count diverging from the other consumer. The new case catches the shared producer
 being wrong, which nothing could see. Three mutations, three different failures.
 
+### 44. CI runs the Node suite, which it never did (2026-09-10)
+
+Filed as #89 while closing #83. `.github/workflows/test.yml` ran four things, `deno fmt --check`,
+`deno lint`, `deno check`, and `deno task test`. No Node step. So `deno task test:node`, whose whole
+purpose is principle 1, that everything the model itself needs runs on Deno, Bun and Node with no
+npm install, was checked only when someone happened to run it on their own machine.
+
+#83 is what that costs. A static `hyparquet` import in `src/data/parse.ts` kept roughly 40
+assertions over `eval-choice`'s scoring arithmetic out of `test:node` entirely, and four more files
+were missing for the other reason, that nothing compared the two task lists to `tests/`. Both fixes
+landed with guards that no CI could enforce.
+
+**What made it its own issue rather than four lines in #83 was the risk profile, and the answer is
+that all three worries were unfounded.** Measured by running it:
+
+| worry                                                                         | measurement                                                                     |
+| :---------------------------------------------------------------------------- | :------------------------------------------------------------------------------ |
+| The strip-types flag has moved across 22.x and 23.x, so the pin is a decision | `22` resolves to v22.23.2 and `lts/*` to v24.20.0 on `ubuntu-latest`; both pass |
+| The 21 files pass on one developer's Node, not necessarily the runner's       | Both matrix entries green on the first run                                      |
+| `test` and `test:node` overlap, so the job roughly doubles the suite          | 21s and 20s beside the Deno job's 20s, in parallel: no wall-clock change        |
+
+Locally for comparison, `test:node` is 6.9s against `test`'s 14.8s, because the GPU parity file
+skips without a WebGPU adapter under Node.
+
+**Two versions rather than one.** `22` is the floor `--experimental-strip-types` needs, and the
+oldest supported runtime is where a syntax the stripper cannot erase shows up first. `lts/*` is what
+someone actually has installed, and catches a regression the floor cannot see. `fail-fast: false`
+so one version failing still reports the other.
+
+It is a separate job rather than a step on the existing one, so it runs beside the Deno suite
+instead of adding to its wall clock. `denoland/setup-deno` appears in it only to read the task
+string out of `deno.json`: spelling the file list into the workflow would make it a third copy of a
+list `tests/task-coverage.ts` exists to keep at two.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
