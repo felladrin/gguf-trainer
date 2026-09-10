@@ -392,7 +392,7 @@ async function main() {
     // clause is what would have to fire. Without assertMatrix it does not: V is
     // undefined, so `id >= V` is false for the 999 too.
     const longTargets = Array.from({ length: 24 }, (_, i) => (i === 0 ? 999 : 0));
-    // Teacher arrays of length T*k = 24, so assertTeacherRows gets past its own
+    // Teacher arrays of length T*k = 24, so keptTeacherRows gets past its own
     // length check and its id range is the guard that would have to fire.
     const tIds = Array.from({ length: 24 }, (_, i) => (i === 0 ? 999 : 0));
     const tProbs = new Array(24).fill(1);
@@ -704,6 +704,51 @@ async function main() {
     console.log(
       `  ${ok ? "ok " : "FAIL"} ${"chunked summed NLL".padEnd(24)}        ` +
         `mean*kept == summed NLL, ${kept} kept of ${T}  maxAbs=${worst.toExponential(2)}`,
+    );
+  }
+  {
+    // The same identity for the soft-target loss, and it exists because #93 took
+    // the kept-row count away from both implementations and gave them one shared
+    // source. That is the right shape, and it costs the weak cross-check the old
+    // arrangement had: two independently written counts compared through a
+    // parity case are unlikely to be identically wrong, while one count feeding
+    // both scales the CPU and GPU losses together and the parity cases stay
+    // green. Every other softCE test is blind to it: the parity cases share the
+    // count, the finite-difference check scales with it, and the two single-row
+    // cases have T === kept.
+    //
+    // So the oracle is computed here and `kept` is written out as a literal
+    // rather than derived, which is what makes this fail when the helper counts
+    // the ignored row (or returns T) and pass otherwise.
+    // Its own seed rather than the shared `rng`: drawing T*V from that stream
+    // would shift every case below this one onto different inputs, and a new
+    // test should not quietly re-roll the ones it was inserted above.
+    const T = 4, V = 9, K = 2;
+    const logits = randTensor([T, V], mulberry32(0x5f7a));
+    const ids = [1, 4, -1, 0, 7, 2, 3, 3];
+    const q = [0.6, 0.3, 0.0, 0.0, 0.5, 0.2, 0.25, 0.25];
+    const kept = 3; // rows 0, 2 and 3; row 1 carries the -1 marker
+
+    let expected = 0;
+    for (let t = 0; t < T; t++) {
+      if (ids[t * K] < 0) continue;
+      let mx = -Infinity;
+      for (let v = 0; v < V; v++) mx = Math.max(mx, logits.data[t * V + v]);
+      let sum = 0;
+      for (let v = 0; v < V; v++) sum += Math.exp(logits.data[t * V + v] - mx);
+      for (let j = 0; j < K; j++) {
+        const weight = q[t * K + j];
+        if (weight === 0) continue;
+        expected += weight * (Math.log(sum) + mx - logits.data[t * V + ids[t * K + j]]);
+      }
+    }
+
+    const worst = Math.abs(softCrossEntropy(logits, ids, q, K).data[0] * kept - expected);
+    const ok = worst < 1e-4;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} ${"softCE summed NLL".padEnd(24)}        ` +
+        `mean*kept == summed weighted NLL, ${kept} kept of ${T}  maxAbs=${worst.toExponential(2)}`,
     );
   }
   {

@@ -1888,7 +1888,7 @@ guard: it is a value both implementations already needed and both were separatel
 #70 hoisted its `assertTeacherRows` above the dispatch, but that validator returns nothing, so each
 backend still counts its own kept rows: `webgpu.ts` runs `teacherIds[t * k] >= 0` over T while the
 CPU body counts inside its own loop. Two implementations of one quantity, and the repo now answers
-the same question two ways. Filed as #93 rather than folded in.
+the same question two ways. Filed as #93 rather than folded in, and closed in lever 43.
 
 Two things improve on the way. A malformed target now refuses before `beginForwardOp` and before
 any `entryFor`, where it used to refuse after both, so nothing is left half-recorded and no pooled
@@ -2114,6 +2114,81 @@ since `linear` is not a loss). What each one is worth is not the same:
 removed still threw cleanly from the backend. With them gone, the wrapper is the only thing between
 a mismatched shape and the heap exhaustion above. That is the standing trade of #61 and #82: a
 duplicate is also what lets the real guard rot unnoticed, and the arms above are the replacement.
+
+### 43. `softCrossEntropy` counts its kept rows once, above the dispatch (2026-09-10)
+
+Filed as #93 in lever 40, as the function left on the wrong side of the argument that lever made.
+#70 hoisted `assertTeacherRows` above the backend dispatch, but that validator returned nothing, so
+each backend went on computing the kept-row count itself:
+
+```ts
+// src/backend/webgpu.ts
+let kept = 0;
+for (let t = 0; t < T; t++) if (teacherIds[t * k] >= 0) kept++;
+```
+
+```ts
+// src/model/autograd.ts, inside the CPU forward loop
+kept++;
+```
+
+One quantity, two implementations, nothing comparing them. They agreed, and nothing made them keep
+agreeing. A divergence would not throw either: the count is the loss denominator, so a wrong one
+reports a plausible number. `crossEntropy` and `fusedCrossEntropy` had exactly this shape until
+lever 40 and now do not, so the repo was answering the same question two ways in adjacent
+functions, and the older-looking answer was the one a new backend would copy.
+
+**Taken the way #82 took it.** `assertTeacherRows` becomes `keptTeacherRows`, returns the count, and
+`OpsBackend.softCrossEntropy` gains a `kept` parameter. The rename is the point rather than a
+tidy-up: the old name promised validation only, and a function that also returns the denominator
+should say so, the way `keptRowsInVocab` does. The count moves into the loop that was already
+walking the rows, so it costs nothing, and the CPU forward loses its own `kept++`.
+
+The alternative the issue listed, leaving the recount and pinning the agreement with a gate, is
+cheaper and tests the property rather than removing the possibility. It was not taken for the reason
+lever 40 gives: a backend that recounts only needs a number, and a bare counting loop satisfies the
+compiler while skipping the validation the same pass does. Passing `kept` down leaves nothing for a
+backend to get wrong.
+
+**The mutation is lever 40's, and it reproduces.** Give the dispatch its own counting loop:
+
+```ts
+let kept = 0;
+if (opsBackend) {
+  for (let t = 0; t < T; t++) if (teacherIds[t * k] >= 0) kept++;
+  return opsBackend.softCrossEntropy(logits, teacherIds, teacherProbs, k, kept);
+}
+kept = keptTeacherRows(teacherIds, teacherProbs, T, k, V);
+```
+
+That turns `softCE true` into `softCE false` on `targetRangeGate` while every CPU case passes,
+which is the signature of a guard that stopped covering the GPU path. The loophole computes the
+right denominator; what it drops is the validation.
+
+**What this costs, and the test that pays it back.** The old arrangement had a weak cross-check
+nobody designed: two independently written counts, compared through a parity case that carries
+ignored rows, are unlikely to be identically wrong. One shared count scales the CPU and GPU losses
+together, so the parity cases go on passing. Measured rather than assumed: with `keptTeacherRows`
+changed to `return T`, and before the case below existed, the entire suite exited 0.
+
+The repo already carries the warning, over the oracle that answers it. `chunked summed NLL` came in
+with #51 and the sentence above it with #62: "The oracle is computed here rather than taken from
+either loss: both draw their denominator from the helper, so comparing them to each other would
+agree on a wrong kept count." (#82 gets the credit for this in a first draft of this lever and
+deserves none of it; it never touched `gradcheck.ts`.) This ships `softCE summed NLL`, the same
+shape for the soft-target loss: a CPU-only case whose expected value is computed in the test and
+whose `kept` is written out as the literal 3 rather than derived. `return T` fails it and only it,
+at `maxAbs=1.67e+0`, and so does moving the `kept++` above the ignore-marker `continue`, which for
+this input is the same mutation: one ignored row means both return `T`. Separating them needs a case
+with two.
+
+The case takes its own seed rather than the shared `rng`, so it does not shift every case below it
+onto different inputs.
+
+The `T`-divisor mutation still has its own job, and it is a different one. Replacing the GPU divisor
+with `T` fails the parity cases at `gpu=2.3589 cpu=3.1453`, a ratio of exactly 3/4: that catches a
+consumer of the count diverging from the other consumer. The new case catches the shared producer
+being wrong, which nothing could see. Three mutations, three different failures.
 
 ## Quality levers
 
