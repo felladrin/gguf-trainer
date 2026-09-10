@@ -2197,39 +2197,55 @@ Filed as #89 while closing #83. `.github/workflows/test.yml` ran four things, `d
 purpose is principle 1, that everything the model itself needs runs on Deno, Bun and Node with no
 npm install, was checked only when someone happened to run it on their own machine.
 
-#83 is what that costs. A static `hyparquet` import in `src/data/parse.ts` kept roughly 40
-assertions over `eval-choice`'s scoring arithmetic out of `test:node` entirely, and four more files
-were missing for the other reason, that nothing compared the two task lists to `tests/`. Both fixes
-landed with guards that no CI could enforce.
+#83 is what that costs. A static `hyparquet` import in `src/data/parse.ts` kept 79 assertions over
+`eval-choice`'s scoring arithmetic out of `test:node` entirely, and four more files were missing for
+the other reason, that nothing compared the two task lists to `tests/`. Both fixes landed with
+guards that no CI could enforce.
 
 **What made it its own issue rather than four lines in #83 was the risk profile, and the answer is
 that all three worries were unfounded.** Measured by running it:
 
 | worry                                                                         | measurement                                                                     |
 | :---------------------------------------------------------------------------- | :------------------------------------------------------------------------------ |
-| The strip-types flag has moved across 22.x and 23.x, so the pin is a decision | `22` resolves to v22.23.2 and `lts/*` to v24.20.0 on `ubuntu-latest`; both pass |
+| The strip-types flag has moved across 22.x and 23.x, so the pin is a decision | `22` resolved to v22.23.2 and `lts/*` to v24.20.0 on `ubuntu-latest`; both pass |
 | The 21 files pass on one developer's Node, not necessarily the runner's       | Both matrix entries green on the first run                                      |
 | `test` and `test:node` overlap, so the job roughly doubles the suite          | 21s and 20s beside the Deno job's 20s, in parallel: no wall-clock change        |
 
 Locally for comparison, `test:node` is 6.9s against `test`'s 14.8s, because the GPU parity file
 skips without a WebGPU adapter under Node.
 
-**What the job does not prove, since a green matrix entry is easy to over-read.** Of the 21 files,
-20 run their checks under Node; `gpu-parity.ts` prints `SKIP: no WebGPU in this runtime` and exits
-0, which is correct behaviour and also zero coverage there. `large-file-write.ts` runs its round
-trips but leaves its big-IO case behind `GGUF_TRAINER_BIG_IO=1`, skipped under both runners. The
-exit code does propagate: the task chains with `&&`, and an injected `process.exit(3)` in the first
-file surfaced as `task exit=3` rather than being swallowed.
+**Both entries are pinned, and that first run is why.** `node-version: "22"` resolves to the newest
+22.x, so the entry called "the floor" tested everything except the floor: `readme.md` promises Node
+22.6+, and 22.6 through 22.17 carry an older stripper than the v22.23.2 that ran. It is now
+`22.6.0`, which makes that entry test the promise, and if it ever fails the promise was wrong and
+belongs raised rather than worked around. `lts/*` went the same way for a different reason: it
+resolved to v24.20.0, and the LTS line rolls to the next major on a calendar, so keeping it would
+eventually turn CI red on a date rather than on a change, in a repo where red blocks every PR. `24`
+moves when a PR moves it. `fail-fast: false` so one version failing still reports the other.
 
-**Two versions rather than one.** `22` is the floor `--experimental-strip-types` needs, and the
-oldest supported runtime is where a syntax the stripper cannot erase shows up first. `lts/*` is what
-someone actually has installed, and catches a regression the floor cannot see. `fail-fast: false`
-so one version failing still reports the other.
+**What the job does and does not prove, since a green matrix entry is easy to over-read.** Of the 21
+files, 20 run their checks under Node. `gpu-parity.ts` prints `SKIP: no WebGPU in this runtime` and
+exits 0, so none of its assertions run; what it still proves is that its whole static import graph,
+the WebGPU backend, the trainer and `src/commands/pretrain.ts`, loads under Node with no npm
+install. That is exactly the #83 class of defect, which makes it one of the more valuable entries
+rather than dead weight. `large-file-write.ts` runs its round trips but leaves its big-IO case
+behind `GGUF_TRAINER_BIG_IO=1`, skipped under both runners. The exit code does propagate: the task
+chains with `&&`, and an injected `process.exit(3)` in the first file surfaced as `task exit=3`
+rather than being swallowed.
+
+**Principle 1 names three runtimes and this enforces two.** Bun has no task and no job. Filed
+separately rather than folded in, because a `test:bun` task is a decision about a third runtime
+rather than a line of YAML.
 
 It is a separate job rather than a step on the existing one, so it runs beside the Deno suite
 instead of adding to its wall clock. `denoland/setup-deno` appears in it only to read the task
 string out of `deno.json`: spelling the file list into the workflow would make it a third copy of a
-list `tests/task-coverage.ts` exists to keep at two.
+list `tests/task-coverage.ts` exists to keep at two. The cost of that is narrow and worth naming: a
+Deno-side breakage reddens the Node job for a non-Node reason.
+
+The workflow also gained a `concurrency` group, because it went from one job to three and a
+superseded push now wastes three runners rather than one. It cancels on `pull_request` only: a
+cancelled main build leaves no record of whether that commit was ever green.
 
 ## Quality levers
 

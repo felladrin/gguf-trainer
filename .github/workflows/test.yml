@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# This workflow went from one job to three, so a superseded push used to waste
+# one runner and now wastes three. Cancel only on pull_request: a main build
+# that gets cancelled leaves no record of whether that commit was ever green.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -31,17 +38,20 @@ jobs:
   # green. That is not hypothetical: #83 was a static `hyparquet` import that
   # kept three test files out of the Node task entirely.
   #
-  # Two versions, not one. 22 is the floor: `--experimental-strip-types` needs
-  # 22.6, and the oldest supported runtime is where a syntax the stripper cannot
-  # erase shows up first. `lts/*` is what someone actually has installed, and
-  # catches a regression the floor cannot see. Separate job rather than a step,
-  # so it runs beside the Deno suite instead of after it.
+  # Two versions, both pinned. 22.6.0 is the exact floor readme.md promises and
+  # the first release with --experimental-strip-types, so this entry tests the
+  # promise rather than whatever 22.x is newest; a bare "22" resolves to the
+  # latest and never exercises the older stripper, which is the whole point of
+  # having a floor. 24 is the ceiling, moved by a PR about moving the ceiling.
+  # `lts/*` would do the same job until the LTS line rolls to the next major,
+  # at which point it turns this red on a calendar rather than on a change.
+  # Separate job rather than a step, so it runs beside the Deno suite.
   node:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        node-version: ["22", "lts/*"]
+        node-version: ["22.6.0", "24"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
