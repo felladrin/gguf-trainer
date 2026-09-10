@@ -49,6 +49,29 @@ Implement the same math as the CPU op in `src/backend/webgpu.ts`, keep the `Tens
 identical, and add a case to `tests/gpu-parity.ts`. A kernel is not trusted until its forward and
 backward match the CPU backend within tolerance (`deno task test`). Bring up kernels one at a time.
 
+## Prove a test can fail
+
+Every guard added here gets a test, and the test gets one more step: break the thing it guards, watch
+it go red, put it back. Not as a ritual. Three tests written on 2026-09-10 passed for reasons that
+had nothing to do with what they claimed, and each one looked right:
+
+- **A NaN oracle.** `!isFinite(got) || Math.abs(got - want) > tol` reads as symmetric and is not:
+  with `want` NaN, `Math.abs(0 - NaN)` is NaN and `NaN > tol` is `false`, so a broken reference side
+  passes silently. Prefer a comparison that fails on NaN, like `got !== 0`, over one that has to be
+  told about it (correctness.md lever 48).
+- **A pass condition the absence of work also satisfies.** A gate asserting "the loss is 0 on a
+  fully masked batch" passes just as well when the readback never happened, because an unread host
+  tensor is zeros. It needed a scored control in the same `sync`, and a `NaN` seeded into every
+  scalar first so each proves the device wrote it (lever 48).
+- **Two sets that never intersect.** A gate meant to catch a later pass overwriting an earlier one's
+  buffer allocated them so that the writes and the reads landed on different halves of the pool, so
+  no ordering violation could have moved the result. Running the backward is what made the buffers
+  overlap (lever 41).
+
+The question to ask is not "does this pass?" but "what would have to be true for this to fail, and
+have I made that happen?". If the answer is "nothing I can do from inside this repo", say so in the
+test, as `recycleReuseGate` does.
+
 ## Style
 
 - `deno fmt` (config in `deno.json`); 100-col lines.
