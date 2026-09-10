@@ -11,9 +11,10 @@ Thanks for helping build a from-scratch, GGUF-native LLM trainer in TypeScript.
    @huggingface/jinja) belong to data fetching and chat templating only, in `src/data/` and
    `src/commands/`; do not let them reach the engine. In any module something under `tests/` can
    reach, import them where they are used rather than at the top: a static import makes every
-   transitive importer unloadable under Node, which is how three test files went missing from
-   `test:node` (lever 39). `tests/task-coverage.ts` catches the other half, a test file that is in
-   one task list and not the other.
+   transitive importer unloadable under Node, which is how two test files went missing from
+   `test:node` (lever 39). Five more were missing for the other reason, which
+   `tests/task-coverage.ts` now catches: nothing compared the two task lists to `tests/`. A test
+   file belongs in both tasks unless it has a load failure under Node you have actually seen.
 2. **GGUF loadability is a contract.** Each architecture's tensor names and metadata keys, in its
    own `src/arch/<name>.ts`, mirror what `llama.cpp` expects. Don't change them without validating
    the output loads in `llama-cli`.
