@@ -951,8 +951,8 @@ async function main() {
   await wsdScheduleParity(gpu);
   await qkClipTrajectoryParity(gpu);
 
-  // 8. sync() must fence GPU completion even when it reads nothing back.
-  await syncFenceGate(gpu);
+  // 8. A sync() that stages nothing recycles every transient with no fence.
+  await recycleReuseGate(gpu);
 
   console.log(
     failures === 0 ? "\n=== all parity checks passed ===" : `\n=== ${failures} FAILURES ===`,
@@ -1296,18 +1296,6 @@ async function qkClipTrajectoryParity(gpu: WebGPUBackend) {
   );
 }
 
-/**
- * Verify that sync() fences GPU completion even when it reads nothing back.
- * The resident training loop calls sync() twice per step: once to read losses
- * and aux grads, once to flush the optimizer dispatches. The second sync has
- * nothing to stage, so without an explicit fence (a staging copy of a 4-byte
- * sentinel) it would resolve at submit rather than at GPU completion: making
- * the optimizer-step timing dishonest and potentially recycling transients
- * the GPU is still writing. This test encodes a GPU linear op, calls sync()
- * with no reads, then reads the output in a second sync and checks correctness.
- * If the first sync didn't actually fence, the second sync's copy would race
- * the linear dispatch and either deadlock (invalid pipeline) or read zeros.
- */
 /**
  * Activation recomputation on the device, over a whole model, against the CPU
  * reference WITHOUT it. Two things this reaches that the CPU gradcheck cannot:
@@ -2277,32 +2265,105 @@ async function targetRangeGate(gpu: WebGPUBackend) {
   }
 }
 
-async function syncFenceGate(gpu: WebGPUBackend) {
+/**
+ * A sync() that stages nothing awaits nothing, and still hands every transient
+ * back to the pool. What keeps that sound is queue ordering, not a fence; the
+ * argument is written out at the release loop in sync().
+ *
+ * Nothing in the shipped trainer reaches that combination: measured over four
+ * steps, the four empty-staging syncs each released zero transients, because
+ * the loss sync immediately before them already emptied the list. The path is
+ * reachable through the public bare `sync()`, which is what this exercises, and
+ * it becomes live the moment a caller keeps its gradients on device and syncs
+ * with work outstanding.
+ *
+ * Three checks, and they cover different halves:
+ *
+ *   - The bare sync() stages nothing. Without it the arm is not on the path
+ *     under test at all, which is what the first draft got wrong.
+ *   - The pool does not grow across the second chain. Delete the release loop
+ *     in sync() and the second chain allocates instead of reusing, so this
+ *     fires. It is what proves the reuse under test happens at all.
+ *   - The first chain's gradients still match the CPU after that reuse. No
+ *     mutation inside the repo forces this one: it fails only if a later submit
+ *     is allowed to overtake an earlier one, which is the assumption being
+ *     leaned on rather than a line anyone here can break.
+ *
+ * The first chain runs its BACKWARD before the bare sync, and that is what
+ * makes the second assertion mean anything. Forward-only, the four recycled
+ * [T, HID] buffers split cleanly: `makeOut` takes a data buffer then a gradient
+ * buffer, the pool pops LIFO, so the second chain's writes land on the first
+ * chain's gradient buffers, which a forward-only graph never touches, while the
+ * first chain reads only its data buffers. Two disjoint sets, no overlap to
+ * race, and the arm passes for a reason unrelated to what it tests. With the
+ * backward recorded, the second chain's two data buffers are both read by work
+ * still in flight: gelu's backward reads one, linear's backward reads the other
+ * twice, and both feed dx and dw1, which the comparison checks. Two write-vs-read
+ * overlaps, on the buffers that matter. Backward allocates nothing (linear, gelu
+ * and crossEntropy all dispatch into buffers they already have), so the pool
+ * assertion is unchanged.
+ *
+ * The gradients are read from the persistent accumulators rather than from any
+ * graph output, whose buffer the bare sync() already returned to the pool.
+ *
+ * One dependency worth naming, because breaking it looks like an ordering
+ * violation and is not: the second chain's entryFor re-queues clears for x.grad
+ * and w1.grad, and the final sync() DROPS them because no backward began. Turn
+ * that drop into a deferral and this gate fails with all-zero gradients.
+ */
+async function recycleReuseGate(gpu: WebGPUBackend) {
+  const T = 24, HID = 64, OUT = 40;
   const rng = mulberry32(0xfeed);
-  const x = randTensor([8, 16], rng);
-  const w = randTensor([12, 16], rng);
+  const x = randTensor([T, HID], rng);
+  const w1 = randTensor([HID, HID], rng);
+  const w2 = randTensor([OUT, HID], rng);
 
-  // CPU reference for correctness check (linear is already imported at top).
-  for (const t of [x, w]) t.zeroGrad();
-  const cpuOut = linear(x, w);
-  const cpuData = cpuOut.data.slice();
+  // Ends in a scalar loss because `backward` seeds `loss.grad[0]` on the host:
+  // a non-scalar output would never get its seed to the device.
+  const targets = Array.from({ length: T }, (_, i) => (i * 7 + 3) % OUT);
+  const chain = () => crossEntropy(linear(gelu(linear(x, w1)), w2), targets);
 
-  // GPU: encode the linear dispatch, fence with empty sync(), then read back.
-  for (const t of [x, w]) t.zeroGrad();
+  for (const t of [x, w1, w2]) t.zeroGrad();
+  backward(chain(), 1);
+  const cpuGrads = [x, w1, w2].map((t) => t.grad.slice());
+
+  for (const t of [x, w1, w2]) t.zeroGrad();
+  // Without this the bare sync() is not empty: every touched external with a
+  // gradient stages one, 32768 bytes here, and the path under test is gone.
+  // train-gpu keeps both parameter groups on device for the same reason.
+  for (const t of [x, w1, w2]) gpu.keepGradOnDevice(t);
   gpu.install();
   let ok = true;
   try {
-    const gpuOut = linear(x, w);
-    // Empty sync: should fence GPU work even though it stages nothing.
+    backward(chain(), 1);
+    await gpu.sync(); // stages nothing, awaits nothing, recycles everything
+    if (gpu.lastSyncReadbackBytes !== 0) {
+      console.log(`    MISMATCH recycleReuse: sync() staged ${gpu.lastSyncReadbackBytes} bytes`);
+      ok = false;
+    }
+    // Exactly the four [T, HID] buffers the first chain released (two ops, each
+    // taking a data and a gradient buffer), so a pool that grew by a byte means
+    // the recycle did not happen.
+    const poolBefore = gpu.residentBytes().pool;
+    gelu(linear(x, w1));
+    const poolAfter = gpu.residentBytes().pool;
+    if (poolAfter !== poolBefore) {
+      console.log(`    MISMATCH recycleReuse: pool grew ${poolBefore} -> ${poolAfter} on reuse`);
+      ok = false;
+    }
     await gpu.sync();
-    // Now read back, if the fence worked the values are those of the linear op.
-    await gpu.sync([gpuOut]);
-    ok = compare("syncFence.out", gpuOut.data, cpuData, FWD) && ok;
+    const names = ["x", "w1", "w2"];
+    for (const [i, t] of [x, w1, w2].entries()) {
+      const got = await gpu.readStateBuffer(gpu.buffersFor(t).grad, t.size);
+      ok = compare(`recycleReuse.d${names[i]}`, got, cpuGrads[i], BWD) && ok;
+    }
   } finally {
     gpu.uninstall();
   }
   if (!ok) failures++;
-  console.log(`  ${ok ? "ok " : "FAIL"} sync() fences GPU even with no readback`);
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} an empty sync() recycles without corrupting in-flight work`,
+  );
 }
 
 /**
