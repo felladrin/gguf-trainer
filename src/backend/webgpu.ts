@@ -1700,10 +1700,37 @@ export class WebGPUBackend implements OpsBackend {
  * (Node and Bun today: run GPU work under Deno, or provide a navigator.gpu
  * polyfill); training then stays on the CPU reference backend.
  */
-export async function initWebGPU(): Promise<WebGPUBackend | null> {
+/**
+ * Whether this RUNTIME exposes WebGPU at all, which is the first of the two
+ * reasons `initWebGPU` returns null and the only one a caller can tell apart
+ * afterwards. Deno does; Node and Bun do not.
+ *
+ * Exported so a caller that got null can say which exit was taken without
+ * re-deriving the test, and used by `initWebGPU` itself so the two cannot
+ * drift. If this says "ok" and `initWebGPU` still returned null, the machine
+ * has no usable adapter.
+ */
+export function webgpuRuntime(): "ok" | "no-runtime" {
   // deno-lint-ignore no-explicit-any
   const nav: any = (globalThis as any).navigator;
-  if (!nav?.gpu) return null;
+  return nav?.gpu ? "ok" : "no-runtime";
+}
+
+/**
+ * Why there is no GPU, for a command that falls back rather than dying. The
+ * distinction matters to the reader: one is fixed by changing runtime, the
+ * other is a property of the machine.
+ */
+export function noGpuNote(): string {
+  return webgpuRuntime() === "no-runtime"
+    ? "(no WebGPU in this runtime; falling back to CPU forward)"
+    : "(no GPU adapter found; falling back to CPU forward)";
+}
+
+export async function initWebGPU(): Promise<WebGPUBackend | null> {
+  if (webgpuRuntime() !== "ok") return null;
+  // deno-lint-ignore no-explicit-any
+  const nav: any = (globalThis as any).navigator;
   const adapter = await nav.gpu.requestAdapter();
   if (!adapter) return null;
   // Request the adapter's own maximum buffer limits instead of the WebGPU

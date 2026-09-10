@@ -1539,6 +1539,52 @@ would quietly stop meaning what it says.
 `withPreamble` joins the few-shot preamble to a stem, and is hoisted for the same reason
 `renderPair` is: both loops have to agree about the separator.
 
+### 36. Why there is no CPU training, measured (2026-09-10)
+
+Asked directly after #41, and worth writing down because the honest answer is not the one the code
+suggests. `pretrain` refuses to start without a GPU adapter, and the natural reading of that is that
+a CPU training path does not exist. It does. `trainLM` in `src/train/trainer.ts` is a complete loop:
+window sampling, backward, optimizer step, LR schedule, QK-clip, supervision masks, disk-backed
+token sources. `demo` trains with it, and `gpu-parity` runs it step-for-step against the GPU trainer
+to prove their trajectories match.
+
+Wiring it into `pretrain` would be modest too: 13 `gpu.` call sites across 8 methods in one file,
+most of them the device banner, the trust gate and the peak-memory line. `--recompute` and
+`--loss-chunk` are backend-agnostic already, and `--reclaim` is moot without a buffer pool.
+
+**The reason is throughput.** Same machine, same shape, same steps, CPU `trainLM` against GPU
+`trainLMGpuResident`:
+
+| shape                              |        CPU |         GPU |
+| ---------------------------------- | ---------: | ----------: |
+| 6.0M params, vocab 8192, seq 256   | 15.8 tok/s | 786.4 tok/s |
+| 32.0M params, vocab 16384, seq 256 |  1.6 tok/s |             |
+
+49x at 6M, and the gap widens with size rather than closing: 5.3x the parameters cost 9.9x the time,
+an exponent of about 1.4 over that range. Extrapolating the 32M figure LINEARLY to 596M, which is
+generous against a curve that is worse than linear, gives 0.086 tok/s, about 12 seconds per token.
+A 100k-token fine-tune is 13 days; 10M tokens is 3.7 years. The same 10M on the GPU, at the 108 tok/s
+measured on that exact Qwen3-0.6B shape, is 25.7 hours.
+
+Threads do not rescue it. The loop is scalar single-threaded JS with no worker pool and no `--threads`
+flag, and a perfect 10x from ten cores still leaves 10M tokens at 135 days.
+
+So shipping `--cpu` for training would be a small change that produces a trap: a flag that accepts
+the run and then never finishes. Making CPU training genuinely useful is the several-new-files
+project, a threaded SIMD or WASM/BLAS backend, which is a different undertaking from exposing the
+reference loop. The loop's job is to be the oracle every GPU kernel is checked against, and it is
+good at that.
+
+**For anyone who has only a CPU**, the recommendation is `transformers` with `peft`, measured on
+Qwen3-0.6B-Base at seq 512, batch 1, 10 threads: LoRA 118 tok/s at 6.1 GB peak, a full fine-tune
+82 tok/s at 12.8 GB. Both fit 32 GB. The readme carries the same note and the install lines.
+
+**The error message was the place a user would learn this, and it said the wrong thing.**
+`initWebGPU` returns null for two reasons, no WebGPU in the runtime and no adapter on the machine,
+and the die collapsed both into "training needs Deno". Someone running Deno on a GPU-less box was
+told to use Deno, which is exactly #41's situation. `webgpuRuntime()` tells them apart, and
+`initWebGPU` takes the same test itself so the two cannot drift. That was #84.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

@@ -34,7 +34,7 @@ import {
 import { assertCorpusFitsVocab, diskTokenSource, tokenBytes } from "../data/tokens.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
-import { initWebGPU } from "../backend/webgpu.ts";
+import { initWebGPU, noGpuNote } from "../backend/webgpu.ts";
 import type { WebGPUBackend } from "../backend/webgpu.ts";
 
 function die(msg: string): never {
@@ -97,7 +97,7 @@ async function run(v: Values) {
       gpu.install();
       gpu.uploadParams(model.params());
     } else {
-      console.log("(no WebGPU; falling back to CPU forward)");
+      console.log(noGpuNote());
     }
   }
 

@@ -53,7 +53,7 @@ import type { IdArray } from "../data/tokens.ts";
 import type { TokenSource } from "../data/tokens.ts";
 import { parseQuantList } from "../gguf/quantize.ts";
 import type { QuantName } from "../gguf/quantize.ts";
-import { initWebGPU } from "../backend/webgpu.ts";
+import { initWebGPU, webgpuRuntime } from "../backend/webgpu.ts";
 import type { WebGPUBackend } from "../backend/webgpu.ts";
 import { deserializeOptState, MuonGpu, serializeOptState } from "../backend/muon-gpu.ts";
 import { trainLMGpuResident } from "../backend/train-gpu.ts";
@@ -286,7 +286,19 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
 
   console.log(`=== ${mode}: ${arch.name} -> GGUF ===\n`);
   const gpu = await initWebGPU();
-  if (!gpu) die("no WebGPU: training needs Deno (Node and Bun have no GPU backend here)");
+  // Two different causes, and the old message only described the first, so a
+  // Deno user on a machine without a GPU was told to use Deno.
+  if (!gpu) {
+    die(
+      webgpuRuntime() === "no-runtime"
+        ? "no WebGPU: training needs Deno (Node and Bun have no GPU backend here)"
+        : "no GPU adapter found, and training needs one. The CPU backend here is a " +
+          "single-threaded correctness reference, not a training path: measured on the same " +
+          "machine and shape, it runs 15.8 tok/s at 6M parameters against the GPU's 786, and " +
+          "1.6 tok/s at 32M. For CPU fine-tuning use transformers with peft instead. " +
+          "`eval-loss`, `eval-choice` and `generate` do take --cpu, at those speeds.",
+    );
+  }
   console.log("Device:");
   for (const line of gpu.describeDevice()) console.log(line);
 
