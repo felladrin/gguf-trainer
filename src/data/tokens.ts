@@ -13,7 +13,29 @@
 // when the vocab fits in u16, else 4. tokenBytes(vocabSize) picks the width;
 // the reader is told the width (the model's config carries the vocab size).
 
-import { chunkSpans, openReader, readFileText, writeFileBytes } from "../io.ts";
+import * as fs from "node:fs";
+import { chunkSpans, openReader, writeFileBytes } from "../io.ts";
+
+/**
+ * A file's contents, or null when it is absent.
+ *
+ * Not readFileText().catch(() => null): that turns every read failure into
+ * "absent", which is the bug pretrain's optstate probe already paid for once,
+ * where decoding a multi-GB sidecar as UTF-8 overflowed and silently reported no
+ * optstate. Only ENOENT means absent.
+ */
+function readIfPresent(path: string): string | null {
+  try {
+    return fs.readFileSync(path, "utf8");
+  } catch (e) {
+    if ((e as { code?: string }).code === "ENOENT") return null;
+    throw e;
+  }
+}
+
+function fileSize(path: string): number {
+  return fs.statSync(path).size;
+}
 
 export interface TokenSource {
   /** Number of tokens in the corpus. */
@@ -173,7 +195,7 @@ export async function diskTokenSource(
  * file's ids are all perfectly legal: a same-size or larger vocab passes every
  * range check, and so does a narrower one that flips the file's id width, since
  * the size check is only `% bytesPerToken`, so a 4-byte file read as 2-byte
- * doubles the count and reads every second id as 0. Nothing about an id says
+ * doubles the count and splits each id into a low and a high half. Nothing about an id says
  * which vocab it came from, so this stores the vocab instead.
  *
  * The hash is over the whole exported tokenizer, not just the vocab size, so it
@@ -184,7 +206,20 @@ export interface TokenFileId {
   tokenizer: string;
   vocabSize: number;
   bytesPerToken: 2 | 4;
+  /**
+   * Size of the token file when it was stamped.
+   *
+   * Without it a stale stamp beside a rewritten file reports a false ok, which
+   * is worse than no stamp at all, and a crash between writeTokenFile and
+   * stampTokenFile is indistinguishable from a file that predates the stamp.
+   */
+  bytes: number;
 }
+
+export type TokenIdVerdict =
+  | { status: "ok" }
+  | { status: "unstamped" }
+  | { status: "mismatch"; message: string };
 
 export function tokenIdPath(tokensPath: string): string {
   return `${tokensPath}.id`;
@@ -208,6 +243,7 @@ export async function stampTokenFile(
     tokenizer: await tokenizerFingerprint(tokenizerData),
     vocabSize,
     bytesPerToken,
+    bytes: fileSize(tokensPath),
   };
   await writeFileBytes(tokenIdPath(tokensPath), new TextEncoder().encode(JSON.stringify(id)));
 }
@@ -227,28 +263,80 @@ export async function checkTokenFileId(
   tokenizerData: unknown,
   vocabSize: number,
   bytesPerToken: 2 | 4,
-): Promise<"ok" | "unstamped" | string> {
-  const raw = await readFileText(tokenIdPath(tokensPath)).catch(() => null);
-  if (raw === null) return "unstamped";
+): Promise<TokenIdVerdict> {
+  const raw = readIfPresent(tokenIdPath(tokensPath));
+  if (raw === null) return { status: "unstamped" };
+  const bad = (message: string): TokenIdVerdict => ({ status: "mismatch", message });
+  const rebuild = `Delete it and let this run rebuild it, or point at a file that matches.`;
   let id: TokenFileId;
   try {
     id = JSON.parse(raw) as TokenFileId;
   } catch {
-    return `${tokenIdPath(tokensPath)} is not readable JSON; delete it and rebuild ${tokensPath}`;
+    return bad(
+      `${tokenIdPath(tokensPath)} is not readable JSON; delete it and rebuild ${tokensPath}`,
+    );
   }
-  const rebuild = `Delete it and let this run rebuild it, or point --data at a file that matches.`;
-  // Checked on its own rather than folded into the fingerprint, because this one
-  // corrupts the read whatever the tokenizer says: the size check in
-  // diskTokenSource is only `% bytesPerToken`, so a 4-byte file read as 2-byte
-  // passes it, doubles the token count, and reads every second id as 0.
+  // JSON.parse("null") and JSON.parse("3") both succeed, and the field reads
+  // below would throw out of the function rather than say what is wrong.
+  if (typeof id !== "object" || id === null) {
+    return bad(
+      `${tokenIdPath(tokensPath)} is not readable JSON; delete it and rebuild ${tokensPath}`,
+    );
+  }
+  const bytes = fileSize(tokensPath);
+  if (id.bytes !== bytes) {
+    return bad(
+      `${tokensPath} is ${bytes} bytes and its stamp was written for ${id.bytes}. Something ` +
+        `rewrote or truncated the file without restamping it, so the stamp says nothing about ` +
+        `what is in there now. ${rebuild}`,
+    );
+  }
+  // Compared on its own for the message, not for independence: bytesPerToken is
+  // a pure function of vocabSize and vocabSize is inside the hash, so a width
+  // mismatch already implies a fingerprint mismatch unless tokenBytes itself
+  // changed. Checking it first turns "different tokenizer" into the actionable
+  // "written 4 bytes, about to be read as 2", which is the failure that doubles
+  // the token count and splits each id into a low and a high half, while passing
+  // diskTokenSource's `% bytesPerToken`.
   if (id.bytesPerToken !== bytesPerToken) {
-    return `${tokensPath} was written ${id.bytesPerToken} bytes per token and is about to be ` +
-      `read as ${bytesPerToken}, which doubles or halves its token count silently. ${rebuild}`;
+    return bad(
+      `${tokensPath} was written ${id.bytesPerToken} bytes per token and is about to be ` +
+        `read as ${bytesPerToken}, which doubles or halves its token count silently. ${rebuild}`,
+    );
   }
   const want = await tokenizerFingerprint(tokenizerData);
-  if (id.tokenizer === want) return "ok";
+  if (id.tokenizer === want) return { status: "ok" };
   const how = id.vocabSize !== vocabSize
     ? `vocab ${id.vocabSize} against the current ${vocabSize}`
     : `the same ${vocabSize} tokens but different merges or specials`;
-  return `${tokensPath} was tokenized with a different tokenizer: ${how}. ${rebuild}`;
+  return bad(`${tokensPath} was tokenized with a different tokenizer: ${how}. ${rebuild}`);
+}
+
+/**
+ * Width-only half of the check, for a caller holding a vocab size and no
+ * tokenizer. It cannot false-refuse a correct pair, because bytesPerToken is a
+ * pure function of the vocab size both sides already agree on.
+ */
+export function checkTokenFileWidth(
+  tokensPath: string,
+  bytesPerToken: 2 | 4,
+): TokenIdVerdict {
+  const raw = readIfPresent(tokenIdPath(tokensPath));
+  if (raw === null) return { status: "unstamped" };
+  let id: Partial<TokenFileId>;
+  try {
+    id = JSON.parse(raw) as Partial<TokenFileId>;
+  } catch {
+    return { status: "unstamped" };
+  }
+  if (typeof id !== "object" || id === null || (id.bytesPerToken !== 2 && id.bytesPerToken !== 4)) {
+    return { status: "unstamped" };
+  }
+  if (id.bytesPerToken === bytesPerToken) return { status: "ok" };
+  return {
+    status: "mismatch",
+    message: `${tokensPath} was written ${id.bytesPerToken} bytes per token and is about to be ` +
+      `read as ${bytesPerToken}, which doubles or halves its token count silently. Score against ` +
+      `the checkpoint whose vocab the file was built for.`,
+  };
 }

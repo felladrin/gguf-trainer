@@ -219,15 +219,15 @@ async function assertTokenFileId(tokensPath: string, tok: BPETokenizer): Promise
     tok.vocabSize,
     tokenBytes(tok.vocabSize),
   );
-  if (verdict === "ok") return;
-  if (verdict === "unstamped") {
+  if (verdict.status === "ok") return;
+  if (verdict.status === "unstamped") {
     console.log(
       `Tokenizer match: ${tokensPath} predates the .id stamp, so it cannot be checked. ` +
         `Rebuild it to get the check.`,
     );
     return;
   }
-  die(verdict);
+  die(verdict.message);
 }
 
 /** Load the tokenizer that `tokenize` wrote next to a .tokens file. */
@@ -596,6 +596,10 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const cooldownStart = steps - Math.round(steps * 0.2);
   const injectFrom = flags.get("injectFrom") ? Number(flags.get("injectFrom")) : cooldownStart;
   if (injectPath) {
+    // The same class as --data, and the same tokenizer in hand: this stream is
+    // instruct data encoded with THIS tokenizer, and a stale one lands on the
+    // cooldown phase, which is where the injection is doing its work.
+    await assertTokenFileId(injectPath, tok);
     injectSource = await diskTokenSource(injectPath, tokenBytes(tok.vocabSize));
     assertCorpusFitsVocab(injectSource, cfg.vocabSize, injectPath);
     console.log(

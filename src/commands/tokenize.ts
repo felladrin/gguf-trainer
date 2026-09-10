@@ -143,7 +143,6 @@ async function run(v: Values) {
     fs.closeSync(fd);
   }
 
-  await stampTokenFile(tokensPath, tok.export(), tok.vocabSize, bpt);
   console.log(
     `\nWrote ${tokensPath} (${bpt} B/token, ${((totalTokens * bpt) / 1e6).toFixed(1)} MB, ` +
       `${totalDocs} docs); tokenizer already at ${tokenizerPath}`,
@@ -162,6 +161,9 @@ async function run(v: Values) {
   }
   src.close();
   console.log(`Round-trip: disk token file matches encoded ids at ${probes.length} part head(s) ✓`);
+  // After the self-check, not before it. A file that fails the round trip must
+  // not ship with a valid identity beside it, or the next `pretrain` accepts it.
+  await stampTokenFile(tokensPath, tok.export(), tok.vocabSize, bpt);
   console.log(`\n=== tokenize OK (${((Date.now() - t0) / 1000).toFixed(1)}s total) ===`);
 }
 

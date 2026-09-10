@@ -14,12 +14,14 @@ import * as path from "node:path";
 import {
   assertCorpusFitsVocab,
   checkTokenFileId,
+  diskTokenSource,
   idArrayFor,
   memTokenSource,
   stampTokenFile,
   tokenBytes,
   tokenIdPath,
   tokenizerFingerprint,
+  writeTokenFile,
 } from "../src/data/tokens.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 import { encodeCorpus } from "../src/commands/pretrain.ts";
@@ -244,8 +246,21 @@ ok(
   const a = train("the quick brown fox jumps over the lazy dog ".repeat(40), 280);
   const b = train("lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(40), 280);
 
-  const verdict = (t: BPETokenizer) =>
-    checkTokenFileId(tokensPath, t.export(), t.vocabSize, tokenBytes(t.vocabSize));
+  const verdict = async (t: BPETokenizer) => {
+    const v = await checkTokenFileId(tokensPath, t.export(), t.vocabSize, tokenBytes(t.vocabSize));
+    return v.status === "mismatch" ? v.message : v.status;
+  };
+
+  // Stability, which matters more than discrimination: if a save/load round trip
+  // moved the fingerprint, every correct corpus would start being refused after
+  // the tokenizer was reloaded from its json, which is how pretrain always gets
+  // it. `specials` is the only computed field in export(), and fromData filters
+  // the declared list by what train() put in the vocab, which is all of it.
+  const reloaded = BPETokenizer.fromData(JSON.parse(JSON.stringify(a.export())));
+  ok(
+    await tokenizerFingerprint(reloaded.export()) === await tokenizerFingerprint(a.export()),
+    "the fingerprint survives a json round trip through fromData",
+  );
 
   ok(await verdict(a) === "unstamped", "an unstamped file reports that, rather than passing");
 
@@ -270,6 +285,26 @@ ok(
     `a width flip is refused even when the tokenizer matches: got ${flipped}`,
   );
 
+  // A stale stamp beside a rewritten file would report a false ok, which is
+  // worse than no stamp: the byte size is what makes that a detection.
+  await stampTokenFile(tokensPath, a.export(), a.vocabSize, tokenBytes(a.vocabSize));
+  fs.writeFileSync(tokensPath, new Uint8Array([1, 0, 2, 0]));
+  const resized = await verdict(a);
+  ok(
+    typeof resized === "string" && resized.includes("is 4 bytes and its stamp was written for 6"),
+    `a file rewritten under its own stamp is refused: got ${resized}`,
+  );
+  fs.writeFileSync(tokensPath, new Uint8Array([1, 0, 2, 0, 3, 0]));
+
+  // JSON.parse("null") succeeds, so without a shape guard the field reads throw
+  // a TypeError out of the function instead of saying what is wrong.
+  fs.writeFileSync(tokenIdPath(tokensPath), "null");
+  const nullStamp = await verdict(a);
+  ok(
+    typeof nullStamp === "string" && nullStamp.includes("not readable JSON"),
+    `a stamp of "null" gets the message, not a stack trace: got ${nullStamp}`,
+  );
+
   fs.writeFileSync(tokenIdPath(tokensPath), "{not json");
   const broken2 = await verdict(a);
   ok(
@@ -286,6 +321,48 @@ ok(
   ok(
     await tokenizerFingerprint(plain.export()) !== await tokenizerFingerprint(special.export()),
     "a reserved special changes the fingerprint, which neither merges nor a size check would show",
+  );
+
+  // The claim the width message makes, demonstrated rather than asserted. A
+  // 4-byte file read as 2-byte passes diskTokenSource's `% bytesPerToken` and
+  // doubles the token count, because each id splits into its low and high
+  // halves. The odd slots are the high halves, which are 0 for every id under
+  // 65,536 and not otherwise: "every second id reads as 0" is the common case,
+  // not the rule, and a corpus that crossed the u16 ceiling is exactly the one
+  // whose high halves are non-zero.
+  const wide = path.join(dir, "wide.tokens");
+  await writeTokenFile(wide, [42, 70000, 7], 4);
+  const asWritten = await diskTokenSource(wide, 4);
+  const asNarrow = await diskTokenSource(wide, 2);
+  ok(asWritten.length === 3, "3 tokens at the width it was written");
+  ok(asNarrow.length === 6, "6 at half the width, so the count doubles rather than failing");
+  const halves = asNarrow.window(0, 6);
+  ok(
+    halves[0] === 42 && halves[1] === 0 && halves[4] === 7 && halves[5] === 0,
+    `an id under 65,536 becomes itself followed by a 0: got ${halves.join(",")}`,
+  );
+  ok(
+    halves[2] === 70000 % 65536 && halves[3] === 1,
+    `and one above it becomes two non-zero halves: got ${halves.join(",")}`,
+  );
+  asWritten.close();
+  asNarrow.close();
+
+  // Only ENOENT means absent. Treating every read failure as "no stamp" is the
+  // bug pretrain's optstate probe already paid for once, where decoding a
+  // multi-GB sidecar as UTF-8 overflowed and reported no optstate.
+  const blocked = path.join(dir, "blocked.tokens");
+  fs.writeFileSync(blocked, new Uint8Array([1, 0]));
+  fs.mkdirSync(tokenIdPath(blocked));
+  let threw = "";
+  try {
+    await checkTokenFileId(blocked, a.export(), a.vocabSize, 2);
+  } catch (e) {
+    threw = String((e as Error).message);
+  }
+  ok(
+    threw !== "",
+    "a stamp path that cannot be read propagates rather than reporting an unstamped file",
   );
 
   fs.rmSync(dir, { recursive: true, force: true });

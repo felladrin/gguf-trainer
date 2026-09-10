@@ -1672,8 +1672,8 @@ Filed as #81, recorded in lever 34 first, and the reason it needed its own entry
 check cannot reach it. `assertCorpusFitsVocab` catches a stale `.tokens` only when its ids exceed
 the new vocab. A stale file's ids are all perfectly legal: a same-size or larger vocab passes every
 range check, and so does a narrower one that flips the id width, since `diskTokenSource`'s size check
-is only `% bytesPerToken`, so a 4-byte file read as 2-byte passes it, doubles the token count and
-reads every second id as 0.
+is only `% bytesPerToken`, so a 4-byte file read as 2-byte passes it, doubles the token count and splits
+each id into a low and a high half.
 
 The reuse that makes it reachable is in `pretrain`'s `.txt` branch, which keeps an existing
 `${stem}.tokens` rather than rewriting it, while `sharedTokenizer` retrains the vocab whenever
@@ -1683,7 +1683,12 @@ token file built from a vocab that no longer exists, with every gate green.
 Nothing about an id says which vocab produced it, so the vocab is stored instead:
 `<file>.tokens.id`, a small JSON holding a SHA-256 over the exported tokenizer plus the vocab size
 and the id width. `tokenize`, `chat-corpus` and `pretrain`'s own writer stamp it; `pretrain` checks
-it in both input branches. Hashing the whole export rather than the size catches the case a size
+it in both input branches and on `--inject`, which opens a second `.tokens` with the same tokenizer
+in hand and lands on the cooldown phase. `tokenize` stamps after its round-trip self-check rather
+than before, so a file that fails the round trip cannot ship with a valid identity beside it.
+The stamp also carries the file's byte size: without it a stale stamp beside a rewritten file
+reports a false ok, which is worse than no stamp, and a crash between the write and the stamp is
+indistinguishable from a legacy file. Hashing the whole export rather than the size catches the case a size
 check misses entirely, a vocab of the same size whose merges retokenize the corpus differently, and
 the specials too. The id width is compared on its own rather than folded into the hash, because a
 width mismatch corrupts the read whatever the tokenizer says.
@@ -1700,18 +1705,52 @@ Exit 1, where before it trained.
 
 **An unstamped file is neither an error nor a pass.** Files written before this existed cannot be
 checked, and the run says so in a line of its own rather than staying quiet and implying a check
-happened. Refusing them instead would strand every corpus already on disk, 13 of them here, for a
-risk that has never been observed to fire; and the flows this guards against, deleting the tokenizer
-json or changing the vocab constant, leave the stamp in place, so they are caught either way. The
-gap that remains is deleting the stamp by hand, which is not something any flow does.
+happened. It is the shape of decision invariant 3 already makes for a missing `.optstate`, which
+re-warms rather than failing.
 
-`eval-loss` is deliberately not wired in. It reads a `.tokens` with no tokenizer in hand, only the
-checkpoint's vocab size, so the check available to it is a different and weaker one; lever 34's scan
-already covers it and this would be a second half-check pretending to be the same one.
+Backfilling the 23 `.tokens` on this machine would be cheap, not the obstacle: 22 have a sibling
+`.tokenizer.json`, and `stampTokenFile` needs only that json and the vocab size, never the corpus.
+The reason not to is that such a stamp would assert an identity nobody verified. It is computed from
+the very json `siblingTokenizer` will later load, so the check could only ever return ok; all it
+would buy is turning a future edit of that json into an error. Which means the scope limit has to be
+said out loud: for those 23 files, deleting the tokenizer json is exactly as unguarded today as it
+was before this change. What is closed is every file written from here on.
+
+The gap that remains for a stamped file is deleting the stamp by hand, which no flow does.
+
+`eval-loss` gets the width half and not the fingerprint, and the reason is not that it lacks a
+tokenizer. `loadModelFromGGUF` returns one; the command discards it. The reason is that a
+GGUF-derived `export()` is not guaranteed equal to the json-derived one the stamp was written from.
+On export `token_type` is assigned by the shape of the token text (`<|...|>` becomes CONTROL)
+regardless of what was declared, and on import `specials` is recovered from `token_type` in vocab
+order rather than from a declared list. For a locally trained tokenizer the two coincide, because
+`train()` appends specials in declaration order at the tail; for a foreign base they do not.
+A fingerprint gate there would refuse correct corpora.
+
+That is also what makes the gate sound in `pretrain`: it takes its tokenizer from the sibling json
+or from `sharedTokenizer`, never from `--resume`, so the comparison is json against json and never
+crosses the GGUF boundary. Someone simplifying `pretrain` to read the tokenizer off the resumed
+checkpoint would start refusing correct corpora.
+
+The width half is worth having on its own there, and cannot false-refuse: `bytesPerToken` is a pure
+function of the vocab size both sides already agree on. Lever 34's scan catches a width mismatch only
+by luck, when some low half of a 4-byte id happens to exceed the model's vocab, and `eval-loss` is
+the one command that answers with a number rather than an error, which `scripts/score-*.sh` publish.
 
 The cases live in `tests/large-vocab.ts`, beside the preflight's. Reporting an unstamped file as ok,
 dropping the width comparison, hashing only the vocab size, and treating an unparseable stamp as
-absent each fail one.
+absent, dropping the byte-size comparison, dropping the object guard that keeps a stamp of `null`
+from throwing a TypeError instead of a message, and widening the read to treat every failure as
+absent rather than only ENOENT, each fail one. Two more pin what the rest of this entry asserts rather than leaving it as
+prose: that the fingerprint survives a json round trip through `fromData`, which is the failure that
+would refuse correct corpora rather than admit wrong ones; and the width flip itself, through
+`writeTokenFile` and `diskTokenSource`. That second one corrected this entry: reading a 4-byte file
+as 2-byte splits each id into its low and high halves, and the high halves are 0 only for ids under
+65,536. "Every second id reads as 0" was the common case written up as the rule, and a corpus that
+crossed the u16 ceiling is precisely the one where it is false.
+
+What no test reaches is the call sites. Deleting `assertTokenFileId` from any of the four leaves the
+suite green; the end-to-end run above is the evidence, and it is not repeatable in CI.
 
 ## Quality levers
 
