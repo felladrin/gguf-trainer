@@ -378,7 +378,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
         : "no GPU adapter found, and training needs one. There is no CPU training path, " +
           "and that is a refusal rather than a gap: the CPU backend is the correctness oracle " +
           "the GPU kernels are checked against, and it is orders of magnitude short of usable " +
-          "at a real size (docs/optimization.md lever 36 has the measurements). For CPU " +
+          "at a real size (docs/correctness.md lever 36 has the measurements). For CPU " +
           "fine-tuning, use transformers with peft.",
     );
   }

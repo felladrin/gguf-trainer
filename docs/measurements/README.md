@@ -1,6 +1,6 @@
 # Measurements
 
-Logs that a `docs/optimization.md` lever quotes numbers from. Everything the trainer writes lands
+Logs that a `docs/optimization.md` or `docs/correctness.md` lever quotes numbers from. Everything the trainer writes lands
 in `out/`, which is gitignored, so a lever citing `out/whatever.log` is unverifiable to anyone who
 was not at the machine. These are the copies that make the levers checkable.
 
