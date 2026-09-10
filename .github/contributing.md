@@ -9,9 +9,11 @@ Thanks for helping build a from-scratch, GGUF-native LLM trainer in TypeScript.
    on Deno, Bun and Node with no npm install. `deno task test:node` checks the Node half of that. Avoid
    runtime-specific APIs; file I/O goes through `src/io.ts`. The two npm dependencies (hyparquet,
    @huggingface/jinja) belong to data fetching and chat templating only, in `src/data/` and
-   `src/commands/`; do not let them reach the engine. Import them where they are used, not at the
-   top of the module: a static import puts every transitive importer out of `test:node`'s reach,
-   which is how `eval-choice`'s scoring arithmetic went uncovered there (lever 39).
+   `src/commands/`; do not let them reach the engine. In any module something under `tests/` can
+   reach, import them where they are used rather than at the top: a static import makes every
+   transitive importer unloadable under Node, which is how three test files went missing from
+   `test:node` (lever 39). `tests/task-coverage.ts` catches the other half, a test file that is in
+   one task list and not the other.
 2. **GGUF loadability is a contract.** Each architecture's tensor names and metadata keys, in its
    own `src/arch/<name>.ts`, mirror what `llama.cpp` expects. Don't change them without validating
    the output loads in `llama-cli`.

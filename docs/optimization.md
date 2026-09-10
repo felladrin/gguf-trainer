@@ -1783,9 +1783,9 @@ Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'hyparquet' imported from src/
 `tests/eval-tasks.ts` imports `src/commands/eval-choice.ts`, which imports `src/data/parse.ts` for
 the HF parquet reader, which imported `hyparquet` at the top. None of what the test exercises touches
 any of it: `choiceMaskStart`, `choiceWindowError`, `preflightByBytes`, `renderPair`, `withPreamble`,
-`argminPerChar`, `hellaswagPreprocess` and the row parsers are pure string and integer work. So
-roughly 40 assertions over the eval scoring arithmetic never saw the Node runtime, because of an
-import none of them reach. `hyparquet` resolves through Deno's import map and there is no
+`argminPerChar`, `hellaswagPreprocess` and the row parsers are pure string and integer work. So 79
+assertions over the eval scoring arithmetic never saw the Node runtime, because of an import none of
+them reach. `hyparquet` resolves through Deno's import map and there is no
 `node_modules`, so the failure is at load time, before a single assertion runs.
 
 Moving it inside `parseParquet` fixes the coupling rather than routing around it, which is why it
@@ -1794,9 +1794,21 @@ package when a parquet file is actually read, `deno check` still resolves the ty
 dynamic specifier, and `eval-choice --task piqa`, which takes the JSON loader, stops paying for a
 reader it never calls.
 
-The check this leaves behind is the test itself: `tests/eval-tasks.ts` joins `test:node`, so putting
-the static import back fails it with the same `ERR_MODULE_NOT_FOUND`. Verified by doing exactly that.
-Parquet reading is unchanged, checked against `tests/fixtures/tiny.parquet` under Deno.
+It unblocked two more files than the issue named. `tests/style-pipeline.ts` was out of `test:node`
+for the identical reason, through `style-seed.ts`, and `tests/generate-penalty.ts` was never blocked
+at all and had simply never been added. Both run under Node now, checked before adding them.
+
+The check this leaves behind is the tests themselves: three files join `test:node`, so putting the
+static import back fails two of them with the same `ERR_MODULE_NOT_FOUND`. Verified by doing exactly
+that. Parquet reading is unchanged, checked against `tests/fixtures/tiny.parquet` under Deno,
+including the `subarray` path that exercises the `byteOffset` slice.
+
+**The static import is only half of why those assertions were invisible.** It made `eval-tasks.ts`
+fail under Node; what made that go unnoticed is that both task lists are hand-maintained strings in
+`deno.json` with nothing comparing them to `tests/`. `generate-penalty.ts` proves the point, since
+nothing was ever blocking it. `tests/task-coverage.ts` now compares both lists against the directory
+and against an exemption list that carries a reason per file, so a new test that is in one task and
+not the other fails rather than disappearing. A doc rule is what already failed here.
 
 **What this does not fix is that CI never runs `test:node` at all.** `.github/workflows/test.yml`
 runs `deno fmt --check`, `deno lint`, `deno check` and `deno task test`, with no Node step, so every
