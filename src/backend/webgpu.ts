@@ -349,9 +349,10 @@ export class WebGPUBackend implements OpsBackend {
    * `makeOut` draws from keeps those three off the argument.
    *
    * It does not put `makeOut` itself off it, which the payoff line above used
-   * to imply: the loss backwards write their seed into an eo.grad that came
-   * from here, so one writeBuffer site does depend on a submit having happened,
-   * and ensureBackwardBegun is what supplies it. See endRegion and lever 20.
+   * to imply: the loss backwards write their seed into an eo.grad that comes
+   * from here under --recompute (measured, see endRegion), so one writeBuffer
+   * site does depend on a submit having happened, and ensureBackwardBegun is
+   * what supplies it. See endRegion and lever 20.
    */
   private regionFree: { buf: GpuBuffer; size: number }[] = [];
   private regionsOpened = 0;
@@ -683,13 +684,15 @@ export class WebGPUBackend implements OpsBackend {
    * saves a regionFree buffer that does reach a queue.writeBuffer is that the
    * write is issued after a submit, so it cannot run ahead of a reader: every
    * loss backward seeds its eo.grad that way, and seedGradFromHost does the
-   * same, on a buffer makeOut can have drawn from regionFree, and
-   * ensureBackwardBegun submits immediately before it. The always-true form is
-   * that a submit has happened since the buffer's last reader was recorded:
-   * ensureBackwardBegun early-returns once backwardBegun is set, and a repeat
-   * seedGradFromHost inside one backward gets no submit of its own, which is
-   * harmless only because nothing was recorded in between and this.enc is still
-   * null. (This comment used to claim no regionFree buffer reaches a writeBuffer
+   * same, on a buffer makeOut does draw from regionFree under --recompute, and
+   * ensureBackwardBegun submits immediately before it. Measured rather than
+   * argued: instrumenting acquireRecycled on a tiny gemma3 forward with
+   * checkpointing on, 44 buffers came off regionFree and the loss's grad buffer
+   * was one of them. The form that survives ensureBackwardBegun's early return
+   * is that a submit has happened since the buffer's last reader was recorded.
+   * That is a property of today's callers rather than something enforced:
+   * record a dispatch reading t.grad and then call seedGradFromHost(t) in the
+   * same backward, and the early return means no submit intervenes. (This comment used to claim no regionFree buffer reaches a writeBuffer
    * at all; lever 20 carries why that was wrong, and lever 41 the ordering
    * argument underneath.) What submit() does is hand the
    * recorded work to the GPU at every layer boundary instead of accumulating a

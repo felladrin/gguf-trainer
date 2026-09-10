@@ -619,9 +619,10 @@ returns the throughput to the dense number, so the comment there says so.
 
 The reason it is not needed for correctness is not the one this lever gave. It said no region
 buffer ever reaches a `queue.writeBuffer` call site, and that is false: the loss backwards write
-their seed into an `eo.grad` that `makeOut` can and does draw from `regionFree` in a `--recompute`
-run. What saves it is that `ensureBackwardBegun` submits immediately before that write, so it
-cannot run ahead of a reader. The conclusion stands, the reason has been replaced, in `endRegion`'s
+their seed into an `eo.grad` that `makeOut` does draw from `regionFree` in a `--recompute` run
+(measured: 44 buffers off that list on a tiny gemma3 forward, the loss's grad among them). What
+saves it is that `ensureBackwardBegun` submits immediately before that write, so it cannot run ahead
+of a reader. The conclusion stands, the reason has been replaced, in `endRegion`'s
 docstring and here. Lever 41 has the general form of the argument.
 
 **This looks like it contradicts lever 3b, and does not.** 3b costs 23% by submitting once per
@@ -1996,7 +1997,8 @@ sentence than the one it replaced. `endRegion` pushes still-in-flight transients
 after a `submit()` and nothing else, `acquireRecycled` hands them straight to the next `makeOut`,
 and its own docstring says so outright: "No fence, and none is needed." Every `--recompute` run does
 this at every layer boundary, and `recomputeModelParity` gates it by name, "the region free-list
-actually handing a released buffer to a later makeOut". Unfenced reuse of live buffers is already
+actually handing a released buffer to a later makeOut". Instrumented on a tiny gemma3 forward with
+checkpointing on: 44 buffers came off `regionFree`, the loss's own gradient buffer among them. Unfenced reuse of live buffers is already
 shipped, already exercised per layer, and already covered by a whole-model parity test.
 `sync()`'s release is the same mechanism, not a new bet.
 
