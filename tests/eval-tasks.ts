@@ -13,6 +13,7 @@ import {
   preflightByBytes,
   renderPair,
   TASKS,
+  withPreamble,
 } from "../src/commands/eval-choice.ts";
 import { BPETokenizer } from "../src/tokenizer/bpe.ts";
 
@@ -301,6 +302,16 @@ for (const [nCtx, nChoice, maxSeq] of [[20, 10, 512], [100, 10, 105], [600, 10, 
 
   // renderPair is what makes the preflight vouch for the strings actually
   // scored: both sites call it, so they cannot drift.
+  // withPreamble is the other shared definition: the preflight and the scoring
+  // loop must agree about the separator, or the pass vouches for strings that
+  // are not the ones scored.
+  const item = { context: "C", choices: ["a"], gold: 0 };
+  ok(withPreamble("", item) === "C", "with no shots the stem is the context itself");
+  ok(
+    withPreamble("P", item) === "P\n\nC",
+    "and with shots it is the preamble, a blank line, the context",
+  );
+
   const rp = renderPair(TASKS["piqa"].render, "G", "S");
   ok(rp.ctxOnly === "Question: G\nAnswer:", "the stem is the render with an empty choice, trimmed");
   ok(rp.choiceText === " S", "and the choice is what the full render adds after it");
@@ -335,7 +346,16 @@ for (const [nCtx, nChoice, maxSeq] of [[20, 10, 512], [100, 10, 105], [600, 10, 
   for (const c of cases) {
     const t = tok.encode(c).length, b = utf8.encode(c).length;
     ok(t <= b, `tokens (${t}) never exceed UTF-8 bytes (${b}) for ${JSON.stringify(c)}`);
+    // The other half, and the one that varies by vocab: encodeOrdinary DROPS a
+    // symbol whose id is missing, and a foreign vocab loaded through fromData is
+    // not guaranteed to carry all 256 base byte tokens. A non-empty string
+    // encoding to nothing would make the preflight's empty check, which is a
+    // string-emptiness proxy for zero tokens, stop meaning what it says.
+    if (c.length > 0) ok(t >= 1, `a non-empty string encodes to >= 1 token: ${JSON.stringify(c)}`);
   }
+  // "" is the robust half of the upper bound: 1 token against 0 bytes fails
+  // under any vocab, while the multi-byte cases hold with equality rather than
+  // slack, so their power depends on this fixture's 300 merges over a pangram.
   // And that characters really do NOT bound it, which is why this is in bytes:
   // an untrained multi-byte character falls back to one token per byte.
   const wide = "\u2e3b".repeat(6);

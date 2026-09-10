@@ -220,6 +220,12 @@ export function choiceMaskStart(nCtx: number, nChoice: number, maxSeq: number): 
   return Math.min(nCtx + nChoice, maxSeq) - nChoice - 1;
 }
 
+/** The few-shot preamble joined to an item's stem, defined once so the preflight
+ * and the scoring loop cannot disagree about the separator. */
+export function withPreamble(preamble: string, it: MCItem): string {
+  return preamble ? `${preamble}\n\n${it.context}` : it.context;
+}
+
 /** The exact strings `choiceNLL` will score, so the preflight cannot check others. */
 export function renderPair(
   render: (ctx: string, choice: string) => string,
@@ -242,9 +248,19 @@ const UTF8 = new TextEncoder();
  * tokens, and a non-empty stem encodes to at least one token.
  *
  * Bytes, not characters. `String.length` counts UTF-16 units and does not bound
- * the token count: measured with this repo's own tokenizer, one `\u2e3b` is a
- * single character and two tokens, and three runic letters are six. Only the
- * byte count holds, and it holds by construction.
+ * the token count: a character whose bytes no merge covers decomposes to one
+ * token per byte, so a single three-byte character can be three tokens. Measured
+ * against the 151936-entry Qwen3 vocab in `data/lambrp-hold.tokenizer.json`, one
+ * `\u2e3b` is one character and two tokens. Only the byte count holds, and it
+ * holds for every vocab by construction: GPT2_SPLIT partitions without overlap,
+ * each pre-token starts at one symbol per byte, bpeWord only shortens, and an
+ * unknown id only drops.
+ *
+ * That last clause is also why a broken premise costs earliness rather than
+ * correctness. This refuses only an empty string, which is zero tokens under
+ * every vocab, so anything it rejects `choiceNLL` would reject too; and every
+ * way the bound could fail makes it pass a pair the scorer still checks with
+ * real token counts.
  *
  * Returns the pairs that still have to be checked exactly, usually none.
  */
@@ -393,8 +409,7 @@ async function run(v: Values) {
     // streaming loop below never does.
     let total = 0, encoded = 0;
     for (const it of evalItems) {
-      const ctx = preamble ? `${preamble}\n\n${it.context}` : it.context;
-      const pairs = it.choices.map((ch) => renderPair(task.render, ctx, ch));
+      const pairs = it.choices.map((ch) => renderPair(task.render, withPreamble(preamble, it), ch));
       const pre = preflightByBytes(pairs, cfg.maxSeq);
       if (pre.empty) {
         const which = pre.empty;
@@ -425,7 +440,7 @@ async function run(v: Values) {
     let correctNorm = 0, correctRaw = 0, done = 0;
     const t0 = Date.now();
     for (const it of evalItems) {
-      const ctx = preamble ? `${preamble}\n\n${it.context}` : it.context;
+      const ctx = withPreamble(preamble, it);
       const sums: number[] = [];
       for (const ch of it.choices) {
         // Through renderPair, the same helper the preflight used: if the two

@@ -1481,12 +1481,22 @@ walks strings the scoring loop was going to render anyway, and only a choice lon
 whole declared context gets encoded. On the shipped tasks that is none.
 
 **Bytes, and not characters, and I shipped characters first.** `String.length` counts UTF-16 units
-and does not bound the token count at all. Measured against this repo's own tokenizer, `⸻` is one
-character and two tokens, and `ᚠᚢᚦ` is three characters and six: a byte-level BPE falls back to one
-token per byte for anything its merges do not cover, so the ratio runs to 3x on non-ASCII. The
-character version was unsound in the dangerous direction, quietly passing an item it was meant to
-catch, and both ARC and HellaSwag carry non-ASCII text. The byte bound holds by construction rather
-than by an argument about vocabularies.
+and does not bound the token count at all: a byte-level BPE falls back to one token per byte for
+anything its merges do not cover, so a single three-byte character can be three tokens and the ratio
+runs to 3x on non-ASCII. Measured against the 151936-entry Qwen3 vocab in
+`data/lambrp-hold.tokenizer.json`, `⸻` is one character and two tokens and `ᚠᚢᚦ` is three characters
+and six. The character version was unsound in the dangerous direction, quietly passing an item it was
+meant to catch, and both ARC and HellaSwag carry non-ASCII text.
+
+The byte bound holds for every vocab by construction, not by an argument about any one of them:
+`GPT2_SPLIT` partitions the text without overlap, each pre-token starts at one symbol per byte,
+`bpeWord` only ever shortens, and an unknown id only drops.
+
+**And a broken premise would cost earliness, never correctness**, which is the better argument for
+merging this than the bound itself. The pass refuses only an empty string, zero tokens under every
+vocab, so anything it rejects `choiceNLL` would reject too; and every way the bound could fail makes
+it pass a pair the scorer still checks with real token counts. That retires the "but a user's vocab
+could differ" objection rather than answering it case by case.
 
 Encoding every pair up front instead, which is what #57 asked for, costs 6.7 s on a full set: 40168
 pairs at 0.17 ms each, measured. That is worth recording but it is not why this design won. 6.7 s
@@ -1503,7 +1513,8 @@ so the arithmetic is testable without a tokenizer or a model, which is the same 
 
 The pass runs per item rather than over the whole grid. At 10-shot the preamble repeats in every
 pair's stem and `choiceText` is a `slice` that retains its parent string, so materializing all 40168
-at once would hold hundreds of MB the streaming loop below never does.
+at once would hold, by estimate rather than measurement, a few hundred MB the streaming loop below
+never does.
 
 `renderPair` is the other half, and it is the one that keeps the pass honest. The two lines that
 define where the stem ends and the choice begins used to exist twice, in the preflight and in the
@@ -1517,6 +1528,16 @@ from a docblock. One check encodes an ASCII, an accented, an untrained multi-byt
 astral string against a real trained tokenizer and requires `tokens <= bytes` for each. Making
 `encode` prepend a BOS, an ordinary thing for a tokenizer to grow, fails it at `café`, 6 tokens
 against 5 bytes.
+
+It also requires the other direction, `tokens >= 1` for a non-empty string, and that is the half
+that genuinely varies by vocab: `encodeOrdinary` drops a symbol whose id is missing, and its comment
+that "every byte is in the base vocab" is true of `train()` and not of `fromData()` on someone
+else's GGUF, which is the path `eval-choice` takes. A vocab missing its byte tokens fails it at
+`café`. Without that assertion the empty check, which is a string-emptiness proxy for zero tokens,
+would quietly stop meaning what it says.
+
+`withPreamble` joins the few-shot preamble to a stem, and is hoisted for the same reason
+`renderPair` is: both loops have to agree about the separator.
 
 ## Quality levers
 
