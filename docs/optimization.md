@@ -2490,6 +2490,43 @@ backend's `submit()`, which is private on `WebGPUBackend` and absent from the `R
 interface `checkpoint` holds, so it takes a cast or an interface member. And run it on an idle
 machine, which is the whole point of this entry.
 
+### 48. An all-ignored batch, on the device (2026-09-10)
+
+Surfaced while reviewing #96. `kept` is the loss denominator, and every path clamps it the same way:
+
+```ts
+const denom = kept > 0 ? kept : 1;
+```
+
+Six times. Three in `autograd.ts` and three in `webgpu.ts`, one per loss per side. Without the clamp
+the mean is 0/0; with one missing on one side, that path reports NaN while the other reports 0, and
+neither throws.
+
+`tests/gradcheck.ts` drives `every row ignored` through the two hard-target losses, and it runs with
+no backend installed, so it only ever exercised the CPU copies. The three device copies had nothing
+driving them, and `softCrossEntropy` had nothing on either side. A masked batch is not exotic:
+assistant-only loss masking produces one whenever a training window lands entirely inside a prompt.
+
+`allIgnoredGate` runs all three losses over a fully masked batch with the backend installed, and
+requires the device answer to be finite and to match the CPU. Six mutations, one per clamp, each
+failing in exactly its own arm:
+
+| clamp removed       | what the gate prints                        |
+| :------------------ | :------------------------------------------ |
+| `webgpu.ts` dense   | `dense NaN, fused 0, softCE 0`              |
+| `webgpu.ts` fused   | `dense 0, fused NaN, softCE 0`              |
+| `webgpu.ts` soft    | `dense 0, fused 0, softCE NaN`              |
+| `autograd.ts` dense | `MISMATCH allIgnored.dense: gpu=0 cpu=NaN`  |
+| `autograd.ts` fused | `MISMATCH allIgnored.fused: gpu=0 cpu=NaN`  |
+| `autograd.ts` soft  | `MISMATCH allIgnored.softCE: gpu=0 cpu=NaN` |
+
+**The bottom three needed a fix to the gate before they failed at all, and it is the interesting
+part.** The first draft checked `Number.isFinite(got[i]) || Math.abs(got[i] - cpu[i]) > 1e-6`, which
+looks symmetric and is not: with a NaN reference, `Math.abs(0 - NaN)` is NaN and `NaN > 1e-6` is
+false, so a missing CPU clamp passed while the arm claimed to cover it. Checking both sides for
+finiteness is what makes the reference side real. A comparison against a NaN oracle is not a weak
+test, it is a test that cannot fail.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

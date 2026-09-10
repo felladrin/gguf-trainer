@@ -678,6 +678,7 @@ async function main() {
   await profilerSmoke(gpu);
   await aliasedBinaryOpParity(gpu);
   await targetRangeGate(gpu);
+  await allIgnoredGate(gpu);
   await fusedCeParity(gpu);
   await recomputeModelParity(gpu);
   await loraModelParity(gpu);
@@ -2408,6 +2409,72 @@ async function recycleReuseGate(gpu: WebGPUBackend) {
  * them would quietly stretch that bound back out to the step cadence, which is
  * a silent failure everywhere except here.
  */
+/**
+ * An all-ignored batch, on the GPU, for all three losses.
+ *
+ * `kept` is the loss denominator, and every path clamps it with the same
+ * `kept > 0 ? kept : 1` written out six times: three in autograd.ts and three in
+ * webgpu.ts. Without the clamp the mean is 0/0. With one clamp missing on one
+ * side, that path reports NaN while the other reports 0, and neither throws.
+ *
+ * `tests/gradcheck.ts` drives `every row ignored` through the two hard-target
+ * losses, but only on the CPU, since it runs with no backend installed. The
+ * device copies of the clamp had nothing driving them, and `softCrossEntropy`
+ * had nothing on either side. A masked batch is not exotic: assistant-only loss
+ * masking produces one whenever a window lands entirely inside a prompt.
+ *
+ * What this pins is that a zero-kept batch is finite and zero on the device, and
+ * that it matches the CPU. Delete any one of the three clamps in webgpu.ts and
+ * the arm turns NaN.
+ */
+async function allIgnoredGate(gpu: WebGPUBackend) {
+  const T = 3, H = 4, V = 6, K = 2;
+  const hid = randTensor([T, H], mulberry32(71));
+  const w = randTensor([V, H], mulberry32(73));
+  const ignored = [-1, -1, -1];
+  // Every teacher row ignored too: the first slot is the marker, the rest are
+  // in-range pads the contract requires and nothing reads.
+  const teacherIds = [-1, 0, -1, 0, -1, 0];
+  const teacherQ = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+  for (const t of [hid, w]) t.zeroGrad();
+  const cpu = [
+    crossEntropy(linear(hid, w), ignored).data[0],
+    fusedCrossEntropy(hid, w, ignored, 2).data[0],
+    softCrossEntropy(linear(hid, w), teacherIds, teacherQ, K).data[0],
+  ];
+
+  for (const t of [hid, w]) t.zeroGrad();
+  gpu.install();
+  let ok = true;
+  try {
+    const dense = crossEntropy(linear(hid, w), ignored);
+    const fused = fusedCrossEntropy(hid, w, ignored, 2);
+    const soft = softCrossEntropy(linear(hid, w), teacherIds, teacherQ, K);
+    await gpu.sync([dense, fused, soft]);
+    const names = ["dense", "fused", "softCE"];
+    const got = [dense.data[0], fused.data[0], soft.data[0]];
+    for (let i = 0; i < got.length; i++) {
+      // Both sides checked for finiteness, not just the GPU. A NaN reference
+      // makes `Math.abs(got - cpu) > 1e-6` FALSE, so comparing alone would let
+      // a missing CPU clamp through while pretending to cover it.
+      if (
+        !Number.isFinite(got[i]) || !Number.isFinite(cpu[i]) || Math.abs(got[i] - cpu[i]) > 1e-6
+      ) {
+        console.log(`    MISMATCH allIgnored.${names[i]}: gpu=${got[i]} cpu=${cpu[i]}`);
+        ok = false;
+      }
+    }
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} an all-ignored batch divides by 1, not 0 ` +
+        `(dense ${got[0]}, fused ${got[1]}, softCE ${got[2]})`,
+    );
+  } finally {
+    gpu.uninstall();
+  }
+}
+
 async function checkpointCadence(gpu: WebGPUBackend) {
   const cfg = microConfig();
   const rngTok = mulberry32(0x5ec2);
