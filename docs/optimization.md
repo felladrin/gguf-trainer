@@ -1769,6 +1769,41 @@ What no test reaches is the call sites. Deleting `assertTokenFileId` from any of
 the suite green, and so does moving either producer's stamp back above its round-trip check. The
 end-to-end runs above are the evidence, and they are not repeatable in CI.
 
+### 39. The parquet reader is imported when a parquet file is read, not before (2026-09-10)
+
+Filed as #83. `deno task test:node` exists to catch Deno-only API use in code that has to run under
+Node too, and it could not reach any of `eval-choice`'s logic. The reason was a dependency that
+logic does not use:
+
+```
+$ node --experimental-strip-types tests/eval-tasks.ts
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'hyparquet' imported from src/data/parse.ts
+```
+
+`tests/eval-tasks.ts` imports `src/commands/eval-choice.ts`, which imports `src/data/parse.ts` for
+the HF parquet reader, which imported `hyparquet` at the top. None of what the test exercises touches
+any of it: `choiceMaskStart`, `choiceWindowError`, `preflightByBytes`, `renderPair`, `withPreamble`,
+`argminPerChar`, `hellaswagPreprocess` and the row parsers are pure string and integer work. So
+roughly 40 assertions over the eval scoring arithmetic never saw the Node runtime, because of an
+import none of them reach. `hyparquet` resolves through Deno's import map and there is no
+`node_modules`, so the failure is at load time, before a single assertion runs.
+
+Moving it inside `parseParquet` fixes the coupling rather than routing around it, which is why it
+beat the alternative of splitting the pure helpers into their own module. The graph pulls the
+package when a parquet file is actually read, `deno check` still resolves the types through the
+dynamic specifier, and `eval-choice --task piqa`, which takes the JSON loader, stops paying for a
+reader it never calls.
+
+The check this leaves behind is the test itself: `tests/eval-tasks.ts` joins `test:node`, so putting
+the static import back fails it with the same `ERR_MODULE_NOT_FOUND`. Verified by doing exactly that.
+Parquet reading is unchanged, checked against `tests/fixtures/tiny.parquet` under Deno.
+
+**What this does not fix is that CI never runs `test:node` at all.** `.github/workflows/test.yml`
+runs `deno fmt --check`, `deno lint`, `deno check` and `deno task test`, with no Node step, so every
+guard in that task, this one included, fires only on a developer's machine. Filed separately rather
+than folded in here, because adding a Node job to CI is a change to CI's risk profile and not to
+this module graph.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

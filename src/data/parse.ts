@@ -1,8 +1,7 @@
 // Parse downloaded dataset bytes into row objects. Supports the formats HF
 // datasets actually ship in: Parquet (the auto-converted default), JSONL/JSON,
-// plain text, and CSV/TSV. Parquet uses hyparquet (pure JS, runs under Deno).
-
-import { parquetReadObjects } from "hyparquet";
+// plain text, and CSV/TSV. Parquet uses hyparquet (pure JS, runs under Deno),
+// imported on demand so nothing else in the graph depends on it.
 
 export type Row = Record<string, unknown>;
 
@@ -70,6 +69,14 @@ function parseCSV(text: string, delim: string): Row[] {
 }
 
 async function parseParquet(bytes: Uint8Array): Promise<Row[]> {
+  // Imported here rather than at the top, so the module graph pulls hyparquet
+  // only when a parquet file is actually read. A static import made every
+  // importer of this file depend on it, which put the whole of eval-choice out
+  // of reach of `deno task test:node`: the specifier resolves through Deno's
+  // import map and there is no node_modules, so Node failed at load time on a
+  // package the pure scoring helpers never call. `eval-choice --task piqa`
+  // takes the JSON loader and stops paying for a parquet reader too.
+  const { parquetReadObjects } = await import("hyparquet");
   // hyparquet reads via an AsyncBuffer ({ byteLength, slice }); wrap the in-memory
   // bytes. ArrayBuffer.slice is synchronous but a sync return satisfies the await.
   const ab = bytes.buffer.slice(
