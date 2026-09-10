@@ -10,7 +10,8 @@ import {
   hellaswagItem,
   hellaswagPreprocess,
   piqaItem,
-  preflightByChars,
+  preflightByBytes,
+  renderPair,
   TASKS,
 } from "../src/commands/eval-choice.ts";
 
@@ -248,35 +249,64 @@ for (const [nCtx, nChoice, maxSeq] of [[20, 10, 512], [100, 10, 105], [600, 10, 
 
 // The preflight. choiceNLL refuses an unscoreable window on the item that holds
 // one, which on a full set is hours in. Encoding every pair up front to find
-// them costs 6.7 s on HellaSwag, measured, so the character bound does the work
-// instead: a string of C characters can never encode to more than C tokens, so a
-// rendered choice shorter than maxSeq characters provably cannot reach maxSeq
-// tokens, and a non-empty stem provably encodes to at least one.
+// them costs 6.7 s on HellaSwag, measured, so a length bound does the work
+// instead.
+//
+// BYTES, not characters. This repo's BPE is byte-level, so every token covers at
+// least one UTF-8 byte and the byte count bounds the token count by
+// construction. `String.length` does not: measured with the repo's own
+// tokenizer, "\u2e3b" is one UTF-16 unit and two tokens.
 {
   const pair = (ctxOnly: string, choiceText: string) => ({ ctxOnly, choiceText });
   const maxSeq = 16;
 
-  const none = preflightByChars([pair("Question: x\nAnswer:", " yes"), pair("q", "a")], maxSeq);
+  const none = preflightByBytes([pair("Question: x\nAnswer:", " yes"), pair("q", "a")], maxSeq);
   ok(none.needExactCheck.length === 0, "short choices need no tokenizer at all");
-  ok(!none.emptyStem, "and a non-empty stem is settled by being non-empty");
+  ok(none.empty === null, "and a non-empty pair is settled by being non-empty");
 
-  // At exactly maxSeq characters the bound stops proving anything, so that pair
-  // has to be encoded. One character less and it cannot reach maxSeq tokens.
-  const boundary = preflightByChars([pair("q", "x".repeat(maxSeq))], maxSeq);
-  ok(boundary.needExactCheck.length === 1, "a choice of maxSeq characters is not settled");
-  const under = preflightByChars([pair("q", "x".repeat(maxSeq - 1))], maxSeq);
-  ok(under.needExactCheck.length === 0, "one character under, it is");
+  // At exactly maxSeq bytes the bound stops proving anything, so that pair has
+  // to be encoded. One byte less and it cannot reach maxSeq tokens.
+  ok(
+    preflightByBytes([pair("q", "x".repeat(maxSeq))], maxSeq).needExactCheck.length === 1,
+    "a choice of maxSeq bytes is not settled",
+  );
+  ok(
+    preflightByBytes([pair("q", "x".repeat(maxSeq - 1))], maxSeq).needExactCheck.length === 0,
+    "one byte under, it is",
+  );
 
-  const empty = preflightByChars([pair("", " yes")], maxSeq);
-  ok(empty.emptyStem, "an empty stem is caught, and needs no tokenizer either");
+  // The case characters get wrong. Six of these are 6 UTF-16 units, well under
+  // maxSeq, but 18 UTF-8 bytes, so they could encode to more tokens than the
+  // context holds and the pair has to be handed on.
+  ok(
+    preflightByBytes([pair("q", "\u2e3b".repeat(6))], maxSeq).needExactCheck.length === 1,
+    "characters do not bound the token count; bytes do",
+  );
+  ok(
+    "\u2e3b".repeat(6).length < maxSeq,
+    "and that case really is under maxSeq by the character count",
+  );
+
+  ok(preflightByBytes([pair("", " yes")], maxSeq).empty === "stem", "an empty stem is caught");
+  ok(preflightByBytes([pair("q", "")], maxSeq).empty === "choice", "an empty choice too");
 
   // Only the long ones are handed on, not the whole batch.
-  const mixed = preflightByChars(
+  const mixed = preflightByBytes(
     [pair("q", "short"), pair("q", "y".repeat(99)), pair("q", "also short")],
     maxSeq,
   );
   ok(mixed.needExactCheck.length === 1, "only the pair that could reach the ceiling is returned");
   ok(mixed.needExactCheck[0].choiceText.length === 99, "and it is the right one");
+
+  // renderPair is what makes the preflight vouch for the strings actually
+  // scored: both sites call it, so they cannot drift.
+  const rp = renderPair(TASKS["piqa"].render, "G", "S");
+  ok(rp.ctxOnly === "Question: G\nAnswer:", "the stem is the render with an empty choice, trimmed");
+  ok(rp.choiceText === " S", "and the choice is what the full render adds after it");
+  ok(
+    TASKS["piqa"].render("G", "S") === rp.ctxOnly + rp.choiceText,
+    "the two halves reassemble into exactly what the model sees",
+  );
 }
 
 console.log("eval-tasks: all checks passed");

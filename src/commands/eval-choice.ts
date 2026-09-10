@@ -220,30 +220,46 @@ export function choiceMaskStart(nCtx: number, nChoice: number, maxSeq: number): 
   return Math.min(nCtx + nChoice, maxSeq) - nChoice - 1;
 }
 
+/** The exact strings `choiceNLL` will score, so the preflight cannot check others. */
+export function renderPair(
+  render: (ctx: string, choice: string) => string,
+  ctx: string,
+  choice: string,
+): { ctxOnly: string; choiceText: string } {
+  const ctxOnly = render(ctx, "").replace(/\s+$/, "");
+  return { ctxOnly, choiceText: render(ctx, choice).slice(ctxOnly.length) };
+}
+
+const UTF8 = new TextEncoder();
+
 /**
  * Refuse an unscoreable item before the first forward, without a tokenizer.
  *
- * `choiceWindowError` needs token counts, and encoding every item's choices up
- * front costs 6.7 s on a full HellaSwag set, measured. It is not needed for
- * almost any of them, because a string of C characters can never encode to more
- * than C tokens: a rendered choice shorter than `maxSeq` characters provably
- * cannot reach `maxSeq` tokens, and a non-empty stem provably encodes to at
- * least one. So the character lengths settle every item except the few whose
- * choice is longer than the whole context, and only those need encoding.
+ * `choiceWindowError` needs token counts, and encoding every pair up front costs
+ * 6.7 s on a full HellaSwag set, measured. It is not needed for almost any of
+ * them, because this repo's BPE is byte-level: every token covers at least one
+ * UTF-8 byte, so a rendered choice under `maxSeq` BYTES cannot reach `maxSeq`
+ * tokens, and a non-empty stem encodes to at least one token.
+ *
+ * Bytes, not characters. `String.length` counts UTF-16 units and does not bound
+ * the token count: measured with this repo's own tokenizer, one `\u2e3b` is a
+ * single character and two tokens, and three runic letters are six. Only the
+ * byte count holds, and it holds by construction.
  *
  * Returns the pairs that still have to be checked exactly, usually none.
  */
-export function preflightByChars(
+export function preflightByBytes(
   pairs: { ctxOnly: string; choiceText: string }[],
   maxSeq: number,
-): { needExactCheck: { ctxOnly: string; choiceText: string }[]; emptyStem: boolean } {
+): { needExactCheck: { ctxOnly: string; choiceText: string }[]; empty: "stem" | "choice" | null } {
   const needExactCheck: { ctxOnly: string; choiceText: string }[] = [];
-  let emptyStem = false;
+  let empty: "stem" | "choice" | null = null;
   for (const p of pairs) {
-    if (p.ctxOnly.length === 0) emptyStem = true;
-    if (p.choiceText.length >= maxSeq) needExactCheck.push(p);
+    if (empty === null && p.ctxOnly.length === 0) empty = "stem";
+    if (empty === null && p.choiceText.length === 0) empty = "choice";
+    if (UTF8.encode(p.choiceText).length >= maxSeq) needExactCheck.push(p);
   }
-  return { needExactCheck, emptyStem };
+  return { needExactCheck, empty };
 }
 
 /**
@@ -370,29 +386,35 @@ async function run(v: Values) {
     // it on the item that holds one, which on a full set is hours in. The
     // character bound settles almost every pair without a tokenizer; only a
     // choice longer than the whole context needs encoding.
-    const pairs = evalItems.flatMap((it) => {
-      const ctx = preamble ? `${preamble}\n\n${it.context}` : it.context;
-      const ctxOnly = task.render(ctx, "").replace(/\s+$/, "");
-      return it.choices.map((ch) => ({
-        ctxOnly,
-        choiceText: task.render(ctx, ch).slice(ctxOnly.length),
-      }));
-    });
-    const pre = preflightByChars(pairs, cfg.maxSeq);
-    if (pre.emptyStem) {
-      die(`${taskName}: an item's stem rendered to 0 tokens, so nothing scores it`);
-    }
-    for (const p of pre.needExactCheck) {
-      const bad = choiceWindowError(
-        tok.encode(p.ctxOnly).length,
-        tok.encode(p.choiceText).length,
-        cfg.maxSeq,
-      );
-      if (bad) die(`${bad}. The choice reads ${JSON.stringify(p.choiceText.slice(0, 60))}`);
-    }
+    const checked = (() => {
+      // Scoped so the grid of rendered strings is not held for the whole run;
+      // only the counts and the few pairs that need encoding escape.
+      const pairs = evalItems.flatMap((it) => {
+        const ctx = preamble ? `${preamble}\n\n${it.context}` : it.context;
+        return it.choices.map((ch) => renderPair(task.render, ctx, ch));
+      });
+      const pre = preflightByBytes(pairs, cfg.maxSeq);
+      if (pre.empty) {
+        const bad = pre.empty;
+        const p = pairs.find((q) => (bad === "stem" ? q.ctxOnly : q.choiceText).length === 0)!;
+        die(
+          `${taskName}: an item's ${bad} rendered to nothing, so it cannot be scored. ` +
+            `The pair reads ${JSON.stringify(`${p.ctxOnly}|${p.choiceText}`.slice(0, 80))}`,
+        );
+      }
+      for (const p of pre.needExactCheck) {
+        const bad = choiceWindowError(
+          tok.encode(p.ctxOnly).length,
+          tok.encode(p.choiceText).length,
+          cfg.maxSeq,
+        );
+        if (bad) die(`${bad}. The choice reads ${JSON.stringify(p.choiceText.slice(0, 60))}`);
+      }
+      return { total: pairs.length, encoded: pre.needExactCheck.length };
+    })();
     console.log(
-      `Windows: ${pairs.length} choices fit a ${cfg.maxSeq}-token context ` +
-        `(${pre.needExactCheck.length} needed encoding) ✓`,
+      `Windows: none of ${checked.total} choices exceeds the ${cfg.maxSeq}-token context ` +
+        `(${checked.encoded} needed encoding) \u2713`,
     );
 
     let correctNorm = 0, correctRaw = 0, done = 0;
@@ -401,13 +423,11 @@ async function run(v: Values) {
       const ctx = preamble ? `${preamble}\n\n${it.context}` : it.context;
       const sums: number[] = [];
       for (const ch of it.choices) {
-        const full = task.render(ctx, ch);
-        // Score only the choice span: render context without the answer to find
-        // the boundary, then score the full render's choice tokens.
-        const ctxOnly = task.render(ctx, "").replace(/\s+$/, "");
-        sums.push(
-          await choiceNLL(model, tok, gpu, ctxOnly, full.slice(ctxOnly.length), lossChunk),
-        );
+        // Through renderPair, the same helper the preflight used: if the two
+        // sites drifted, the preflight would be vouching for strings that are
+        // not the ones scored.
+        const { ctxOnly, choiceText } = renderPair(task.render, ctx, ch);
+        sums.push(await choiceNLL(model, tok, gpu, ctxOnly, choiceText, lossChunk));
       }
       const bestNorm = argminPerChar(sums, it.choices);
       let bestRaw = 0;

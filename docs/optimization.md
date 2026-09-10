@@ -1472,26 +1472,38 @@ does it on the item that holds one: after the GGUF is loaded, after the GPU is i
 however many items sit ahead of it. On a full HellaSwag set that is hours of forwards before the
 command exits with a usage error.
 
-The obvious preflight is to encode every pair up front and run the same check. **Measured, that costs
-6.7 s** on a full set, 40168 context+choice pairs at 0.17 ms each, on every run including the ones
-that were always going to be fine. For a condition the four shipped tasks cannot currently reach,
-that is a poor trade, and it is close enough to a poor trade that it was worth measuring before
-writing it.
+The check does not need a tokenizer, and that is what makes it free rather than cheap. This repo's
+BPE is byte-level, so **every token covers at least one UTF-8 byte**: a rendered choice under
+`maxSeq` bytes cannot reach `maxSeq` tokens, and a non-empty stem encodes to at least one. The pass
+walks strings the scoring loop was going to render anyway, and only a choice longer than the model's
+whole declared context gets encoded. On the shipped tasks that is none.
 
-The check does not need a tokenizer. **A string of C characters can never encode to more than C
-tokens**, so a rendered choice shorter than `maxSeq` characters provably cannot reach `maxSeq`
-tokens, and a non-empty stem provably encodes to at least one. The character lengths settle every
-pair except one whose choice is longer than the model's whole declared context, and only those get
-encoded. On the shipped tasks that is none, and the whole preflight is a pass over strings the
-scoring loop was going to build anyway.
+**Bytes, and not characters, and I shipped characters first.** `String.length` counts UTF-16 units
+and does not bound the token count at all. Measured against this repo's own tokenizer, `⸻` is one
+character and two tokens, and `ᚠᚢᚦ` is three characters and six: a byte-level BPE falls back to one
+token per byte for anything its merges do not cover, so the ratio runs to 3x on non-ASCII. The
+character version was unsound in the dangerous direction, quietly passing an item it was meant to
+catch, and both ARC and HellaSwag carry non-ASCII text. The byte bound holds by construction rather
+than by an argument about vocabularies.
 
-The bound is exact at its boundary, which is where a `>=` earns its place: a choice of exactly
-`maxSeq` characters could encode to `maxSeq` tokens, one character fewer could not. Weakening it to
-`>` fails the case that pins it.
+Encoding every pair up front instead, which is what #57 asked for, costs 6.7 s on a full set: 40168
+pairs at 0.17 ms each, measured. That is worth recording but it is not why this design won. 6.7 s
+against hours of forwards is a rounding error, and the honest reason is that the length pass is
+already free and exact, so paying anything for the same answer would be the worse trade.
 
-`preflightByChars` returns the pairs that still need encoding rather than doing the encoding itself,
+The bound is tight at its boundary, which is where the `>=` earns its place: a choice of exactly
+`maxSeq` bytes could encode to `maxSeq` tokens, one byte fewer could not. Weakening it to `>` fails
+the case that pins it, and swapping bytes back for characters fails a different one.
+
+`preflightByBytes` returns the pairs that still need encoding rather than doing the encoding itself,
 so the arithmetic is testable without a tokenizer or a model, which is the same split
 `choiceMaskStart` and `choiceWindowError` already use.
+
+`renderPair` is the other half, and it is the one that keeps the pass honest. The two lines that
+define where the stem ends and the choice begins used to exist twice, in the preflight and in the
+scoring loop. If they drifted, the preflight would print its tick for strings that are not the ones
+being scored, which is worse than not having the pass at all. Both sites call the same helper now,
+and a test reassembles its two halves into exactly what the model sees.
 
 ## Quality levers
 
