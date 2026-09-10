@@ -2277,17 +2277,34 @@ whose entire output is numbers.
 `onSubmittedWorkDone()` would restore the wait and cost nothing today, but it would let such a case
 exist: this file's header defines the wall number as including the host-side graph build and the
 gradient readback, so a case that stages nothing has already stopped reporting what the column
-claims, fence or no fence. The two properties stand or fall together, so one check covers both:
+claims, fence or no fence. A fence keeps one half of the header's promise true while the other goes
+quietly false for one row of a column whose other rows keep it, which is a worse artifact than a
+hard failure and the same class of bug as #99 itself.
 
-```
-bench: case "rmsnorm" staged nothing, so its timing neither includes the gradient readback nor
-waits for the GPU. Give the case inputs that carry gradients, or read something back explicitly;
-do not leave the pass unfenced.
-```
+**Byte-exact, not `> 0`, and the first draft got that wrong.** `lastSyncReadbackBytes` sums every
+touched external, so one live input keeps it non-zero. A case that freezes only SOME of its inputs
+therefore keeps the fence and loses part of the readback, and a zero check waves it through. That
+partial shape is the likelier mistake, not the rarer one: the natural additions here are
+LoRA-shaped or inference-shaped, where some tensor is frozen. So the check compares against what
+`Case.inputs` declares, summed as `t.size * 4` and deduped, computed once per case in `timeCase` so
+the measured window is untouched.
 
-Adding `gpu.keepGradOnDevice(t)` over the case inputs reproduces it exactly, which is the mutation
-that proves the check. The published numbers do not move: the assertion is a field read against
-zero, and every existing case passes it.
+Both modes reproduce, on the `rmsnorm` case whose inputs are 5245440 bytes of gradient:
+
+| mutation                                   | reported                    | caught by `> 0`? |
+| :----------------------------------------- | :-------------------------- | :--------------- |
+| `keepGradOnDevice` on every input          | `read back 0 of 5245440`    | yes              |
+| `keepGradOnDevice` on the first input only | `read back 2560 of 5245440` | **no**           |
+
+The published numbers do not move: the assertion is one integer compare on a path that allocates
+nothing, and `bench --suite all` passes every case with the exact equality, which is also the
+measurement that confirms `sync()` stages exactly `t.size * 4` per live external.
+
+**One review suggestion declined.** The error used to offer "or read something back explicitly",
+which `Case` has no way to express, so the advice was unreachable; the suggestion was to add a
+`reads?: Tensor[]` field and forward it to `sync()`. No case needs one, so that is a feature with no
+user, and the message now names only the option that exists. Whoever adds a genuinely
+gradient-free case can add the field then, which is the point at which its shape is known.
 
 No test file, deliberately. `bench` needs a GPU and is not in `deno task test`, and the check runs on
 every real invocation, which is where it belongs. The property it depends on, that

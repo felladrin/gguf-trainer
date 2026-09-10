@@ -58,14 +58,15 @@ interface Case {
  * the only reason the pass is fenced at all: a `sync()` with nothing to stage
  * submits and returns without awaiting the GPU.
  *
- * So the two properties stand or fall together, and the assertion below is what
- * says so. A case with frozen inputs, or one calling `keepGradOnDevice` the way
- * the resident training loop does, would stage nothing: the wall number would
- * quietly stop including the readback AND stop waiting for the GPU tail, and it
- * would still print a plausible time. That is the one failure this command
- * cannot afford, since the number is the whole output.
+ * So the assertion below checks the readback against what `Case.inputs`
+ * declares, byte for byte, which covers both. A case with frozen inputs, or one
+ * calling `keepGradOnDevice` the way the resident training loop does, stages
+ * nothing: the wall number stops including the readback AND stops waiting for
+ * the GPU tail, and still prints a plausible time. A case that freezes only SOME
+ * of its inputs keeps the fence and loses part of the readback, which a `> 0`
+ * check would wave through.
  */
-async function once(gpu: WebGPUBackend, c: Case) {
+async function once(gpu: WebGPUBackend, c: Case, wantBytes: number) {
   for (const t of c.inputs) t.zeroGrad();
   const out = c.run(gpu);
   if (c.backward) {
@@ -74,11 +75,17 @@ async function once(gpu: WebGPUBackend, c: Case) {
     out._backward();
   }
   await gpu.sync([]);
-  if (gpu.lastSyncReadbackBytes === 0) {
+  // Byte-exact, not `> 0`. The field sums every touched external, so one live
+  // input keeps it non-zero while a frozen sibling's readback goes missing
+  // unnoticed, and that partial shape is the LIKELIER mistake: the natural
+  // additions here are LoRA-shaped or inference-shaped, where some tensor is
+  // frozen. `> 0` would keep the fence and let the column lie.
+  if (gpu.lastSyncReadbackBytes !== wantBytes) {
     throw new Error(
-      `bench: case "${c.name}" staged nothing, so its timing neither includes the gradient ` +
-        `readback nor waits for the GPU. Give the case inputs that carry gradients, or read ` +
-        `something back explicitly; do not leave the pass unfenced.`,
+      `bench: case "${c.name}" read back ${gpu.lastSyncReadbackBytes} of ${wantBytes} expected ` +
+        `gradient bytes, so its timing does not include the full gradient readback the wall ` +
+        `column claims; at 0 it does not wait for the GPU either. Give the case inputs that all ` +
+        `carry gradients, or change what the wall number is documented to mean.`,
     );
   }
 }
@@ -117,12 +124,16 @@ async function timeCase(
   iters: number,
   warmup: number,
 ): Promise<{ wallMs: number; wallMedianMs: number; kernels: KernelTime[] }> {
-  for (let i = 0; i < warmup; i++) await once(gpu, c);
+  // Computed here rather than inside `once`, so the measured window is exactly
+  // what it was. Deduped because `touchedExternals` is a set, and `t.size * 4`
+  // is what sync() stages per live external.
+  const wantBytes = [...new Set(c.inputs)].reduce((a, t) => a + t.size * 4, 0);
+  for (let i = 0; i < warmup; i++) await once(gpu, c, wantBytes);
 
   const walls: number[] = [];
   for (let i = 0; i < iters; i++) {
     const t0 = performance.now();
-    await once(gpu, c);
+    await once(gpu, c, wantBytes);
     walls.push(performance.now() - t0);
   }
 
@@ -132,7 +143,7 @@ async function timeCase(
   if (gpu.timestampSupported) {
     for (let i = 0; i < iters; i++) {
       gpu.startProfile();
-      await once(gpu, c);
+      await once(gpu, c, wantBytes);
       const r = gpu.stopProfile();
       if (r.overflow) console.log("  (profile slots overflowed: split is partial)");
       for (const k of r.kernels) {
