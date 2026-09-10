@@ -233,7 +233,8 @@ for (
 // initWebGPU returns null for two different reasons, and until now every caller
 // reported only the first. A Deno user on a machine with no GPU was told that
 // training needs Deno. webgpuRuntime is what tells them apart, and it is the
-// same test initWebGPU takes itself, so the two cannot drift.
+// test a caller can apply after the fact. initWebGPU does not consult it: the
+// wrapper around its adapter request already covers that exit.
 {
   // deno-lint-ignore no-explicit-any
   const g = globalThis as any;
@@ -249,8 +250,10 @@ for (
     set({});
     eq(webgpuRuntime(), "no-runtime", "a navigator without .gpu is too: Node has one");
     // initWebGPU must return null rather than throw for every shape of broken
-    // navigator, since a throw is the stack trace this whole change exists to
-    // replace. The polyfill route the docblock advertises is where partial
+    // navigator that fails at or before requestAdapter, since a throw is the
+    // stack trace this whole change exists to replace. A junk adapter that gets
+    // PAST requestAdapter can still throw out of the device request; that is
+    // older than this change and not claimed here. The polyfill route the docblock advertises is where partial
     // implementations show up, so the list is not hypothetical.
     for (
       const [label, nav] of [
@@ -283,7 +286,6 @@ for (
         `initWebGPU returns null rather than throwing: navigator ${label}`,
       );
     }
-    set({});
     set({ gpu: {} });
     eq(webgpuRuntime(), "ok", "a navigator with .gpu is a runtime that could have an adapter");
     // Which is the whole point: "ok" here plus a null from initWebGPU means the

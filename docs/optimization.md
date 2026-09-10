@@ -1582,10 +1582,12 @@ reads stronger for conceding it.
 
 49x at 6M, and CPU throughput falls faster than the parameter count rises: 5.3x the parameters cost
 10x the time over that range. That pair says nothing about the GPU side, which is measured
-separately below; what widens the gap is that the GPU scales the other way. Two short timings at shapes differing in four variables are not a curve, so what
-follows is an order-of-magnitude argument and nothing finer. Carrying the 32M figure LINEARLY to
-596M, generous against a trend worse than linear, puts a 596M CPU step in the range of seconds per
-token: a 100k-token fine-tune runs into weeks, and 10M tokens into years.
+separately below; What widens the gap is how much better the GPU holds up: it loses less than an
+order of magnitude between the 6M and 596M shapes, while the CPU loses a full one between 6M and
+32M. Two short timings at shapes differing in four variables are not a curve, so what follows is an
+order-of-magnitude argument and nothing finer. Carrying the 32M figure LINEARLY to 596M, generous
+against a trend worse than linear, puts a 596M CPU step in the range of seconds per token: a
+100k-token fine-tune runs into weeks, and 10M tokens into years.
 
 For the GPU at that size no extrapolation is needed, since it was measured directly:
 
@@ -1617,7 +1619,9 @@ Qwen3-0.6B-Base at seq 512, batch 1, 10 threads: LoRA 118 tok/s at 6.1 GB peak, 
 `initWebGPU` returns null for two reasons, no WebGPU in the runtime and no adapter on the machine,
 and the die collapsed both into "training needs Deno". Someone running Deno on a GPU-less box was
 told to use Deno, which is exactly #41's situation. `webgpuRuntime()` tells them apart, and
-`initWebGPU` takes the same test itself so the two cannot drift. That was #84.
+`initWebGPU` does not consult it: the `try`/`catch` around its
+adapter request already covers every runtime without WebGPU, and a first-line guard duplicating the
+predicate proved unobservable across six shapes of broken navigator. That was #84.
 
 ## Quality levers
 
