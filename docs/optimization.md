@@ -22,21 +22,24 @@ against them; read the block below instead.
 
 ## Measured baseline (2026-08-19, post-rewrite, Strix)
 
-| Metric                  | Value                     | How measured                                                          |
-| :---------------------- | :------------------------ | :-------------------------------------------------------------------- |
-| Throughput              | 0.0969 st/s (10.6 s/step) | 94.7M, seq 2048, batch 8, plateau rate                                |
-| Throughput              | 1588 tok/s (1.76x)        | against 903 tok/s on the old kernels                                  |
-| GPU busy                | **~42%** / 52.5%          | `gpu_busy_percent`; 42% during the run, 52.5% re-measured uncontended |
-| Host CPU                | ~400% of 32 cores         | `top` on the trainer process                                          |
-| Host RSS                | 1.06 GB steady            | sampled every 10s over 150 steps; flat from 300s on                   |
-| Peak GPU (pool + state) | 39.3 GB                   | trainer's own readout, unchanged                                      |
-| Profiled kernel time    | ~330 ms of a 10.6 s step  | `bench`, idle GPU, summed over a step's dispatches                    |
+| Metric                  | Value                         | How measured                                                                                                                                                           |
+| :---------------------- | :---------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Throughput              | 0.0969 st/s (10.6 s/step)     | 94.7M, seq 2048, batch 8, plateau rate                                                                                                                                 |
+| Throughput              | 1588 tok/s (1.76x)            | against 903 tok/s on the old kernels                                                                                                                                   |
+| GPU busy                | ~42% (unlabelled) / **52.5%** | `gpu_busy_percent`; 42% during the run, with its other device users unrecorded, so lever 47 sets it aside; 52.5% re-measured uncontended, and that is the one to quote |
+| Host CPU                | ~400% of 32 cores             | `top` on the trainer process                                                                                                                                           |
+| Host RSS                | 1.06 GB steady                | sampled every 10s over 150 steps; flat from 300s on                                                                                                                    |
+| Peak GPU (pool + state) | 39.3 GB                       | trainer's own readout, unchanged                                                                                                                                       |
+| Profiled kernel time    | ~330 ms of a 10.6 s step      | `bench`, idle GPU, summed over a step's dispatches                                                                                                                     |
 
 The two facts that now drive everything below:
 
-1. **The step is host-bound, not GPU-bound.** The GPU idles ~58% of the time while four host cores
-   stay busy. Cheaper kernels can no longer raise tokens/second on this box; only cheaper host work
-   can. See lever 1c, which is where the time actually goes.
+1. **The step is host-bound, not GPU-bound.** The GPU idles about half the step while four host
+   cores stay busy (lever 1c's 52.5%, the reading taken uncontended; the `~42%` beside it in the
+   table was taken during a run whose other device users are not recorded, so lever 47 discards it
+   and the `~58%` this used to quote with it). Cheaper kernels can no longer raise
+   tokens/second on this box; only cheaper host work can. See lever 1c, which is where the time
+   actually goes.
 2. **Batch is sequential gradient accumulation, not a real batch dimension.** The training loop runs
    one sequence per forward/backward and sums the gradients (`train-gpu.ts`), so batch size trades
    step count for per-step time at a fixed tokens/second. It changes gradient noise, not throughput.
@@ -410,7 +413,7 @@ gate is tolerance-based, so rounding-order changes are admissible.
 
 Packing the `batchPerStep` sequences into one real batch dimension would enlarge the GEMMs and cut
 per-launch + sync overhead. The old reasoning against it was that "GEMM is only ~9% of runtime and
-the GPU is already saturated at batch 1": the GPU is NOT saturated, it idles ~58%. But the
+the GPU is already saturated at batch 1": the GPU is NOT saturated, it idles about half the step. But the
 conclusion survives for a different reason, which is that GPU work is only ~330 ms of the step at
 all, so enlarging the GEMMs cannot buy much either. Lever 1c's proposed fix turned out to be a dead
 end, so there is no longer a "fix that first"; the open question is where the dispatch-path host
@@ -2480,25 +2483,37 @@ passed one. That 16227 is also the control above, which is why it is worth carry
 20's corollary says returns the throughput to the dense number, was measured only under load and
 those numbers are discarded; it remains unmeasured. So does any account of what `--recompute` buys
 beyond the 2.25x itself. `gpu_busy_percent` was tried as a discriminator and its readings discarded by
-this lever's own rule: all of them were taken under the same load. They read 98-100% across arms of
-very different throughput, which a first draft blamed on the counter saturating.
+this lever's own rule: the conditions they were taken under were not recorded. A draft blamed the
+98-100% they showed on the counter being pinned. It is not pinned. Sampled at 10 Hz for 30 s with
+no heavy workload on the device, it reads **mean 43.2%, median 17%, max 99%, min 0%** over 300
+samples, so it spans its range and lever 1c's 52.5% is a plausible reading rather than an artifact.
+Levers 1c, 19 and 20 stand on it.
 
-**It does not saturate, and #104 settled that by re-reading it idle.** Same two shapes, same sampler
-at 10 Hz:
+**What it does not do is attribute.** It is a whole-device counter, and this box is shared. Every
+reading of 98-100% taken here coincided with another process holding `/dev/dri/renderD128`; the one
+reading of 76.6% did not. The check before quoting any of this is one command:
 
-| shape                                            |                   idle | under load |
-| :----------------------------------------------- | ---------------------: | ---------: |
-| 28 layers, hidden 544, 16 heads of 128, seq 2048 | 76.6% mean, 71% median |      98.2% |
-| 28 layers, hidden 128, seq 64, batch 1           | 78.5% mean, 81% median |      99.8% |
+```
+fuser -v /dev/dri/renderD128
+```
 
-So it reads well below 100% when the machine is quiet, and lever 1c's 52.5%, principle 1's idle
-claim and lever 19's reasoning all stand: 1c records its reading as taken uncontended, which is
-exactly the condition this lever says to measure in.
+which on this machine routinely lists a compositor, an idle `llama-server`, and, during this work, a
+second agent session running an unrelated ROCm job in bursts. Nothing in `gpu_busy_percent` tells
+our trainer's share apart from theirs.
 
-What does NOT follow is a rule for which way contention moves the number. Here it read higher under
-load; in 1c it read lower, 42% during the run against 52.5% uncontended. Both directions are on
-record, so the usable conclusion is narrower and more useful than either: a `gpu_busy_percent`
-reading whose machine conditions are not recorded is not evidence of anything.
+**That forces a correction to the paragraph above.** It attributes the 2x throughput swing to CPU
+contention from review agents, because that is what was known to be running. At least one other
+contender was on the GPU itself, intermittently, and was present during runs recorded as loaded and
+absent during ones recorded as quiet. The swing is real and reproduces; **which contention causes it
+is not established**, and CPU was named too confidently. A later attempt to settle it timed out
+because the other session's job restarted mid-run, which is itself the point: on a shared box the
+control has to be verified rather than assumed, before and after.
+
+So the rule this lever leaves behind is not "run it quiet", which is unfalsifiable, but: record what
+else held the CPU and the render node, check both at the start and the end of the run, and treat any
+number without that record as unusable. That includes the `~42%` in this file's summary table and
+the `~58%` idle figure derived from it, whose device conditions are not recorded; principle 1's
+claim survives on lever 1c's 52.5%, which is labelled uncontended, and is restated off that.
 
 To re-run the follow-up: `checkpoint()`'s passthrough at `if (!checkpointing) return fn()` needs the
 backend's `submit()`, which is private on `WebGPUBackend` and absent from the `RegionBackend`
