@@ -9,7 +9,7 @@ import { loadModelFromGGUF } from "../export/load-gguf.ts";
 import { readFileBytes } from "../io.ts";
 import { greedyComplete } from "../eval/generate.ts";
 import { freezeForScoring } from "../train/loss.ts";
-import { initWebGPU } from "../backend/webgpu.ts";
+import { initWebGPU, noGpuNote } from "../backend/webgpu.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
 
@@ -29,7 +29,11 @@ async function run(v: Values) {
   // helper, whether or not it would happen to be safe for today's callers.
   freezeForScoring(model);
 
-  const gpu = v.bool("cpu") ? null : await initWebGPU();
+  const useCpu = v.bool("cpu");
+  const gpu = useCpu ? null : await initWebGPU();
+  // stderr: --completion-only exists so stdout is the completion and nothing
+  // else, and a note on that stream would end up in whatever consumes it.
+  if (!gpu && !useCpu) console.error(noGpuNote());
   if (gpu) {
     gpu.install();
     gpu.uploadParams(model.params());

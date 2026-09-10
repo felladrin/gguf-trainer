@@ -1696,15 +1696,67 @@ export class WebGPUBackend implements OpsBackend {
 }
 
 /**
- * Probe for a WebGPU device. Returns null when the runtime has no WebGPU
- * (Node and Bun today: run GPU work under Deno, or provide a navigator.gpu
- * polyfill); training then stays on the CPU reference backend.
+ * Whether this RUNTIME exposes WebGPU at all, which is the first of the two
+ * reasons `initWebGPU` returns null and the only one a caller can tell apart
+ * afterwards. Deno does; Node and Bun do not.
+ *
+ * Exported for the caller that got null and has to say which exit was taken:
+ * if this says "ok" and `initWebGPU` still returned null, the machine has no
+ * usable adapter.
+ *
+ * `initWebGPU` does NOT call this. It used to, as a first-line guard, and the
+ * guard turned out to be unobservable once the adapter request was wrapped:
+ * measured across six shapes of broken navigator, from undefined through a
+ * `requestAdapter` that throws synchronously, removing it changed nothing. Dead
+ * code that reads like a safeguard is worse than neither, so it went.
+ */
+export function webgpuRuntime(): "ok" | "no-runtime" {
+  // deno-lint-ignore no-explicit-any
+  const nav: any = (globalThis as any).navigator;
+  return nav?.gpu ? "ok" : "no-runtime";
+}
+
+/**
+ * Why there is no GPU, for a command that falls back rather than dying. The
+ * distinction matters to the reader: one is fixed by changing runtime, the
+ * other is a property of the machine.
+ */
+export function noGpuNote(): string {
+  return webgpuRuntime() === "no-runtime"
+    ? "(no WebGPU in this runtime; falling back to CPU forward)"
+    : "(no GPU adapter found; falling back to CPU forward)";
+}
+
+/**
+ * Probe for a WebGPU device. Returns null for TWO different reasons, and a
+ * caller that reports only one of them misdirects the other's user:
+ *
+ *   - the runtime has no WebGPU at all (Node and Bun today), which
+ *     `webgpuRuntime()` reports, and which is fixed by running under Deno or
+ *     providing a navigator.gpu polyfill;
+ *   - the runtime has WebGPU but the machine has no usable adapter, which is
+ *     what a null means when `webgpuRuntime()` still says "ok".
+ *
+ * Commands that fall back use `noGpuNote()` for the wording; the two that need
+ * a device name the cause themselves.
  */
 export async function initWebGPU(): Promise<WebGPUBackend | null> {
   // deno-lint-ignore no-explicit-any
   const nav: any = (globalThis as any).navigator;
-  if (!nav?.gpu) return null;
-  const adapter = await nav.gpu.requestAdapter();
+  // The whole probe, not just the adapter's null: this is the ONLY exit for a
+  // runtime without WebGPU too, since `nav.gpu` is then undefined and the call
+  // throws in here. try/catch rather than `.catch` because a partial
+  // navigator.gpu polyfill, which the docblock advertises as supported, can
+  // reject, throw synchronously, be absent, or return a non-promise, and only
+  // the first of those is a rejection. All four reach the "no adapter" message
+  // rather than a stack trace.
+  // deno-lint-ignore no-explicit-any
+  let adapter: any = null;
+  try {
+    adapter = await nav.gpu.requestAdapter();
+  } catch {
+    adapter = null;
+  }
   if (!adapter) return null;
   // Request the adapter's own maximum buffer limits instead of the WebGPU
   // spec's conservative default (128 MiB per storage buffer binding).

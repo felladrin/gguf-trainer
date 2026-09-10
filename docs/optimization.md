@@ -1539,6 +1539,90 @@ would quietly stop meaning what it says.
 `withPreamble` joins the few-shot preamble to a stem, and is hoisted for the same reason
 `renderPair` is: both loops have to agree about the separator.
 
+### 36. Why there is no CPU training, measured (2026-09-10)
+
+Asked directly after #41, and worth writing down because the honest answer is not the one the code
+suggests. `pretrain` refuses to start without a GPU adapter, and the natural reading of that is that
+a CPU training path does not exist. It does. `trainLM` in `src/train/trainer.ts` is a complete loop:
+window sampling, backward, optimizer step, LR schedule, QK-clip, supervision masks, disk-backed
+token sources. `demo` trains with it, and `gpu-parity` runs it step-for-step against the GPU trainer
+to prove their trajectories match.
+
+**Wiring it into `pretrain` is not the modest change a `gpu.` grep suggests**, and this entry said
+it was until review counted properly. The grep returns 13 lines, but four are imports: nine calls
+over seven methods, of which only `describeDevice` and `residentBytes` are trivially replaceable.
+What the grep cannot see is the rest:
+
+- the two optimizers are not interchangeable. `MuonOpts` and `MuonGpuOpts` are structurally
+  identical, so the constructor ports, but `MuonGpu` has `recordStep()` where `Muon` has `step()`,
+  so it does not satisfy `Optimizer` and `trainLM` cannot take it, while `trainLMGpuResident` types
+  its parameter as `MuonGpu` so `Muon` cannot go the other way.
+- `syncWeightsToHost()`, `exportState()` and `importState()` exist only on the GPU optimizers, so
+  the `--resume` optimizer sidecar, its size in the checkpoint log, and the LoRA stale-sidecar
+  removal have no CPU path at all.
+- the `--recompute` guard tests `gpu.regionCount()`, and there is no backend-agnostic count to
+  substitute, so that is a new API rather than a swap. `checkpoint()` itself is genuinely
+  backend-agnostic, degrading to plain recompute, so the flag would work; the guard around it would
+  throw.
+- the trust gate would compare the CPU against itself, `cpuLoss` and the probe both coming from the
+  same `model.forward`, so the difference is zero by construction and it prints a green line for a
+  comparison it never made. That is the exact failure its own comment warns about for
+  `--loss-chunk`.
+
+None of that is a big project. It is more than a banner and a memory line, and the argument below
+reads stronger for conceding it.
+
+**The reason is throughput.** Same machine, same shape, same steps, CPU `trainLM` against GPU
+`trainLMGpuResident`:
+
+| shape                                                            |       CPU |       GPU |
+| ---------------------------------------------------------------- | --------: | --------: |
+| 6.0M params, vocab 8192, hidden 256, 4 layers, seq 256, 2 steps  |  16 tok/s | 786 tok/s |
+| 32.0M params, vocab 16384, hidden 512, 6 layers, seq 256, 1 step | 1.6 tok/s |           |
+
+49x at 6M, and CPU throughput falls faster than the parameter count rises: 5.3x the parameters cost
+10x the time over that range. That pair says nothing about the GPU side, which is measured
+separately below. What widens the gap is how much better the GPU holds up: it loses less than an
+order of magnitude between the 6M and 596M shapes, while the CPU loses a full one between 6M and
+32M. Two short timings at shapes differing in four variables are not a curve, so what follows is an
+order-of-magnitude argument and nothing finer. Carrying the 32M figure LINEARLY to 596M, generous
+against a trend worse than linear, puts a 596M CPU step in the range of seconds per token: a
+100k-token fine-tune runs into weeks, and 10M tokens into years.
+
+For the GPU at that size no extrapolation is needed, since it was measured directly:
+
+```sh
+deno run -A cli.ts pretrain --data data/lambrp.tokens --out /tmp/tps.gguf --steps 2 --batch 1 \
+  --seq-len 2048 --arch qwen3 --hidden 1024 --layers 28 --heads 16 --head-dim 128 \
+  --recompute --loss-chunk 8192
+# Training: ... 108 tok/s, peak 15839MB gpu (pool 5903 + state 9936)
+```
+
+108 and 109 tok/s over two runs, so 10M tokens is about a day. The point is the ratio of orders of
+magnitude, not the third digit on either side.
+
+Threads do not rescue it either. The loop is scalar single-threaded JS with no worker pool and no
+`--threads` flag, and even a perfect 10x from ten cores leaves that 596M estimate months short of
+useful.
+
+So shipping `--cpu` for training would be a small change that produces a trap: a flag that accepts
+the run and then never finishes. Making CPU training genuinely useful is the several-new-files
+project, a threaded SIMD or WASM/BLAS backend, which is a different undertaking from exposing the
+reference loop. The loop's job is to be the oracle every GPU kernel is checked against, and it is
+good at that.
+
+**For anyone who has only a CPU**, the recommendation is `transformers` with `peft`, measured on
+Qwen3-0.6B-Base at seq 512, batch 1, 10 threads: LoRA 118 tok/s at 6.1 GB peak, a full fine-tune
+82 tok/s at 12.8 GB. Both fit 32 GB. The readme carries the same note and the install lines.
+
+**The error message was the place a user would learn this, and it said the wrong thing.**
+`initWebGPU` returns null for two reasons, no WebGPU in the runtime and no adapter on the machine,
+and the die collapsed both into "training needs Deno". Someone running Deno on a GPU-less box was
+told to use Deno, which is exactly #41's situation. `webgpuRuntime()` tells them apart, and
+`initWebGPU` does not consult it: the `try`/`catch` around its adapter request already covers every
+runtime without WebGPU, and a first-line guard duplicating the predicate proved unobservable across
+six shapes of broken navigator. The error message was #84.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

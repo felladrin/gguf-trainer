@@ -43,7 +43,7 @@ import { trainLM } from "../src/train/trainer.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
 import { qkLogitScale } from "../src/train/qk-clip.ts";
 import { AdamW } from "../src/train/adam.ts";
-import { initWebGPU, WebGPUBackend } from "../src/backend/webgpu.ts";
+import { initWebGPU, WebGPUBackend, webgpuRuntime } from "../src/backend/webgpu.ts";
 import { MAX_WG } from "../src/backend/wgsl.ts";
 import { MuonGpu, newtonSchulzGpu } from "../src/backend/muon-gpu.ts";
 import { AdamWGpu } from "../src/backend/adamw-gpu.ts";
@@ -643,7 +643,11 @@ async function specDefaultLimitsCheck(T: number, hd: number, why: string) {
 async function main() {
   const gpu = await initWebGPU();
   if (!gpu) {
-    console.log("SKIP: no WebGPU in this runtime. Run under Deno (or provide navigator.gpu).");
+    console.log(
+      webgpuRuntime() === "no-runtime"
+        ? "SKIP: no WebGPU in this runtime. Run under Deno (or provide navigator.gpu)."
+        : "SKIP: WebGPU is present but no GPU adapter was found, so there is nothing to compare.",
+    );
     return;
   }
   console.log(`=== GPU-vs-CPU parity checks (adapter: ${gpu.adapterName}) ===\n`);

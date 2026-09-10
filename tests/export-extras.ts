@@ -13,7 +13,7 @@ import { addMatrix, addVector, tensorLoader } from "../src/arch/common.ts";
 import { GGUFWriter, readGGUF } from "../src/gguf/gguf.ts";
 import { Tensor } from "../src/model/autograd.ts";
 import { llamaRunScript } from "../src/export/export-gguf.ts";
-import { guardBufferSize } from "../src/backend/webgpu.ts";
+import { guardBufferSize, initWebGPU, noGpuNote, webgpuRuntime } from "../src/backend/webgpu.ts";
 import { gemma3Config } from "../src/arch/gemma3.ts";
 import { stepCheckpointPath } from "../src/commands/pretrain.ts";
 import { lossChunkModelError, lossChunkValueError, MAX_LOSS_SPANS } from "../src/train/loss.ts";
@@ -227,6 +227,92 @@ for (
     () => addVector(new GGUFWriter(), "bad", Tensor.zeros([3, 4])),
     "addVector: bad must be 1-D, got [3, 4]",
     "a 2-D tensor is refused by addVector",
+  );
+}
+
+// initWebGPU returns null for two different reasons, and until now every caller
+// reported only the first. A Deno user on a machine with no GPU was told that
+// training needs Deno. webgpuRuntime is what tells them apart, and it is the
+// test a caller can apply after the fact. initWebGPU does not consult it: the
+// wrapper around its adapter request already covers that exit.
+{
+  // deno-lint-ignore no-explicit-any
+  const g = globalThis as any;
+  // The descriptor, not the value: `navigator` is an accessor on the global in
+  // both runtimes, so restoring it as a plain data property would leave
+  // something subtly different behind.
+  const saved = Object.getOwnPropertyDescriptor(g, "navigator");
+  const set = (v: unknown) =>
+    Object.defineProperty(g, "navigator", { value: v, configurable: true });
+  try {
+    set(undefined);
+    eq(webgpuRuntime(), "no-runtime", "no navigator at all is a runtime problem");
+    set({});
+    eq(webgpuRuntime(), "no-runtime", "a navigator without .gpu is too: Node has one");
+    // initWebGPU must return null rather than throw for every shape of broken
+    // navigator that fails at or before requestAdapter, since a throw is the
+    // stack trace this whole change exists to replace. A junk adapter that gets
+    // PAST requestAdapter can still throw out of the device request; that is
+    // older than this change and not claimed here. The polyfill route the docblock
+    // advertises is where partial
+    // implementations show up, so the list is not hypothetical.
+    for (
+      const [label, nav] of [
+        ["undefined", undefined],
+        ["no .gpu", {}],
+        ["gpu without requestAdapter", { gpu: {} }],
+        ["requestAdapter throws synchronously", {
+          gpu: {
+            requestAdapter: () => {
+              throw new Error("boom");
+            },
+          },
+        }],
+        ["requestAdapter rejects", {
+          gpu: { requestAdapter: () => Promise.reject(new Error("x")) },
+        }],
+        ["requestAdapter returns null", { gpu: { requestAdapter: () => null } }],
+      ] as [string, unknown][]
+    ) {
+      set(nav);
+      let threw = false;
+      let got: unknown = "not-null";
+      try {
+        got = await initWebGPU();
+      } catch {
+        threw = true;
+      }
+      ok(
+        !threw && got === null,
+        `initWebGPU returns null rather than throwing: navigator ${label}`,
+      );
+    }
+    set({ gpu: {} });
+    eq(webgpuRuntime(), "ok", "a navigator with .gpu is a runtime that could have an adapter");
+    // Which is the whole point: "ok" here plus a null from initWebGPU means the
+    // machine has no adapter, not that the runtime is wrong.
+    ok(
+      noGpuNote().includes("no GPU adapter found"),
+      `the fallback note names the adapter when the runtime is fine, got ${noGpuNote()}`,
+    );
+    set({});
+    ok(
+      noGpuNote().includes("no WebGPU in this runtime"),
+      `and names the runtime when that is what is missing, got ${noGpuNote()}`,
+    );
+  } finally {
+    if (saved) Object.defineProperty(g, "navigator", saved);
+    else delete g.navigator;
+  }
+  // Against the saved DESCRIPTOR, not against whatever navigator happens to be:
+  // comparing the global to itself passes no matter what the finally did, which
+  // is what the first version of this assertion got wrong in both runtimes.
+  const now = Object.getOwnPropertyDescriptor(g, "navigator");
+  ok(
+    saved === undefined
+      ? now === undefined
+      : !!now && saved.get === now.get && saved.value === now.value,
+    "the real navigator descriptor is back, accessor and all",
   );
 }
 

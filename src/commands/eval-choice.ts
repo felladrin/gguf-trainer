@@ -30,7 +30,7 @@ import {
 } from "../train/loss.ts";
 import type { LanguageModel } from "../model/arch.ts";
 import type { BPETokenizer } from "../tokenizer/bpe.ts";
-import { initWebGPU } from "../backend/webgpu.ts";
+import { initWebGPU, noGpuNote } from "../backend/webgpu.ts";
 import type { WebGPUBackend } from "../backend/webgpu.ts";
 import { fetchParquetUrls } from "../data/hf.ts";
 import { parseDataFile, type Row } from "../data/parse.ts";
@@ -372,7 +372,7 @@ async function run(v: Values) {
   let gpu: WebGPUBackend | null = null;
   if (!useCpu) {
     gpu = await initWebGPU();
-    if (!gpu) console.log("(no WebGPU; falling back to CPU forward)");
+    if (!gpu) console.log(noGpuNote());
     else {
       console.log(`WebGPU adapter: ${gpu.adapterName}`);
       gpu.install();
