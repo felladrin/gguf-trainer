@@ -43,7 +43,12 @@ interface Case {
   detail: string;
   /** Build the graph and return the loss-like scalar/tensor to backward from. */
   run: (gpu: WebGPUBackend) => Tensor;
-  /** Tensors whose gradients the backward pass must produce (kept alive). */
+  /**
+   * Every external tensor the pass touches, whose gradients it must produce.
+   * Kept alive, zeroed before each pass, and, since #99, the declaration the
+   * readback assertion in `once` checks against: an external touched by `run`
+   * but missing here fails that check as surely as a frozen one does.
+   */
   inputs: Tensor[];
   backward: boolean;
 }
@@ -83,9 +88,11 @@ async function once(gpu: WebGPUBackend, c: Case, wantBytes: number) {
   if (gpu.lastSyncReadbackBytes !== wantBytes) {
     throw new Error(
       `bench: case "${c.name}" read back ${gpu.lastSyncReadbackBytes} of ${wantBytes} expected ` +
-        `gradient bytes, so its timing does not include the full gradient readback the wall ` +
-        `column claims; at 0 it does not wait for the GPU either. Give the case inputs that all ` +
-        `carry gradients, or change what the wall number is documented to mean.`,
+        `gradient bytes, so its timing is not the full gradient readback the wall column ` +
+        `claims. Fewer means an input is frozen or kept on device, and at 0 the pass does not ` +
+        `wait for the GPU either; more means \`run\` touched an external that \`inputs\` does not ` +
+        `list, which also missed its zeroGrad. Fix the case, or change what the wall number is ` +
+        `documented to mean.`,
     );
   }
 }

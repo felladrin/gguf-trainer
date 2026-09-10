@@ -2300,11 +2300,18 @@ The published numbers do not move: the assertion is one integer compare on a pat
 nothing, and `bench --suite all` passes every case with the exact equality, which is also the
 measurement that confirms `sync()` stages exactly `t.size * 4` per live external.
 
+The assertion is two-sided by construction, and the message says so: fewer bytes than declared means
+an input is frozen or kept on device, more means `run` touched an external that `inputs` does not
+list, which also missed its `zeroGrad`. `Case.inputs` now documents that contract, since it is the
+declaration being checked rather than a note about what to keep alive.
+
 **One review suggestion declined.** The error used to offer "or read something back explicitly",
 which `Case` has no way to express, so the advice was unreachable; the suggestion was to add a
-`reads?: Tensor[]` field and forward it to `sync()`. No case needs one, so that is a feature with no
-user, and the message now names only the option that exists. Whoever adds a genuinely
-gradient-free case can add the field then, which is the point at which its shape is known.
+`reads?: Tensor[]` field and forward it to `sync()`. Declined on caller count, and the second round
+gave the better reason: those bytes would have to count toward the expected total, and then a
+gradient-free case satisfies the assertion with a DATA readback while the header promises the wall
+number carries the gradient one. The field would buy the fence back at the cost of the property the
+assertion exists to protect. The message now names only the option that exists.
 
 No test file, deliberately. `bench` needs a GPU and is not in `deno task test`, and the check runs on
 every real invocation, which is where it belongs. The property it depends on, that
