@@ -56,14 +56,11 @@ jobs:
         run: bun --version
       - name: Bun compatibility
         run: deno task test:bun
-      - name: PROBE, how does npm-deps resolve under Bun
+      - name: PROBE, what needs auto-install
         run: |
-          echo "--- cache before ---"; ls ~/.bun/install/cache 2>/dev/null | head -5 || echo none
-          echo "--- with auto-install off ---"
-          bun run --no-install tests/npm-deps.ts && echo "PROBE: passed with --no-install" || echo "PROBE: FAILED with --no-install"
-          echo "--- default ---"
-          bun run tests/npm-deps.ts && echo "PROBE: passed by default" || echo "PROBE: FAILED by default"
-          echo "--- cache after ---"; ls ~/.bun/install/cache 2>/dev/null | head -5 || echo none
+          echo "--- npm-deps, the one file that imports npm packages ---"
+          bun run --no-install tests/npm-deps.ts && echo "PROBE: npm-deps passed --no-install" || echo "PROBE: npm-deps FAILED --no-install"
+          bun run tests/npm-deps.ts && echo "PROBE: npm-deps passed by default" || echo "PROBE: npm-deps FAILED by default"
 
   # Two versions, both pinned. 22.6.0 is the exact floor readme.md promises and
   # the first release with --experimental-strip-types, so this entry tests the
