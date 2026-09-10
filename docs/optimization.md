@@ -2490,6 +2490,80 @@ backend's `submit()`, which is private on `WebGPUBackend` and absent from the `R
 interface `checkpoint` holds, so it takes a cast or an interface member. And run it on an idle
 machine, which is the whole point of this entry.
 
+### 48. An all-ignored batch, on the device (2026-09-10)
+
+Surfaced while reviewing #96. `kept` is the loss denominator, and every path clamps it the same way:
+
+```ts
+const denom = kept > 0 ? kept : 1;
+```
+
+Six times. Three in `autograd.ts` and three in `webgpu.ts`, one per loss per side. Without the clamp
+the mean is 0/0; with one missing on one side, that path reports NaN while the other reports 0, and
+neither throws.
+
+`tests/gradcheck.ts` drives `every row ignored` through the two hard-target losses, and it runs with
+no backend installed, so it only ever exercised the CPU copies. The three device copies had nothing
+driving them, and `softCrossEntropy` had nothing on either side. A masked batch is not exotic:
+assistant-only loss masking produces one whenever a training window lands entirely inside a prompt.
+
+**The sixth clamp needed its own case, in gradcheck rather than here.** `gpu-parity.ts` returns
+`SKIP` with no adapter, and CI has no GPU, so the device gate does not run there. The CPU clamps for
+the two hard-target losses are covered anyway by gradcheck's existing `every row ignored`, but the
+CPU `softCrossEntropy` clamp was covered by nothing that runs GPU-less: the `teacher id range`
+block's smallest kept count is 2. One case in that list closes it, and the whole point is that it
+runs where the suite actually runs.
+
+`allIgnoredGate` runs all three losses over a fully masked batch with the backend installed, and
+requires both the device answer and the CPU reference to be exactly 0, with a scored batch beside
+them in the same readback as the control. Six mutations, one per clamp, each failing in exactly its
+own arm:
+
+| clamp removed       | what the gate prints                                                                                                      |
+| :------------------ | :------------------------------------------------------------------------------------------------------------------------ |
+| `webgpu.ts` dense   | `dense NaN, fused 0, softCE 0`                                                                                            |
+| `webgpu.ts` fused   | `dense 0, fused NaN, softCE 0`                                                                                            |
+| `webgpu.ts` soft    | `dense 0, fused 0, softCE NaN`                                                                                            |
+| `autograd.ts` dense | `MISMATCH allIgnored.dense: gpu=0 cpu=NaN`                                                                                |
+| `autograd.ts` fused | `MISMATCH allIgnored.fused: gpu=0 cpu=NaN`                                                                                |
+| `autograd.ts` soft  | `MISMATCH allIgnored.softCE: gpu=0 cpu=NaN`, and GPU-less, `teacher id range` reports `failed: every teacher row ignored` |
+
+Each device row also prints the summary line and each CPU row also prints its `MISMATCH`; the table
+shows whichever is the more useful of the two.
+
+**The bottom three needed a fix to the gate before they failed at all, and it is the interesting
+part.** The first draft checked `!Number.isFinite(got[i]) || Math.abs(got[i] - cpu[i]) > 1e-6`,
+which looks symmetric and is not: with a NaN reference, `Math.abs(0 - NaN)` is NaN and `NaN > 1e-6`
+is false, so a missing CPU clamp passed while the arm claimed to cover it. A comparison against a
+NaN oracle is not a weak test, it is a test that cannot fail.
+
+The fix went further than adding a second finiteness check. The arm now asserts exactly
+`got !== 0 || cpu !== 0`, which is stronger and shorter: exact zero is guaranteed rather than hoped
+for, since every kernel writes 0 for an ignored row and the CPU totals are sums over no terms, so
+nothing accumulates and there is no float noise to absorb; and `NaN !== 0` is true, so one
+comparison covers both sides with no finiteness test at all. Written the other way round,
+`Math.abs(got[i]) > 0` is false for NaN, which is the same trap again.
+
+Three limits worth stating. At `kept == 0` the numerator is 0 too, so no arm here can grip the
+count's VALUE, only the clamp; the value is pinned by the partial-mask parity cases and by
+`chunked summed NLL` and `softCE summed NLL`.
+
+WGSL does not promise that `0.0 / 0.0` is NaN, and a draft of this paragraph said the CPU comparison
+made the device arms adapter-independent. It does not, and the truth is the reverse: the check is
+`got !== 0` and `cpu !== 0` independently, so an adapter that yields 0 there makes all three device
+mutations invisible, and the CPU oracle cannot rescue them because it is 0 too. The three device
+rows are what THIS adapter did.
+
+And the arm's pass condition is "everything is 0", which an unread host buffer also satisfies, since
+`makeOut` hands back a `Tensor.zeros`. Deleting the readback made the first version pass on
+unwritten memory. Two things close that. A scored batch rides in the same `sync` and must be nonzero
+and match the CPU, which is the control `targetRangeGate` carries for the same reason; with the
+readback deleted it reports `scored control 0.0000, 0.0000, 0.0000`. And every one of the six host
+scalars is seeded to `NaN` first, so each proves individually that the readback wrote it: `NaN !== 0`
+fails an ignored arm and `!(Math.abs(NaN) > 1e-6)` fails a control arm. The control alone would not
+have caught an op that never reached the device at all, since it takes the real path; the seed does.
+With the sync deleted, all six now report.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE

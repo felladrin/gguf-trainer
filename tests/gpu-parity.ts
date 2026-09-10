@@ -678,6 +678,7 @@ async function main() {
   await profilerSmoke(gpu);
   await aliasedBinaryOpParity(gpu);
   await targetRangeGate(gpu);
+  await allIgnoredGate(gpu);
   await fusedCeParity(gpu);
   await recomputeModelParity(gpu);
   await loraModelParity(gpu);
@@ -2398,6 +2399,117 @@ async function recycleReuseGate(gpu: WebGPUBackend) {
   console.log(
     `  ${ok ? "ok " : "FAIL"} an empty sync() recycles without corrupting in-flight work`,
   );
+}
+
+/**
+ * An all-ignored batch, on the GPU, for all three losses.
+ *
+ * `kept` is the loss denominator, and every path clamps it with the same
+ * `kept > 0 ? kept : 1` written out six times: three in autograd.ts and three in
+ * webgpu.ts. Without the clamp the mean is 0/0. With one clamp missing on one
+ * side, that path reports NaN while the other reports 0, and neither throws.
+ *
+ * `tests/gradcheck.ts` drives `every row ignored` through the two hard-target
+ * losses, but only on the CPU, since it runs with no backend installed. The
+ * device copies of the clamp had nothing driving them, and `softCrossEntropy`
+ * had nothing on either side. A masked batch is not exotic: assistant-only loss
+ * masking produces one whenever a window lands entirely inside a prompt.
+ *
+ * What this pins is the clamp and nothing more. At `kept == 0` the numerator is
+ * 0 too, so every divisor looks alike and no arm here can grip the count's
+ * VALUE; that is pinned elsewhere and on both paths, by the partial-mask cases
+ * above and by `chunked summed NLL` and `softCE summed NLL` in gradcheck, which
+ * check `mean * kept` against an independently summed numerator.
+ *
+ * Delete any one of the six clamps and the matching arm fails. On this adapter
+ * the device three turn NaN. WGSL does not promise that `0.0 / 0.0` is NaN,
+ * and the check is `got !== 0` and `cpu !== 0` independently rather than a
+ * comparison, so an adapter that yields 0 there would make those three
+ * mutations invisible and the CPU oracle could not rescue them, being 0 too.
+ */
+async function allIgnoredGate(gpu: WebGPUBackend) {
+  const T = 3, H = 4, V = 6, K = 2;
+  const hid = randTensor([T, H], mulberry32(71));
+  const w = randTensor([V, H], mulberry32(73));
+  const ignored = [-1, -1, -1];
+  // Every teacher row ignored too: the first slot is the marker, and the rest
+  // are in-range by choice rather than by contract, since keptTeacherRows does
+  // not look at slots >= 1 of an ignored row.
+  // The probabilities are NONZERO on purpose: with zeros, both bodies would
+  // return 0 for a second reason (`q === 0` skips the term on the CPU, `q != 0.0`
+  // in the kernel), and the row skip this arm is about would stop being
+  // load-bearing.
+  const teacherIds = [-1, 0, -1, 0, -1, 0];
+  const teacherQ = [0.6, 0.4, 0.6, 0.4, 0.6, 0.4];
+
+  // The control, and it is not optional here: `makeOut` hands back a
+  // `Tensor.zeros`, so an unread host buffer is all zeros and "everything is 0"
+  // is exactly this arm's pass condition. Delete the sync below and the ignored
+  // arms would pass on unwritten memory. `targetRangeGate` carries the same
+  // control for the same reason. These three run in the SAME sync, so they
+  // cannot be satisfied by a readback the ignored three did not get.
+  const scoredTargets = [0, V - 1, 1];
+  const scoredIds = [0, 1, 2, 3, 4, 5];
+
+  const cpu = [
+    crossEntropy(linear(hid, w), ignored).data[0],
+    fusedCrossEntropy(hid, w, ignored, 2).data[0],
+    softCrossEntropy(linear(hid, w), teacherIds, teacherQ, K).data[0],
+    crossEntropy(linear(hid, w), scoredTargets).data[0],
+    fusedCrossEntropy(hid, w, scoredTargets, 2).data[0],
+    softCrossEntropy(linear(hid, w), scoredIds, teacherQ, K).data[0],
+  ];
+
+  gpu.install();
+  let ok = true;
+  try {
+    const out = [
+      crossEntropy(linear(hid, w), ignored),
+      fusedCrossEntropy(hid, w, ignored, 2),
+      softCrossEntropy(linear(hid, w), teacherIds, teacherQ, K),
+      crossEntropy(linear(hid, w), scoredTargets),
+      fusedCrossEntropy(hid, w, scoredTargets, 2),
+      softCrossEntropy(linear(hid, w), scoredIds, teacherQ, K),
+    ];
+    // Seeded per tensor so each of the six proves individually that the readback
+    // wrote it. Without this, an op that never reaches the device leaves its
+    // host `Tensor.zeros` untouched and passes an arm whose expected value IS
+    // zero; the scored control cannot see that, because it took the real path.
+    // `NaN !== 0` fails an ignored arm and `!(Math.abs(NaN) > 1e-6)` fails a
+    // control arm, so nothing here can be satisfied by an unwritten buffer.
+    for (const t of out) t.data[0] = NaN;
+    await gpu.sync(out);
+    const names = ["dense", "fused", "softCE"];
+    const got = out.map((t) => t.data[0]);
+    for (let i = 3; i < got.length; i++) {
+      // The control: a scored batch must be nonzero and must match the CPU.
+      if (!(Math.abs(got[i]) > 1e-6) || Math.abs(got[i] - cpu[i]) > 1e-4) {
+        console.log(`    MISMATCH allIgnored.scored.${names[i - 3]}: gpu=${got[i]} cpu=${cpu[i]}`);
+        ok = false;
+      }
+    }
+    for (let i = 0; i < 3; i++) {
+      // `!== 0` rather than a tolerance, doing two jobs. Exact zero is guaranteed
+      // here rather than hoped for: every kernel writes 0 for an ignored row and
+      // the CPU totals are sums over no terms, so nothing accumulates and there
+      // is no float noise to absorb. And `NaN !== 0` is TRUE, so this catches a
+      // dropped clamp on either side without a separate finiteness test. Written
+      // the other way round, `Math.abs(got[i]) > 0` is FALSE for NaN, which is
+      // the trap the first draft fell into by comparing against a NaN oracle.
+      if (got[i] !== 0 || cpu[i] !== 0) {
+        console.log(`    MISMATCH allIgnored.${names[i]}: gpu=${got[i]} cpu=${cpu[i]}`);
+        ok = false;
+      }
+    }
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "ok " : "FAIL"} an all-ignored batch is 0 on both sides, not NaN ` +
+        `(dense ${got[0]}, fused ${got[1]}, softCE ${got[2]}; ` +
+        `scored control ${got[3].toFixed(4)}, ${got[4].toFixed(4)}, ${got[5].toFixed(4)})`,
+    );
+  } finally {
+    gpu.uninstall();
+  }
 }
 
 /**

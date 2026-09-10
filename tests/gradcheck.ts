@@ -525,6 +525,23 @@ async function main() {
       // case instead of aborting the whole file.
       ["an ignored row's other ids are not checked", scores([-1, 999, 0, 1, 2, 3])],
       ["a valid set still scores", scores([0, 1, 2, 3, 4, 5])],
+      // kept == 0, which every case above misses: the smallest they reach is 2.
+      // The denominator is clamped to 1 in both bodies, so the mean is 0 rather
+      // than 0/0, and `!== 0` catches a dropped clamp because NaN !== 0 is true.
+      // This is the only GPU-less coverage the softCrossEntropy clamp has, and
+      // CI has no adapter, so `allIgnoredGate` in gpu-parity does not run there.
+      // Wrapped like the two above it: a guard that wrongly refused this would
+      // report as a failed case rather than aborting the file.
+      [
+        "every teacher row ignored",
+        (() => {
+          try {
+            return softCrossEntropy(logits, [-1, 0, -1, 0, -1, 0], probs, k).data[0] === 0;
+          } catch {
+            return false;
+          }
+        })(),
+      ],
     ];
     const bad = cases.filter(([, ok]) => !ok).map(([name]) => name);
     const ok = bad.length === 0;
