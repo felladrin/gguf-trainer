@@ -635,8 +635,10 @@ micro-batch on the same host-bound step; 20 gains 2.3x by submitting once per la
 difference is not the frequency, it is the wait. `reclaimStepTransients` ends the pass, submits,
 and then AWAITS `onSubmittedWorkDone`, which drains the pipeline and stalls the host until the GPU
 catches up. `endRegion` submits and returns. Submitting is the overlap; waiting for the submission
-is the stall. That also sharpens the follow-up above: a dense-path version must submit without a
-fence, or it will reproduce 3b's 23% rather than this lever's 2.3x.
+is the stall. That also sharpened the follow-up above, while it was still
+open: a dense-path version had to submit without a fence, or it would reproduce 3b's 23% rather than
+this lever's 2.3x. Lever 47 built it that way and measured no effect, so this is a record of the
+reasoning rather than a decision anyone still has to take.
 
 Correctness is gated three ways rather than by the loss curve: `checkpoint == off` in
 `tests/gradcheck.ts` requires bit-identical gradients, `recomputeModelParity` runs all three
@@ -2477,13 +2479,26 @@ passed one. That 16227 is also the control above, which is why it is worth carry
 **What this lever explicitly does not establish.** Deleting `endRegion`'s `submit()`, which lever
 20's corollary says returns the throughput to the dense number, was measured only under load and
 those numbers are discarded; it remains unmeasured. So does any account of what `--recompute` buys
-beyond the 2.25x itself. `gpu_busy_percent` was tried as a discriminator and dropped, and by this
-lever's own rule rather than on its merits: every reading was taken under the same load, so they
-join the discard pile. For the record they read 98-100% across three arms of very different
-throughput, which cannot be reconciled with lever 1c's 52.5%; whether that is the counter saturating
-or the load, this lever cannot say, and 1c's own note that its reading was taken uncontended is the
-first thing to check if anyone wants to. Filed as #104, because five places in this file rest on
-that counter.
+beyond the 2.25x itself. `gpu_busy_percent` was tried as a discriminator and its readings discarded by
+this lever's own rule: all of them were taken under the same load. They read 98-100% across arms of
+very different throughput, which a first draft blamed on the counter saturating.
+
+**It does not saturate, and #104 settled that by re-reading it idle.** Same two shapes, same sampler
+at 10 Hz:
+
+| shape                                            |                   idle | under load |
+| :----------------------------------------------- | ---------------------: | ---------: |
+| 28 layers, hidden 544, 16 heads of 128, seq 2048 | 76.6% mean, 71% median |      98.2% |
+| 28 layers, hidden 128, seq 64, batch 1           | 78.5% mean, 81% median |      99.8% |
+
+So it reads well below 100% when the machine is quiet, and lever 1c's 52.5%, principle 1's idle
+claim and lever 19's reasoning all stand: 1c records its reading as taken uncontended, which is
+exactly the condition this lever says to measure in.
+
+What does NOT follow is a rule for which way contention moves the number. Here it read higher under
+load; in 1c it read lower, 42% during the run against 52.5% uncontended. Both directions are on
+record, so the usable conclusion is narrower and more useful than either: a `gpu_busy_percent`
+reading whose machine conditions are not recorded is not evidence of anything.
 
 To re-run the follow-up: `checkpoint()`'s passthrough at `if (!checkpointing) return fn()` needs the
 backend's `submit()`, which is private on `WebGPUBackend` and absent from the `RegionBackend`
