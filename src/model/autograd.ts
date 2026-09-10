@@ -315,10 +315,31 @@ export function linear(x: Tensor, w: Tensor): Tensor {
 }
 
 function linearRaw(x: Tensor, w: Tensor): Tensor {
-  if (opsBackend) return opsBackend.linear(x, w);
   const [T, inDim] = x.shape;
   const [outDim, inDim2] = w.shape;
-  if (inDim !== inDim2) throw new Error(`linear dim mismatch ${inDim} vs ${inDim2}`);
+  // Above the dispatch, like every other shape validator in this file. It was
+  // the last one below (#91), and it survived there because both
+  // implementations happened to have it, with the identical message. That is
+  // exactly the shape #61 was: a guard under a dispatch has to be written again
+  // in every implementation, and the one nobody remembers is the one that ships
+  // unvalidated.
+  //
+  // Cheaper to hoist than the loss guards of #82: it returns nothing, so the
+  // dispatch line is unchanged, and the comparison itself does not run any more
+  // often than before, since webgpu.ts ran it on every call too. What the GPU
+  // path does pay is the two shape destructures above, which used to happen
+  // only inside the backend. `linear` is the hottest op in the graph, so that
+  // is worth a number rather than a shrug: 86 calls per step at 6 layers and
+  // batch 2, and 4.1 ns for two destructures and a compare, which is 0.00035 ms
+  // per step against a step measured in seconds.
+  if (inDim !== inDim2) {
+    throw new Error(
+      `linear dim mismatch: x is [${x.shape}] and w is [${w.shape}], ` +
+        `so the contracted dimension is ${inDim} on one side and ${inDim2} on the other. ` +
+        `A LoRA adapter built for a different width is one way to get here.`,
+    );
+  }
+  if (opsBackend) return opsBackend.linear(x, w);
   const out = Tensor.zeros([T, outDim]);
   for (let t = 0; t < T; t++) {
     for (let o = 0; o < outDim; o++) {
@@ -866,8 +887,8 @@ export function keptRowsInVocab(targets: number[], T: number, V: number, where: 
 export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
   assertMatrix(logits, "logits", "crossEntropy");
   const [T, V] = logits.shape;
-  // Above the dispatch, like every id and shape validator in this file bar
-  // linearRaw's dim check (#91). It stayed below for as long as it did because
+  // Above the dispatch, like every id and shape validator in this file. It
+  // stayed below for as long as it did because
   // it returns a value both implementations need as their loss denominator, so
   // hoisting it means passing `kept` down rather than each backend calling it
   // again. That is a smaller price than the shape that produced #61: a guard

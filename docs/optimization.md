@@ -1912,7 +1912,8 @@ into `fused false`, while every CPU case passes. Measured both ways, and the det
 that the legal arm's loss does not move: 1.6022 either way. The loophole computes the right
 denominator and skips the validation, which is why nothing but a placement gate catches it.
 
-**One instance of the gap shape remains, and it is not this one.** `linearRaw` checks
+**One instance of the gap shape remains, and it is not this one** (closed in lever 42).
+`linearRaw` checks
 `inDim !== inDim2` below its dispatch and `webgpu.ts` repeats the identical check with the identical
 message. No gap today, same as here, and hoisting it is a different change to a different function.
 Filed as #91 rather than folded in, since `linear` is the hottest op in the graph and "the check is
@@ -2040,6 +2041,64 @@ Two smaller consequences of the same fix. The chain ends in a `crossEntropy` sca
 device. And the gradients are read from the persistent accumulators rather than from a graph
 output, whose buffer the bare `sync()` has already returned to the pool: reading that would have
 been a second way for the arm to pass without proving anything.
+
+### 42. `linear`'s dim check came up above the dispatch, and the dead copies went (2026-09-10)
+
+Filed as #91 in lever 40, as the last instance of the shape that produced #61. `linearRaw`
+dispatched before it validated, and `webgpu.ts` repeated the check with the identical message, so
+there was no live gap and no way to tell which copy threw:
+
+```ts
+function linearRaw(x: Tensor, w: Tensor): Tensor {
+  if (opsBackend) return opsBackend.linear(x, w);
+  const [T, inDim] = x.shape;
+  const [outDim, inDim2] = w.shape;
+  if (inDim !== inDim2) throw new Error(`linear dim mismatch ${inDim} vs ${inDim2}`);
+```
+
+**The cost question the issue raised does not survive contact with the code.** `linear` is the
+hottest op in the graph and the worry was that hoisting puts a guard on that path. It was already
+on that path: the GPU copy ran on every call. Hoisting moves the comparison, it does not add one.
+What the GPU path genuinely gains is the two shape destructures above the dispatch, which used to
+happen only inside the backend, and that is small enough to put a number on rather than wave at.
+Counted through the real training loop, `linearRaw` runs 86 times per step at 6 layers and batch 2
+(43 per micro-batch: seven projections across six blocks, plus the readout). Two destructures and a
+compare measure 4.10 ns, so 0.00035 ms per step, against a step of seconds. A before/after step
+timing would have measured this machine's variance and nothing else.
+
+Unlike #82 there is no interface to widen: the check returns nothing, so the dispatch line is
+untouched.
+
+The message now names both shapes, since after the hoist there is one copy and it is the only thing
+the caller gets:
+
+```
+linear dim mismatch: x is [24,64] and w is [40,65], so the contracted dimension is 64 on one side
+and 65 on the other. A LoRA adapter built for a different width is one way to get here.
+```
+
+**Two dead checks went with it.** `WebGPUBackend.fusedCrossEntropy` repeated `H !== H2` and
+`chunk <= 0` with the wrapper's exact messages, and the wrapper has validated both above the
+dispatch since before #82. Nothing reaches that method except the wrapper: `sequenceLoss` is the
+only caller of `fusedCrossEntropy` in `src/`, and it goes through `autograd.ts`.
+
+`targetRangeGate` gains three arms and a name that fits them (`GPU refuses malformed op inputs`,
+since `linear` is not a loss). What each one is worth is not the same:
+
+- `linear`: putting the check back below `if (opsBackend)` turns `linear true` into `linear false`
+  while every CPU caller keeps passing. That is the signature of this mistake, and the third time
+  the gate has caught it.
+- `fusedDim`: deleting the wrapper's `H !== H2` turns `fusedDim true` into `fusedDim false`. Clean.
+- `fusedChunk`: deleting the wrapper's `chunk <= 0` does NOT turn this arm false. The suite dies
+  with `Fatal JavaScript out of memory` inside the arm, 13 checks in, because
+  `for (v0 = 0; v0 < V; v0 += chunk)` never advances on a zero chunk. Exit 133 rather than exit 1:
+  the regression is caught, but by exhaustion rather than by the assertion, and that is worth
+  knowing before someone reads a red suite and looks for a mismatch line.
+
+**What the deletion gives up, stated plainly.** With the copies in place, a wrapper whose guard was
+removed still threw cleanly from the backend. With them gone, the wrapper is the only thing between
+a mismatched shape and the heap exhaustion above. That is the standing trade of #61 and #82: a
+duplicate is also what lets the real guard rot unnoticed, and the arms above are the replacement.
 
 ## Quality levers
 
