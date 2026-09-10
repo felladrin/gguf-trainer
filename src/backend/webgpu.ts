@@ -1332,17 +1332,16 @@ export class WebGPUBackend implements OpsBackend {
     teacherIds: number[],
     teacherProbs: number[],
     k: number,
+    kept: number,
   ): Tensor {
     this.beginForwardOp();
     this.curLabel = "softCrossEntropy";
-    // Shapes and teacher ids are validated by the softCrossEntropy wrapper,
-    // above this dispatch.
+    // Shapes, teacher ids and the kept-row count all come from the
+    // softCrossEntropy wrapper, above this dispatch.
     const [T, V] = logits.shape;
     const el = this.entryFor(logits);
     const idBuf = this.uploadU32(teacherIds); // a first id of -1 uploads as 0xffffffff (ignore)
     const qBuf = this.uploadF32(teacherProbs);
-    let kept = 0;
-    for (let t = 0; t < T; t++) if (teacherIds[t * k] >= 0) kept++;
     const divBuf = this.uploadF32([kept > 0 ? kept : 1]); // mean over kept rows
     const probs = this.acquireTransient(T * V * 4);
     const perRow = this.acquireTransient(T * 4);

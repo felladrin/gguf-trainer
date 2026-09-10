@@ -392,7 +392,7 @@ async function main() {
     // clause is what would have to fire. Without assertMatrix it does not: V is
     // undefined, so `id >= V` is false for the 999 too.
     const longTargets = Array.from({ length: 24 }, (_, i) => (i === 0 ? 999 : 0));
-    // Teacher arrays of length T*k = 24, so assertTeacherRows gets past its own
+    // Teacher arrays of length T*k = 24, so keptTeacherRows gets past its own
     // length check and its id range is the guard that would have to fire.
     const tIds = Array.from({ length: 24 }, (_, i) => (i === 0 ? 999 : 0));
     const tProbs = new Array(24).fill(1);

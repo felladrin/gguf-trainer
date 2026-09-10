@@ -140,11 +140,13 @@ export interface OpsBackend {
     chunk: number,
     kept: number,
   ): Tensor;
+  /** Same again: `keptTeacherRows` validates and counts above the dispatch. */
   softCrossEntropy(
     logits: Tensor,
     teacherIds: number[],
     teacherProbs: number[],
     k: number,
+    kept: number,
   ): Tensor;
 }
 
@@ -753,13 +755,13 @@ export function attention(
  * reason for it. A teacher file must pad short rows with an in-range id, never
  * with `-1`.
  */
-export function assertTeacherRows(
+export function keptTeacherRows(
   teacherIds: number[],
   teacherProbs: number[],
   T: number,
   k: number,
   V: number,
-): void {
+): number {
   if (k < 1) throw new Error(`softCrossEntropy: k must be >= 1, got ${k}`);
   if (teacherIds.length !== T * k || teacherProbs.length !== T * k) {
     throw new Error(
@@ -767,6 +769,7 @@ export function assertTeacherRows(
         `${teacherIds.length}/${teacherProbs.length}`,
     );
   }
+  let kept = 0;
   for (let t = 0; t < T; t++) {
     if (teacherIds[t * k] === -1) continue; // the marker; nothing below it is read
     for (let j = 0; j < k; j++) {
@@ -780,7 +783,9 @@ export function assertTeacherRows(
         );
       }
     }
+    kept++;
   }
+  return kept;
 }
 
 /**
@@ -1074,13 +1079,17 @@ export function softCrossEntropy(
 ): Tensor {
   assertMatrix(logits, "logits", "softCrossEntropy");
   const [T, V] = logits.shape;
-  assertTeacherRows(teacherIds, teacherProbs, T, k, V);
-  if (opsBackend) return opsBackend.softCrossEntropy(logits, teacherIds, teacherProbs, k);
+  // Counted once, above the dispatch, for the reason crossEntropy gives (#82,
+  // #93): a backend that recounts only needs a number, so a bare counting loop
+  // satisfies the compiler while skipping the validation this pass also does.
+  // The count is the loss denominator, so a divergence would not throw, it would
+  // report a plausible loss.
+  const kept = keptTeacherRows(teacherIds, teacherProbs, T, k, V);
+  if (opsBackend) return opsBackend.softCrossEntropy(logits, teacherIds, teacherProbs, k, kept);
   const loss = Tensor.zeros([1]);
   const probs = new Float32Array(T * V);
   const rowMass = new Float32Array(T); // S per row: Σ_j q[t,j]
   let total = 0;
-  let kept = 0;
   for (let t = 0; t < T; t++) {
     const b = t * V;
     let maxL = -Infinity;
@@ -1108,7 +1117,6 @@ export function softCrossEntropy(
       total += q * (Math.log(sum) + maxL - logits.data[b + id]);
       rowMass[t] += q;
     }
-    kept++;
   }
   const denom = kept > 0 ? kept : 1;
   loss.data[0] = total / denom;
