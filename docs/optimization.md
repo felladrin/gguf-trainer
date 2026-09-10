@@ -1769,6 +1769,81 @@ What no test reaches is the call sites. Deleting `assertTokenFileId` from any of
 the suite green, and so does moving either producer's stamp back above its round-trip check. The
 end-to-end runs above are the evidence, and they are not repeatable in CI.
 
+### 39. The parquet reader is imported when a parquet file is read, not before (2026-09-10)
+
+Filed as #83. `deno task test:node` exists to catch Deno-only API use in code that has to run under
+Node too, and it could not reach any of `eval-choice`'s logic. The reason was a dependency that
+logic does not use:
+
+```
+$ node --experimental-strip-types tests/eval-tasks.ts
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'hyparquet' imported from src/data/parse.ts
+```
+
+`tests/eval-tasks.ts` imports `src/commands/eval-choice.ts`, which imports `src/data/parse.ts` for
+the HF parquet reader, which imported `hyparquet` at the top. None of what the test exercises touches
+any of it: `choiceMaskStart`, `choiceWindowError`, `preflightByBytes`, `renderPair`, `withPreamble`,
+`argminPerChar`, `hellaswagPreprocess` and the row parsers are pure string and integer work. So 79
+assertions over the eval scoring arithmetic never saw the Node runtime, because of an import none of
+them reach. `hyparquet` resolves through Deno's import map and there is no
+`node_modules`, so the failure is at load time, before a single assertion runs.
+
+Moving it inside `parseParquet` fixes the coupling rather than routing around it, which is why it
+beat the alternative of splitting the pure helpers into their own module. The graph pulls the
+package when a parquet file is actually read, `deno check` still resolves the types through the
+dynamic specifier, and `eval-choice --task piqa`, which takes the JSON loader, stops paying for a
+reader it never calls.
+
+The issue named one file. Restoring the static import and running each candidate says the truth:
+three were blocked by it, `eval-tasks.ts`, `style-pipeline.ts` (through `style-seed.ts`) and
+`rp-chats.ts` (through `scripts/build-rp-chats.ts`). Four were not blocked by anything.
+`generate-penalty.ts` had simply never been added, and three had exemptions written for them in the
+first version of the guard: `endpoint-score.ts`, `rp-battery-score.ts` and `rp-chats.ts` were each
+recorded as blocked by a Deno API in the script they test, when every one of those sits behind an
+`import.meta.main` guard and never runs on import. Two of the three passed under Node the moment
+anyone tried.
+
+`rp-chats.ts` is the interesting one, because it was on both lists: its exemption named the wrong
+cause while the file really was unloadable. A reason that is wrong about why is invisible even when
+it happens to be right about whether, which is worth more as a warning than either half alone.
+`test:node` went from 14 files to 21.
+
+The check this leaves behind is the tests themselves: seven files join `test:node`, and putting the
+static import back fails three of them with the same `ERR_MODULE_NOT_FOUND` while the other four
+pass. Verified by doing exactly that, file by file. Parquet reading is unchanged, checked against `tests/fixtures/tiny.parquet` under Deno,
+including the `subarray` path that exercises the `byteOffset` slice.
+
+**The static import is only half of why those assertions were invisible.** It made `eval-tasks.ts`
+fail under Node; what made that go unnoticed is that both task lists are hand-maintained strings in
+`deno.json` with nothing comparing them to `tests/`. `generate-penalty.ts` proves the point on its
+own, since nothing was ever blocking it and it was missing anyway. `tests/task-coverage.ts` compares
+both lists against the directory, recursively, and against an exemption list carrying a stated load
+failure per file. It matches the runner and not just the path, so pasting `deno run tests/foo.ts`
+into the `test:node` string cannot report Node coverage that does not exist. One exemption survives:
+`npm-deps.ts` statically imports `@huggingface/jinja`, and exercising the npm dependencies is the
+point of that file, so the import cannot move inside a function.
+
+Two static npm imports remain outside `parse.ts`, in `corpus.ts` and `chat-corpus.ts`. Both are
+reachable only through `src/cli/registry.ts` and so only from `cli.ts`, which is Deno-only anyway,
+and no test imports either. They are not a coverage problem today, and the rule for the day one is:
+move the import, do not earn an exemption.
+
+The exemption list is where this bug can come back, which is why the bar written into it is a load
+failure someone has seen rather than a guess. Its own first version is the cautionary case: five
+entries, three of them wrong, each reading authoritative.
+
+**What this does not fix is that CI never runs `test:node` at all.** `.github/workflows/test.yml`
+runs `deno fmt --check`, `deno lint`, `deno check` and `deno task test`, with no Node step, so the
+21 files in that task are checked against Node only on a developer's machine. Filed as #89 rather
+than folded in here, because adding a Node job is a change to CI's risk profile and not to this
+module graph.
+
+The list check does run in CI, since `task-coverage.ts` is in `test`. So the half of this that
+survives #89 is the half that catches a file going missing; what waits on #89 is catching a file
+that is listed and broken. Worth noting that a Node job would not have caught #83 either:
+`test:node` was green then, and would have been green in CI, because `eval-tasks.ts` was not in the
+list.
+
 ## Quality levers
 
 ### 8. WSD decay-phase instruct injection (medium): MECHANISM DONE
