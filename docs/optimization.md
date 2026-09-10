@@ -612,12 +612,13 @@ was measured, with two short `pretrain` runs differing only in the flag.
 
 If that reading is right, the same overlap is available without recomputing anything, by submitting
 at layer boundaries on the dense path too. That is the obvious follow-up and it is not done here.
-**Done in lever 47, and it loses: 32% slower, which also refutes the reading above.** The mechanism
-that fits the three-arm measurement is the pool footprint, not the overlap.
+**Done in lever 47: +16% at this shape, and -32% at another, so the sign is a property of the shape
+rather than of the change.** Lever 47 also measures the corollary below for the first time.
 
 The corollary is a trap worth naming: the `submit()` in `endRegion` is not needed for correctness.
 It is what produces the overlap. Deleting it as redundant keeps the whole suite green and silently
-returns the throughput to the dense number, so the comment there says so.
+gives most of the throughput back, so the comment there says so. **Measured in lever 47: 117 to 75
+tok/s, which is 1.56x of this lever's headline, though not quite "the dense number" (58).**
 
 The reason it is not needed for correctness is not the one this lever gave. It said no region
 buffer ever reaches a `queue.writeBuffer` call site, and that is false: the loss backwards write
@@ -2419,63 +2420,83 @@ natively rather than through Node's stripper, so it accepts things Node refuses.
 Web API or a `node:` builtin behaving differently there, which is the half of principle 1 that had
 no check at all.
 
-### 47. Submitting at dense layer boundaries is 32% SLOWER, and lever 20's mechanism is wrong (2026-09-10)
+### 47. Lever 20's follow-up works, and the shape decides the sign (2026-09-10)
 
-Lever 20 measured `--recompute` at 2.3x faster and inferred why: `endRegion` submits at every layer
-boundary, so the GPU works on layer 1 while the host records layer 5, and the extra forward lands in
-time the GPU was already spending idle. It named the follow-up in the same breath: "the same overlap
-is available without recomputing anything, by submitting at layer boundaries on the dense path too.
-That is the obvious follow-up and it is not done here." It also flagged its own reasoning: "The
-mechanism is inferred, not proven."
+Lever 20 measured `--recompute` at 2.3x, inferred that `endRegion`'s per-layer `submit()` was what
+bought it, and named the follow-up in the same breath: "the same overlap is available without
+recomputing anything, by submitting at layer boundaries on the dense path too. That is the obvious
+follow-up and it is not done here." It flagged its own reasoning as "inferred, not proven", and left
+a corollary that was also unmeasured: deleting that submit "silently returns the throughput to the
+dense number".
 
-Done now, and the follow-up loses. Three arms, qwen3, 28 layers, hidden 544, `--heads 8`, seq 2048,
-batch 2, `--reclaim --loss-chunk 8192`, vocab 151936, 6 steps, same seed, on an AMD Strix Halo iGPU
-(RADV, Deno 2.9.1):
+Both are measured now. The follow-up works, at +16%, and the corollary is close but overstated.
 
-| arm                                    | throughput | peak GPU (pool + state) |
-| :------------------------------------- | ---------: | ----------------------: |
-| dense                                  |  247 tok/s |  10135 MB (7560 + 2575) |
-| dense + submit at every layer boundary |  168 tok/s |  10135 MB (7560 + 2575) |
-| `--recompute`                          |  308 tok/s |   4613 MB (2038 + 2575) |
+Four arms, lever 20's own shape and flags: qwen3, 28 layers, hidden 544, 16 heads of 128, seq 2048,
+batch 2, `--reclaim --loss-chunk 8192`, vocab 151936, 6 steps, same seed, AMD Strix Halo iGPU
+(RADV, Deno 2.9.1). The follow-up is an `endPass(); submit()` in `checkpoint()`'s dense passthrough,
+which is byte-for-byte what `endRegion` does to the queue.
 
-The loss is identical to four digits across all three (11.581 -> 8.745 over the six steps), so
-nothing is being skipped in either direction. The middle arm is the follow-up, implemented as an
-`endPass(); submit()` at the same place `checkpoint()` takes its dense passthrough, with no fence,
-which is what lever 20 warned it had to be to avoid reproducing 3b's stall.
+| arm                                             | throughput | vs dense | peak GPU |
+| :---------------------------------------------- | ---------: | -------: | -------: |
+| dense                                           |   58 tok/s |        - | 16227 MB |
+| dense + per-layer submit (the follow-up)        |   67 tok/s |     +16% | 16227 MB |
+| `--recompute` with `endRegion`'s submit deleted |   75 tok/s |     +29% |  6579 MB |
+| `--recompute` as shipped                        |  117 tok/s |    +102% |  6579 MB |
 
-**It is 32% slower, not faster.** So submitting per layer is not free on the dense path, and that
-refutes the overlap story rather than confirming it: if the submits were what bought lever 20 its
-speedup, adding them to the dense path would have moved it toward the recompute number instead of
-away from it. Sampled at 10 Hz through `gpu_busy_percent`, the dense arm runs at 98.2% and the
-per-layer-submit arm at 54.9%, which is the shape of a pipeline being broken up rather than
-overlapped.
+**This reproduces lever 20 on different hardware**, which is what makes the rest comparable: 58 vs
+its 72 tok/s dense, 117 vs its 168, a 2.02x ratio against its 2.3x, peak 16227 MB against its
+18974 MB.
 
-**The mechanism that does fit is the footprint.** Rerun the pair at seq 512, where the dense pool
-falls from 7560 MB to 3534 MB and recompute's from 2038 MB to 2292 MB, so the ratio between them
-goes from 3.7x to 1.5x:
+**The corollary is confirmed in direction and overstated in size.** Deleting `endRegion`'s submit
+costs 36% of the recompute arm, 117 to 75, so it is worth 1.56x inside that path and lever 20 is
+right that it is not a redundant line. It does not return the throughput to the dense number,
+though: 75 is still 1.29x over dense. So recompute's 2.02x splits into 1.29x that is not submitting
+and 1.56x that is.
 
-| arm           |         seq 2048 |         seq 512 |
-| :------------ | ---------------: | --------------: |
-| dense         |        247 tok/s |       157 tok/s |
-| `--recompute` | 308 tok/s (+25%) | 93 tok/s (-41%) |
+**And the follow-up gets +16% where recompute's submits get +102%, from the same idea.** The
+difference is where they are. `checkpoint()` calls `endRegion` in the forward AND in every block's
+backward, so the recompute arm submits about twice as often and in the pass that does most of the
+work; the follow-up hooks the passthrough, which is forward only. That is a lead rather than a
+conclusion: nothing here isolates submit COUNT from submit PLACEMENT, and the arm that would
+(submits at both boundaries on the dense path) is not run.
 
-Recompute wins only where it shrinks the pool a lot, and loses by roughly the textbook extra-forward
-cost where it does not. That is an arithmetic-versus-memory tradeoff on a unified-memory APU, not an
-overlap effect, and it explains the -41% that lever 20 predicted for "a GPU-bound shape" without
-needing the host-bound premise. Lever 20's own advice, measure it with two short `pretrain` runs
-differing only in the flag, is what produced both columns.
+**The measurement that matters most is the one that says the sign is a property of the shape.** The
+first pass at this ran on qwen3 with `--heads 8` against the default `--head-dim 64`, 8x64 instead
+of lever 20's 16x128, everything else identical. Same code, same flag, opposite answer:
 
-**Nothing shipped.** The per-layer submit is a two-line experiment (a `flushPass()` on the backend
-and a call in `checkpoint()`'s dense path) and it is not in the tree, because the measurement says
-not to add it. Reproduce it by putting them back; that is cheaper than carrying a flag nobody should
-set.
+| shape                       |     dense | dense + per-layer submit |
+| :-------------------------- | --------: | -----------------------: |
+| 16 heads x 128 (lever 20's) |  58 tok/s |          67 tok/s (+16%) |
+| 8 heads x 64                | 247 tok/s |         168 tok/s (-32%) |
 
-**What is not established.** This is not a reproduction of lever 20's numbers: its dense arm was
-72 tok/s and this one is 247, on a config that is close but not identical (`--heads 8` gives a
-smaller attention block than its 293M), and on different hardware, driver and Deno version. What
-each table above compares is two arms of its own run, same seed, same everything but the one change.
-The direction of lever 20's headline still holds here, at 1.25x rather than 2.3x. The claim this
-retires is the mechanism and the follow-up, not the lever.
+A first draft of this lever reported the -32% as a refutation of lever 20's mechanism. It was not:
+lever 20's claim is explicitly conditional on a host-bound step, and a shape running four times
+faster per token has no idle gap to fill, which is the case lever 20 itself predicted a slowdown
+for. The change did not refute the mechanism; it was measured where the premise was absent. Both
+numbers are real and neither generalizes, which is the reason this lever exists and the reason
+nothing ships: a flag whose sign flips with head geometry is a footgun, and no rule for when to set
+it has been measured.
+
+**`gpu_busy_percent` does not discriminate here, and this lever's first draft leaned on it.** Read
+at 10 Hz: 98.2% for dense, 100.0% for the fastest arm of all, 99.8% for recompute without its
+submit, and 54.9% for the slow 8x64 dense-plus-submit arm. It is a duty-cycle counter that saturates
+whenever anything is in flight, so it separates only the arm with visible host stalls and says
+nothing about headroom. Lever 1c's 52.5% is a real number on a real shape; do not read a high one
+here as evidence of anything.
+
+**One story this lever does NOT tell, having tried.** The draft explained recompute's win by pool
+footprint, on a seq-2048 vs seq-512 pair where recompute went from +25% to -41% while the pool ratio
+went from 3.7x to 1.5x. The competing explanation is simpler and the same table supports it: the
+dense arm gets slower PER TOKEN as the sequence shrinks, 247 to 157 tok/s, which is the signature of
+fixed per-step overhead being amortized over fewer tokens rather than of anything about memory.
+Dispatch count per micro-batch barely moves with sequence length, since `--loss-chunk` derives its
+span count from the vocab and not the rows. Isolating footprint needs a sweep at constant tokens per
+step, or one that moves the pool at a fixed shape; neither is run, so the 1.29x above stays
+unexplained rather than attributed.
+
+Reproduce the follow-up by calling the existing private `submit()` from `checkpoint()`'s passthrough
+at the `if (!checkpointing)` line, forward only. Reproduce the corollary by deleting one line,
+`this.submit()` in `endRegion`, and gating it on `recomputeModelParity` first.
 
 ## Quality levers
 
