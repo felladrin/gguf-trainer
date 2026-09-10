@@ -13,7 +13,9 @@ architecture and `readme.md` "Honest limits" for the ceiling this project accept
 Before the 2026-08-18 kernel rewrite: 0.049 st/s (20.4 s/step) at 94.7M / seq 2048 / batch 8 (that
 step time implies ~803 tok/s, while every other pre-rewrite figure in this file uses 903 tok/s at
 ~18 s/step; the two were taken weeks apart and are not reconciled), GPU
-busy ~100%, attention ~78% of runtime, f16 and f32 compute the same speed. Two things that
+busy ~100% (a whole-device reading with its other users unrecorded, the signature lever 47 puts
+under suspicion; the 1.76x below rests on tok/s, not on it), attention ~78% of runtime, f16 and f32
+compute the same speed. Two things that
 followed from it no longer hold. The GPU is NOT saturated (lever 1). And the reason once given for
 f16, that it "only speeds the ~9% GEMM slice", was never the reason: measured, f16 compute is 0.98x
 on attention itself and overflows to NaN without clamps, so that conclusion survives on its own
@@ -22,24 +24,31 @@ against them; read the block below instead.
 
 ## Measured baseline (2026-08-19, post-rewrite, Strix)
 
-| Metric                  | Value                         | How measured                                                                                                                                                           |
-| :---------------------- | :---------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Throughput              | 0.0969 st/s (10.6 s/step)     | 94.7M, seq 2048, batch 8, plateau rate                                                                                                                                 |
-| Throughput              | 1588 tok/s (1.76x)            | against 903 tok/s on the old kernels                                                                                                                                   |
-| GPU busy                | ~42% (unlabelled) / **52.5%** | `gpu_busy_percent`; 42% during the run, with its other device users unrecorded, so lever 47 sets it aside; 52.5% re-measured uncontended, and that is the one to quote |
-| Host CPU                | ~400% of 32 cores             | `top` on the trainer process                                                                                                                                           |
-| Host RSS                | 1.06 GB steady                | sampled every 10s over 150 steps; flat from 300s on                                                                                                                    |
-| Peak GPU (pool + state) | 39.3 GB                       | trainer's own readout, unchanged                                                                                                                                       |
-| Profiled kernel time    | ~330 ms of a 10.6 s step      | `bench`, idle GPU, summed over a step's dispatches                                                                                                                     |
+| Metric                  | Value                     | How measured                                                          |
+| :---------------------- | :------------------------ | :-------------------------------------------------------------------- |
+| Throughput              | 0.0969 st/s (10.6 s/step) | 94.7M, seq 2048, batch 8, plateau rate                                |
+| Throughput              | 1588 tok/s (1.76x)        | against 903 tok/s on the old kernels                                  |
+| GPU busy                | ~42% / 52.5% [^busy]      | `gpu_busy_percent`; 42% during the run, 52.5% re-measured uncontended |
+| Host CPU                | ~400% of 32 cores         | `top` on the trainer process                                          |
+| Host RSS                | 1.06 GB steady            | sampled every 10s over 150 steps; flat from 300s on                   |
+| Peak GPU (pool + state) | 39.3 GB                   | trainer's own readout, unchanged                                      |
+| Profiled kernel time    | ~330 ms of a 10.6 s step  | `bench`, idle GPU, summed over a step's dispatches                    |
+
+[^busy]: Both are whole-device readings whose other users were not recorded, which lever 47
+    calibrated and sets aside; read them as ceilings on this trainer's share rather than as its
+    utilization. The per-process number is the ~330 ms of profiled kernel time in the row above.
 
 The two facts that now drive everything below:
 
-1. **The step is host-bound, not GPU-bound.** The GPU idles about half the step while four host
-   cores stay busy (lever 1c's 52.5%, the reading taken uncontended; the `~42%` beside it in the
-   table was taken during a run whose other device users are not recorded, so lever 47 discards it
-   and the `~58%` this used to quote with it). Cheaper kernels can no longer raise
-   tokens/second on this box; only cheaper host work can. See lever 1c, which is where the time
-   actually goes.
+1. **The step is host-bound, not GPU-bound.** Profiled kernel time is ~330 ms of a 10.6 s step,
+   from `bench` summed over a step's dispatches, and that is the only per-process GPU number here.
+   Cheaper kernels can no longer raise tokens/second on this box; only cheaper host work can. See
+   lever 1c, which is where the time actually goes.
+
+   `gpu_busy_percent` corroborates rather than establishes this, and lever 47 says why: it is a
+   whole-device counter, so its 52.5% is a ceiling on our trainer's share rather than a measure of
+   it, and the `~42%` beside it in the table was taken during a run whose other device users are
+   unrecorded.
 2. **Batch is sequential gradient accumulation, not a real batch dimension.** The training loop runs
    one sequence per forward/backward and sums the gradients (`train-gpu.ts`), so batch size trades
    step count for per-step time at a fixed tokens/second. It changes gradient noise, not throughput.
@@ -369,7 +378,11 @@ Where the 34.9 GB came from is unresolved. It was read once with `smaps_rollup` 
 
 What survives: the step really is host-bound. Re-measured uncontended at the same shape,
 `gpu_busy_percent` averages 52.5% over 40 samples (max 86%), so the GPU still idles about half the
-step. The host time is in the dispatch path itself, not in allocating host arrays. Anyone taking
+step. (Lever 47 later calibrated that counter and narrowed what this sentence can claim: it is
+whole-device, "uncontended" here was not checked against `fuser -v /dev/dri/renderD128`, and the
+counter reads 43.2% mean with nothing training at all. Read 52.5% as a ceiling on this trainer's
+share, not as its utilization. Lever 47 also found a second tenant on this box's GPU, which
+independently corroborates the loose end below about the ten-hour run sharing the device.) The host time is in the dispatch path itself, not in allocating host arrays. Anyone taking
 this on next should profile bind-group and pipeline setup per dispatch, not memory.
 
 One loose end worth naming: this configuration reaches 0.161 st/s where the roleplay run logged
@@ -2433,22 +2446,26 @@ Lever 20 named a follow-up: "the same overlap is available without recomputing a
 submitting at layer boundaries on the dense path too." Measuring it turned into a lesson about
 measuring, which is the more useful half and is why this lever leads with it.
 
-**Background CPU load on this step is worth 2x, uniformly.** Same binary, same shape, same flags,
-same seed:
+**Whatever else is running on this box is worth 2x on this step.** Same binary, same shape, same
+flags, same seed:
 
-| arm           | quiet machine | with review agents running |
-| :------------ | ------------: | -------------------------: |
-| dense         |     113 tok/s |            54 and 58 tok/s |
-| `--recompute` |     248 tok/s |                  117 tok/s |
+| arm           | machine otherwise unloaded | with other work running |
+| :------------ | -------------------------: | ----------------------: |
+| dense         |                  113 tok/s |         54 and 58 tok/s |
+| `--recompute` |                  248 tok/s |               117 tok/s |
 
-That is 1.95x to 2.09x on the dense arm and 2.12x on the other. A 2x sensitivity to CPU contention
-is itself the evidence that the step is host-bound, which matters because the metric that used to
-carry that claim is discredited below. Nothing in the output says so either way: the run prints a
-plausible tok/s whatever else is on the machine.
+That is 1.95x to 2.09x on the dense arm and 2.12x on the other. **What the other work was is not
+established, and a draft of this lever said CPU with more confidence than the evidence carries.**
+Review agents were running, which is CPU. So, it turned out later, was a second agent session on
+this machine driving an unrelated ROCm job in bursts, which is the GPU. Which of the two moves the
+number, or whether both do, is unmeasured; the run set up to settle it timed out when the other
+session's job restarted mid-run, which is the lesson rather than an inconvenience. Nothing in the
+output says any of it: the run prints a plausible tok/s whatever else is on the machine.
 
 **The factor is not constant, and that is what actually corrupted the drafts.** If it were, ratios
 would survive it and three loaded A/Bs of one unchanged line would have agreed with each other. The
-54-versus-58 on one arm is the visible edge of the same variation. What the controls do establish is
+54-versus-58 on one arm is the visible edge of the same variation, and an intermittent GPU tenant is
+one thing that would produce exactly that. What the controls do establish is
 that the arms were the same work at different speeds: peak GPU reads 16227 MB in the quiet dense
 runs and in the loaded ones alike, and three separate builds (yesterday's HEAD, current main, the
 patched tree with the flag off) give 114, 110 and 113 quiet. So it is neither a config difference
@@ -2486,20 +2503,39 @@ beyond the 2.25x itself. `gpu_busy_percent` was tried as a discriminator and its
 this lever's own rule: the conditions they were taken under were not recorded. A draft blamed the
 98-100% they showed on the counter being pinned. It is not pinned. Sampled at 10 Hz for 30 s with
 no heavy workload on the device, it reads **mean 43.2%, median 17%, max 99%, min 0%** over 300
-samples, so it spans its range and lever 1c's 52.5% is a plausible reading rather than an artifact.
-Levers 1c, 19 and 20 stand on it.
+samples, so it spans its range and is not clipped at the top. The arm that would show it is
+LINEAR, back-to-back dispatches against an otherwise idle device, was not run: the other tenant took
+the GPU back first. "Idles about half the step" is a linearity claim and inherits that gap.
 
-**What it does not do is attribute.** It is a whole-device counter, and this box is shared. Every
-reading of 98-100% taken here coincided with another process holding `/dev/dri/renderD128`; the one
-reading of 76.6% did not. The check before quoting any of this is one command:
+**But that same arm is what stops 52.5% meaning what it looks like.** The counter reads 43.2% mean
+with NO training on the device at all, against lever 1c's 52.5% during a run, over 40 samples, on a
+distribution that runs 0 to 99 with a median of 17. Those two are not distinguishable at that
+sample size. What survives is the weaker and still sufficient reading: 52.5% is whole-device busy,
+so it is a CEILING on our trainer's share and the device really was idle for a good part of the
+wall clock. That carries "not GPU-bound" and it carries lever 19's "the added work lands in a gap
+that was already idle". It does not carry 52.5% as the trainer's utilization, and the rule below
+bites it as hard as it bites the 42%: neither reading records what else held the device.
+
+**What it does not do is attribute.** It is a whole-device counter, and this box is shared. The
+first calibration attempt read **mean 99.8% over 200 samples with our trainer not running at all**,
+and `fuser` showed why: a second agent session on this machine had the render node open for an
+unrelated ROCm job. That is the one reading here with a verified device record, and it is what the
+attribution rests on.
+
+The rest is weaker and is offered as a hypothesis rather than a finding: the 98-100% readings taken
+during training look like that same tenant, and the one 76.6% reading looks like its absence. Only
+that one arm's device state was ever checked with `fuser`, so those are retro-inferences from the
+counter, which is the thing under suspicion. The check that would have settled it is one command:
 
 ```
 fuser -v /dev/dri/renderD128
 ```
 
-which on this machine routinely lists a compositor, an idle `llama-server`, and, during this work, a
-second agent session running an unrelated ROCm job in bursts. Nothing in `gpu_busy_percent` tells
-our trainer's share apart from theirs.
+which on this machine routinely lists a compositor, an idle `llama-server`, and, during this work,
+that second session's job. Nothing in `gpu_busy_percent` tells our trainer's share apart from
+theirs. The 43.2% calibration above was taken with `fuser` listing only the compositor and the idle
+`llama-server`, checked before and after; that is the standard the rest of the readings here do not
+meet.
 
 **That forces a correction to the paragraph above.** It attributes the 2x throughput swing to CPU
 contention from review agents, because that is what was known to be running. At least one other
@@ -2511,7 +2547,12 @@ control has to be verified rather than assumed, before and after.
 
 So the rule this lever leaves behind is not "run it quiet", which is unfalsifiable, but: record what
 else held the CPU and the render node, check both at the start and the end of the run, and treat any
-number without that record as unusable. That includes the `~42%` in this file's summary table and
+number without that record as unusable.
+
+Read literally that voids this lever's own tok/s figures too, which have no such record. They
+survive on something the counter readings cannot offer: they come from the trainer's own output
+rather than a shared counter, and three independent builds agree within 3.6% (114, 110, 113). A
+single unlabelled reading of a whole-device counter has neither property. That includes the `~42%` in this file's summary table and
 the `~58%` idle figure derived from it, whose device conditions are not recorded; principle 1's
 claim survives on lever 1c's 52.5%, which is labelled uncontended, and is restated off that.
 
