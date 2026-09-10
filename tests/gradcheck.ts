@@ -720,8 +720,11 @@ async function main() {
     // So the oracle is computed here and `kept` is written out as a literal
     // rather than derived, which is what makes this fail when the helper counts
     // the ignored row (or returns T) and pass otherwise.
+    // Its own seed rather than the shared `rng`: drawing T*V from that stream
+    // would shift every case below this one onto different inputs, and a new
+    // test should not quietly re-roll the ones it was inserted above.
     const T = 4, V = 9, K = 2;
-    const logits = randTensor([T, V], rng);
+    const logits = randTensor([T, V], mulberry32(0x5f7a));
     const ids = [1, 4, -1, 0, 7, 2, 3, 3];
     const q = [0.6, 0.3, 0.0, 0.0, 0.5, 0.2, 0.25, 0.25];
     const kept = 3; // rows 0, 2 and 3; row 1 carries the -1 marker

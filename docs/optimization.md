@@ -2169,15 +2169,21 @@ right denominator; what it drops is the validation.
 nobody designed: two independently written counts, compared through a parity case that carries
 ignored rows, are unlikely to be identically wrong. One shared count scales the CPU and GPU losses
 together, so the parity cases go on passing. Measured rather than assumed: with `keptTeacherRows`
-changed to `return T`, the entire suite exits 0.
+changed to `return T`, and before the case below existed, the entire suite exited 0.
 
-That is #82's hazard, and #82 already carries the warning, at the top of its own oracle: "The oracle
-is computed here rather than taken from either loss: both draw their denominator from the helper, so
-comparing them to each other would agree on a wrong kept count." It shipped `chunked summed NLL` to
-close it. This ships `softCE summed NLL`, the same shape for the soft-target loss: a CPU-only case
-whose expected value is computed in the test and whose `kept` is written out as the literal 3 rather
-than derived. `return T` fails it and only it, at `maxAbs=1.44e+0`, and so does moving the `kept++`
-above the ignore-marker `continue`.
+The repo already carries the warning, over the oracle that answers it. `chunked summed NLL` came in
+with #51 and the sentence above it with #62: "The oracle is computed here rather than taken from
+either loss: both draw their denominator from the helper, so comparing them to each other would
+agree on a wrong kept count." (#82 gets the credit for this in a first draft of this lever and
+deserves none of it; it never touched `gradcheck.ts`.) This ships `softCE summed NLL`, the same
+shape for the soft-target loss: a CPU-only case whose expected value is computed in the test and
+whose `kept` is written out as the literal 3 rather than derived. `return T` fails it and only it,
+at `maxAbs=1.67e+0`, and so does moving the `kept++` above the ignore-marker `continue`, which for
+this input is the same mutation: one ignored row means both return `T`. Separating them needs a case
+with two.
+
+The case takes its own seed rather than the shared `rng`, so it does not shift every case below it
+onto different inputs.
 
 The `T`-divisor mutation still has its own job, and it is a different one. Replacing the GPU divisor
 with `T` fails the parity cases at `gpu=2.3589 cpu=3.1453`, a ratio of exactly 3/4: that catches a
