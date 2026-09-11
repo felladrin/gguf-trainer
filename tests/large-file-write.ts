@@ -27,8 +27,6 @@
 
 import { chunkSpans, readFileBytes, WRITE_CHUNK_BYTES, writeFileBytes } from "../src/io.ts";
 
-// node:fs and node:os rather than the Deno globals: `deno task test:node` runs
-// this file too, and src/io.ts exists precisely to keep the tree runtime-neutral.
 const fs = await import("node:fs");
 const os = await import("node:os");
 // A private directory, not counter-named files in a shared /tmp: those collide
@@ -37,9 +35,7 @@ const os = await import("node:os");
 const tmpDir = fs.mkdtempSync(`${os.tmpdir()}/gguf-trainer-io-`);
 let tmpSeq = 0;
 const tmpPath = () => `${tmpDir}/${tmpSeq++}.bin`;
-const envVar = (k: string): string | undefined =>
-  // deno-lint-ignore no-explicit-any
-  (globalThis as any).Deno?.env?.get(k) ?? (globalThis as any).process?.env?.[k];
+const envVar = (k: string): string | undefined => Deno.env.get(k);
 
 let failures = 0;
 
@@ -187,33 +183,17 @@ async function bigWrite(): Promise<void> {
   }
 }
 
-// deno-lint-ignore no-explicit-any
-const argv: string[] = (globalThis as any).Deno?.args ??
-  // deno-lint-ignore no-explicit-any
-  ((globalThis as any).process?.argv ?? []).slice(2);
-// deno-lint-ignore no-explicit-any
-const isDeno = !!(globalThis as any).Deno;
-
-if (argv.includes("--big-child")) {
+if (Deno.args.includes("--big-child")) {
   await bigWrite();
 } else if (envVar("GGUF_TRAINER_BIG_IO") !== "1") {
   console.log("  ..  large-write case skipped (set GGUF_TRAINER_BIG_IO=1 to run it)");
-} else if (!isDeno) {
-  // Node's readFileSync throws ERR_FS_FILE_TOO_LARGE above 2^31 - 1 (measured on
-  // v26.8.1, at 2.2 GB as well as 4.4 GB), so the readback would fail for a
-  // reason that has nothing to do with the defect. A false FAIL is worse than a
-  // skip here, because this wrapper exists so that a FAIL means the write ran
-  // away. The CLI is Deno-only, so nothing real is uncovered.
-  console.log("  ..  large-write case skipped on Node (readFileSync caps at 2^31)");
 } else {
   const { spawnSync } = await import("node:child_process");
   const { fileURLToPath } = await import("node:url");
-  // deno-lint-ignore no-explicit-any
-  const g = globalThis as any;
   // fileURLToPath, not URL.pathname: the latter leaves percent-escapes in, so a
   // checkout under a path with a space would send the child somewhere else.
   const self = fileURLToPath(import.meta.url);
-  const cmd = [g.Deno.execPath(), "run", "-A", self, "--big-child"];
+  const cmd = [Deno.execPath(), "run", "-A", self, "--big-child"];
   // The command travels in argv via "$@" rather than interpolated into the
   // script, so quoting never enters into it; the shell is only here for
   // `ulimit`, which is a builtin. The unit is 512-byte blocks in dash and 1024

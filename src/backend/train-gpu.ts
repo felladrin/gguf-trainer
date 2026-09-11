@@ -117,7 +117,7 @@ export interface TrainGpuResidentOpts {
    * probability `injectFrac`. Used to fold a little instruct/ChatML data into the
    * cooldown so the base emerges more instructable. All unset -> no injection and
    * the rng stream is byte-identical to before (the decision rng() is only drawn
-   * when injection is actually active), so CPU/GPU parity is unaffected.
+   * when injection is actually active), so kernel parity is unaffected.
    */
   injectSource?: TokenSource;
   injectFrac?: number; // 0..1 probability per micro-batch during the window

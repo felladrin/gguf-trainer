@@ -6,7 +6,7 @@
 // on load and on export.
 //
 // This check exists because the defect it guards is silent. Greedy generation
-// still reads fine with the wrong order, and the CPU and GPU backends agree with
+// still reads fine with the wrong order, and the reference and GPU backends agree with
 // each other because they share the path, so neither gpu-parity nor gradcheck sees
 // it. The way it showed up was a base checkpoint scoring ppl 5.73 on "The cat sat
 // on the mat." repeated 400 times, against llama.cpp's 1.006 on the same file.

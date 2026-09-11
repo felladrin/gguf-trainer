@@ -1,6 +1,6 @@
 // Held-out validation loss for a pretrain checkpoint: the trend signal the
 // per-step training loss can't give you (that's a single noisy batch) and the
-// parity probe was never meant to be (it's a 16-token GPU-vs-CPU trust gate).
+// parity probe was never meant to be (it's a 16-token trust gate at init).
 //
 // Scores a GGUF checkpoint on a FIXED, seeded set of windows drawn from a token
 // stream: same seed -> same windows every run, so the mean loss is directly
@@ -39,8 +39,7 @@ import {
 } from "../data/tokens.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
-import { initWebGPU, noGpuNote } from "../backend/webgpu.ts";
-import type { WebGPUBackend } from "../backend/webgpu.ts";
+import { requireGPU } from "../backend/webgpu.ts";
 
 function die(msg: string): never {
   throw new UsageError(msg);
@@ -53,7 +52,6 @@ async function run(v: Values) {
   const seqLen = v.num("seq-len");
   const holdout = v.num("holdout");
   const seed = v.num("seed");
-  const useCpu = v.bool("cpu");
   if (!(holdout > 0 && holdout <= 1)) die(`--holdout must be in (0, 1], got ${holdout}`);
   const lossChunk = v.num("loss-chunk");
   // Before the checkpoint read: a typo'd width should not cost a multi-GB load.
@@ -113,16 +111,9 @@ async function run(v: Values) {
   const rng = mulberry32(seed);
   const starts = Array.from({ length: windows }, () => lo + Math.floor(rng() * (hi - lo)));
 
-  let gpu: WebGPUBackend | null = null;
-  if (!useCpu) {
-    gpu = await initWebGPU();
-    if (gpu) {
-      gpu.install();
-      gpu.uploadParams(model.params());
-    } else {
-      console.log(noGpuNote());
-    }
-  }
+  const gpu = await requireGPU("eval-loss");
+  gpu.install();
+  gpu.uploadParams(model.params());
 
   let sum = 0;
   try {
@@ -130,11 +121,11 @@ async function run(v: Values) {
       const inputs = src.window(start, seqLen);
       const targets = src.window(start + 1, seqLen);
       const loss = sequenceLoss(model, inputs, targets, lossChunk);
-      if (gpu) await gpu.sync([loss]); // recycles this window's transients too
+      await gpu.sync([loss]); // recycles this window's transients too
       sum += loss.data[0];
     }
   } finally {
-    if (gpu) gpu.uninstall();
+    gpu.uninstall();
     src.close();
   }
 
@@ -204,9 +195,8 @@ optimistic; pass a separate token file with --holdout 1 for a true generalizatio
       default: 0,
       placeholder: "N",
       describe:
-        "stream the readout and the loss in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way to score a large-vocab model at long context (0 = dense). Pointless with --cpu, where there is no binding limit and the chunked path costs an extra pass over the readout",
+        "stream the readout and the loss in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way to score a large-vocab model at long context (0 = dense)",
     },
-    { name: "cpu", type: "boolean", describe: "force the CPU forward pass instead of WebGPU" },
   ],
   run: run,
 };

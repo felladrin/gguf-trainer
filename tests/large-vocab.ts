@@ -408,7 +408,7 @@ ok(
   // measured below.
   await stampTokenFile(wOnly, a.export(), a.vocabSize, 2);
 
-  // The asymmetry lever 38 spends a paragraph defending: a different tokenizer
+  // The asymmetry the tokenizer stamp exists for: a different tokenizer
   // of the same width is refused by the full check and passed by the width one.
   // Without this, "improving" the width path to hash the tokenizer would refuse
   // correct corpora in eval-loss with the suite green.

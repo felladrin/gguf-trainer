@@ -23,12 +23,7 @@ import {
   rmsNorm,
   Tensor,
 } from "../model/autograd.ts";
-import {
-  initWebGPU,
-  type KernelTime,
-  type WebGPUBackend,
-  webgpuRuntime,
-} from "../backend/webgpu.ts";
+import { type KernelTime, requireGPU, type WebGPUBackend } from "../backend/webgpu.ts";
 
 const SUITES = ["attention", "gemm", "ce", "norm", "all"] as const;
 
@@ -243,14 +238,7 @@ function buildCases(v: Values): Case[] {
 }
 
 async function run(v: Values) {
-  const gpu = await initWebGPU();
-  if (!gpu) {
-    throw new Error(
-      webgpuRuntime() === "no-runtime"
-        ? "no WebGPU: bench needs Deno (Node and Bun have no GPU backend here)"
-        : "no GPU adapter found, and bench times GPU kernels, so there is nothing to time",
-    );
-  }
+  const gpu = await requireGPU("bench");
   const cases = buildCases(v);
   if (cases.length === 0) throw new Error(`--suite ${v.str("suite")} selected no cases`);
   const iters = v.num("iters");

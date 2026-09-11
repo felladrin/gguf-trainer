@@ -56,7 +56,7 @@ import type { IdArray } from "../data/tokens.ts";
 import type { TokenSource } from "../data/tokens.ts";
 import { parseQuantList } from "../gguf/quantize.ts";
 import type { QuantName } from "../gguf/quantize.ts";
-import { initWebGPU, webgpuRuntime } from "../backend/webgpu.ts";
+import { requireGPU } from "../backend/webgpu.ts";
 import type { WebGPUBackend } from "../backend/webgpu.ts";
 import { deserializeOptState, MuonGpu, serializeOptState } from "../backend/muon-gpu.ts";
 import { trainLMGpuResident } from "../backend/train-gpu.ts";
@@ -97,7 +97,7 @@ const SAMPLE_PROMPTS = [
  * The trust gate's GPU half: forward the dense loss and, when --loss-chunk is
  * on, the chunked one, then read both back in a single sync.
  *
- * The op that runs every step is not the one the CPU side checks, so this checks
+ * The op that runs every step is not the one the reference side checks, so this checks
  * it too: at 16 tokens the dense side still fits whatever the run's seq-len would
  * have blown, and this exercises every FORWARD span offset at the real vocab
  * before the run starts. Only forward: the probe never calls backward, so the
@@ -368,20 +368,7 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     : [];
 
   console.log(`=== ${mode}: ${arch.name} -> GGUF ===\n`);
-  const gpu = await initWebGPU();
-  // Two different causes, and the old message only described the first, so a
-  // Deno user on a machine without a GPU was told to use Deno.
-  if (!gpu) {
-    die(
-      webgpuRuntime() === "no-runtime"
-        ? "no WebGPU: training needs Deno (Node and Bun have no GPU backend here)"
-        : "no GPU adapter found, and training needs one. There is no CPU training path, " +
-          "and that is a refusal rather than a gap: the CPU backend is the correctness oracle " +
-          "the GPU kernels are checked against, and it is orders of magnitude short of usable " +
-          "at a real size (docs/correctness.md lever 36 has the measurements). For CPU " +
-          "fine-tuning, use transformers with peft.",
-    );
-  }
+  const gpu = await requireGPU("training");
   console.log("Device:");
   for (const line of gpu.describeDevice()) console.log(line);
 
@@ -498,9 +485,9 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
   const scanned = assertCorpusFitsVocab(src, cfg.vocabSize, srcPath);
   console.log(`Vocab fit: ${(scanned / 1e6).toFixed(1)}M tokens under ${cfg.vocabSize} ✓`);
 
-  // Trust gate: GPU forward+loss must match the CPU reference at init.
+  // Trust gate: GPU forward+loss must match the reference at init.
   const probeIn = src.window(0, 16), probeTgt = src.window(1, 16);
-  const cpuLoss = crossEntropy(model.forward(probeIn), probeTgt).data[0];
+  const refLoss = crossEntropy(model.forward(probeIn), probeTgt).data[0];
   const { gpuLoss, fusedLoss } = await probeGpuLosses(
     gpu,
     model,
@@ -509,13 +496,13 @@ async function run(v: Values, mode: "pretrain" | "finetune") {
     probeTgt,
     lossChunk,
   );
-  const drift = Math.abs(gpuLoss - cpuLoss);
+  const drift = Math.abs(gpuLoss - refLoss);
   console.log(
-    `Parity probe: CPU ${cpuLoss.toFixed(4)} vs GPU ${gpuLoss.toFixed(4)} (|Δ|=${
+    `Parity probe: reference ${refLoss.toFixed(4)} vs GPU ${gpuLoss.toFixed(4)} (|Δ|=${
       drift.toExponential(1)
     })`,
   );
-  if (drift > 1e-3 + 1e-3 * Math.abs(cpuLoss)) die("GPU/CPU parity probe failed");
+  if (drift > 1e-3 + 1e-3 * Math.abs(refLoss)) die("parity probe failed");
   if (flags.has("recompute") && gpu.regionCount() === 0) {
     // Matches how --loss-chunk refuses an architecture without forwardToReadout
     // (lossChunkModelError in src/train/loss.ts): the flag would otherwise print

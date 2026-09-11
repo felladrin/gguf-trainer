@@ -11,7 +11,7 @@
 #
 # Score the WHOLE series and rank it. Do not fit a slope through it and do not read
 # a turn at a phase boundary as evidence about the phase: both were tried on the
-# LittleLamb run and both were wrong (docs/optimization.md levers 16 and 16b).
+# LittleLamb run and both were wrong (docs/evaluation.md, "Picking a checkpoint").
 #
 # Appends as it goes, so a killed run still leaves what it measured.
 set -euo pipefail

@@ -89,7 +89,7 @@ interface Layer {
  * a head's dimension order carries meaning.
  *
  * Getting this wrong is quiet rather than loud. Greedy generation still reads
- * fine because the argmax survives, and the CPU and GPU backends agree with each
+ * fine because the argmax survives, and the reference and GPU backends agree with each
  * other because they share the bug. What breaks is anything that needs an exact
  * match to earlier context: the base checkpoint scored ppl 5.73 on "The cat sat
  * on the mat." repeated 400 times, where llama.cpp scored 1.006 on the same file.

@@ -3,7 +3,7 @@
 // own convention and correct, on `/v1/chat/completions` it is the defect. A
 // scorer that merges them reports whichever conclusion its bucket boundary
 // happens to draw, which is exactly how the roleplay battery was misread twice
-// (docs/optimization.md, lever 16).
+// (docs/evaluation.md, "Behavioural probes, and how they break").
 //
 // Run:  deno run tests/endpoint-score.ts
 import { scoreChat, scoreRaw, stoppedOnEos } from "../scripts/eval-endpoints.ts";

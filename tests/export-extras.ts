@@ -13,7 +13,7 @@ import { addMatrix, addVector, tensorLoader } from "../src/arch/common.ts";
 import { GGUFWriter, readGGUF } from "../src/gguf/gguf.ts";
 import { Tensor } from "../src/model/autograd.ts";
 import { llamaRunScript } from "../src/export/export-gguf.ts";
-import { guardBufferSize, initWebGPU, noGpuNote, webgpuRuntime } from "../src/backend/webgpu.ts";
+import { guardBufferSize, initWebGPU, requireGPU } from "../src/backend/webgpu.ts";
 import { gemma3Config } from "../src/arch/gemma3.ts";
 import { stepCheckpointPath } from "../src/commands/pretrain.ts";
 import { lossChunkModelError, lossChunkValueError, MAX_LOSS_SPANS } from "../src/train/loss.ts";
@@ -230,25 +230,19 @@ for (
   );
 }
 
-// initWebGPU returns null for two different reasons, and until now every caller
-// reported only the first. A Deno user on a machine with no GPU was told that
-// training needs Deno. webgpuRuntime is what tells them apart, and it is the
-// test a caller can apply after the fact. initWebGPU does not consult it: the
-// wrapper around its adapter request already covers that exit.
+// No adapter is a stop, not a stack trace: initWebGPU has to return null for
+// every shape of broken navigator, and requireGPU has to turn that null into a
+// message naming what needed the device.
 {
   // deno-lint-ignore no-explicit-any
   const g = globalThis as any;
-  // The descriptor, not the value: `navigator` is an accessor on the global in
-  // both runtimes, so restoring it as a plain data property would leave
-  // something subtly different behind.
+  // The descriptor, not the value: `navigator` is an accessor on the global, so
+  // restoring it as a plain data property would leave something subtly
+  // different behind.
   const saved = Object.getOwnPropertyDescriptor(g, "navigator");
   const set = (v: unknown) =>
     Object.defineProperty(g, "navigator", { value: v, configurable: true });
   try {
-    set(undefined);
-    eq(webgpuRuntime(), "no-runtime", "no navigator at all is a runtime problem");
-    set({});
-    eq(webgpuRuntime(), "no-runtime", "a navigator without .gpu is too: Node has one");
     // initWebGPU must return null rather than throw for every shape of broken
     // navigator that fails at or before requestAdapter, since a throw is the
     // stack trace this whole change exists to replace. A junk adapter that gets
@@ -287,18 +281,18 @@ for (
         `initWebGPU returns null rather than throwing: navigator ${label}`,
       );
     }
-    set({ gpu: {} });
-    eq(webgpuRuntime(), "ok", "a navigator with .gpu is a runtime that could have an adapter");
-    // Which is the whole point: "ok" here plus a null from initWebGPU means the
-    // machine has no adapter, not that the runtime is wrong.
+    // The purpose is in the message because the same null reaches five
+    // commands, and "no GPU adapter found" alone does not say which one stopped.
+    set({ gpu: { requestAdapter: () => null } });
+    let message = "";
+    try {
+      await requireGPU("training");
+    } catch (e) {
+      message = (e as Error).message;
+    }
     ok(
-      noGpuNote().includes("no GPU adapter found"),
-      `the fallback note names the adapter when the runtime is fine, got ${noGpuNote()}`,
-    );
-    set({});
-    ok(
-      noGpuNote().includes("no WebGPU in this runtime"),
-      `and names the runtime when that is what is missing, got ${noGpuNote()}`,
+      message.includes("no GPU adapter found") && message.includes("training"),
+      `requireGPU names the adapter and the purpose, got ${JSON.stringify(message)}`,
     );
   } finally {
     if (saved) Object.defineProperty(g, "navigator", saved);

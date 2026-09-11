@@ -1,7 +1,7 @@
 // GPU-resident Muon: the exact math of ../train/muon.ts (momentum, optional
 // Nesterov, quintic Newton–Schulz, sqrt(rows/cols) scaling) expressed as GPU
 // dispatches, so Muon-group weights, momentum, and gradients never cross the
-// PCIe/host boundary during training. The CPU implementation is the spec; the
+// PCIe/host boundary during training. The reference implementation is the spec; the
 // only differences here are f32 accumulation order (GEMM tiles, tree
 // reductions), which the parity gates in tests/gpu-parity.ts bound.
 //
@@ -114,7 +114,7 @@ fn main(@builtin(local_invocation_id) li: vec3<u32>) {
 /**
  * X = (flip ? Uᵀ : U) / (frob + 1e-7): move U ([m,n]) into the Newton–Schulz
  * working orientation (smaller first dim) and Frobenius-normalize, exactly as
- * the CPU newtonSchulz() prologue.
+ * the reference newtonSchulz() prologue.
  */
 function srcNormalize(m: number, n: number, flip: boolean): string {
   // When flipped X is [n,m], so X[row,col] = U[col,row] = UB[col*n + row].
@@ -164,7 +164,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /**
  * W ← W − LR·scale·ortho, reading ortho straight out of X (transposing back on
- * the fly when the NS ran flipped): the CPU path's final transpose + update
+ * the fly when the NS ran flipped): the reference path's final transpose + update
  * fused into one pass. The shape-static scale (sqrt(max(1, rows/cols))) is
  * baked; the learning rate comes from a 1-element buffer so a WSD schedule can
  * update it every step without rebuilding the pipeline (all Muon params share
@@ -268,7 +268,7 @@ export async function newtonSchulzGpu(
   const ns = allocNs(gpu, m, n, gpu.buffersFor(src).data);
   for (const op of buildNewtonSchulz(gpu, ns, m, n, steps)) op();
   // scale=1 (no rows/cols factor here: return raw orthogonalization to match
-  // the CPU newtonSchulz output), lr=-1 so W(=0) − lr·ortho = +ortho.
+  // the reference newtonSchulz output), lr=-1 so W(=0) − lr·ortho = +ortho.
   const lr = gpu.createStateBuffer(4);
   gpu.writeStateBuffer(lr, Float32Array.of(-1));
   gpu.prepareDispatch(

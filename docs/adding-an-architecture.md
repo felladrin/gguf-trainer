@@ -151,7 +151,7 @@ Registering an architecture enrolls it in:
 
 What you do NOT get automatically is a GPU parity check of a _new op_. The existing ops are already
 covered in `tests/gpu-parity.ts`; if your architecture needs an op that does not exist yet, that op
-needs a CPU implementation, a WGSL kernel, and a parity entry before your architecture will train on
+needs a reference implementation, a WGSL kernel, and a parity entry before your architecture will train on
 the GPU.
 
 ## When your architecture needs a new operation
@@ -163,7 +163,7 @@ than the arch file:
 1. Implement it in `src/model/autograd.ts`, forward and backward, and add it to `OpsBackend`.
 2. Add a finite-difference check in `tests/gradcheck.ts`.
 3. Write the WGSL kernel in `src/backend/`, forward and backward.
-4. Add a GPU-vs-CPU parity entry in `tests/gpu-parity.ts`.
+4. Add a parity entry in `tests/gpu-parity.ts`.
 5. Then write the arch file.
 
 **Worked example, the hybrid conv models** (LFM2 and friends): they interleave short causal

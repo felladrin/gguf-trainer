@@ -1,11 +1,13 @@
 # Measurements
 
-Logs that a `docs/optimization.md` or `docs/correctness.md` lever quotes numbers from. Everything the trainer writes lands
-in `out/`, which is gitignored, so a lever citing `out/whatever.log` is unverifiable to anyone who
-was not at the machine. These are the copies that make the levers checkable.
+Logs that a number in `docs/` was read from. Everything the trainer writes lands
+in `out/`, which is gitignored, so a claim citing `out/whatever.log` is unverifiable to anyone who
+was not at the machine. These are the copies that make those claims checkable.
 
 Small and append-only. A file here should be the raw tool output, not a summary: the point is that
-a reader can recompute the lever's arithmetic rather than trust the lever's arithmetic.
+a reader can recompute the arithmetic rather than trust it. That also means a log quotes the script
+and the docs as they were on the day it ran, so a path inside one may no longer exist. The logs are
+not edited to keep up; that would make them summaries.
 
 | File                                 | What produced it                                                                                                                       |
 | :----------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------- |
@@ -17,7 +19,7 @@ a reader can recompute the lever's arithmetic rather than trust the lever's arit
 | `lambrp-cooldown-counterfactual.log` | `scripts/score-counterfactual.sh`, the same eval-loss knobs over both counterfactual arms at their eight matched steps                 |
 | `lambrp-cf-arm-cooldown.log`         | arm A of `scripts/counterfactual-cooldown.sh`, whose header carries the schedule the arm actually ran                                  |
 | `lambrp-cf-arm-flat.log`             | arm B of the same script, kept because its header is the proof its cooldown starts past the stop                                       |
-| `smolrp-cross-engine.log`            | `scripts/cross-engine-check.sh` plus the held-out line and both greedy continuations, all AFTER the lever-17 fix                       |
+| `smolrp-cross-engine.log`            | `scripts/cross-engine-check.sh` plus the held-out line and both greedy continuations, all AFTER the RoPE-layout fix                    |
 | `smolrp-holdout.log`                 | `eval-loss --holdout 1 --windows 64 --seq-len 1024 --seed 1234` over every SmolLM2-135M-Heretic-RP snapshot and the base               |
 | `smolrp-train.log`                   | the run's own header and per-step loss lines, from `finetune`                                                                          |
 | `smolrp-corpus-build.log`            | `scripts/build-rp-chats.ts`, the per-source document counts the model card's corpus table reads from                                   |
@@ -29,9 +31,9 @@ a reader can recompute the lever's arithmetic rather than trust the lever's arit
 | `smolrp-eval-choice.log`             | `eval-choice --limit 500` on four tasks, base and released checkpoint                                                                  |
 
 The battery's raw completions are not here: 216 files of model output is too much to carry in a
-repo, and the two tables above are what the lever reads. Regenerate them with
+repo, and the two tables above are what the docs read. Regenerate them with
 `scripts/eval-rp-completions.sh` if you need the text.
 
-`smolrp-cross-engine.log` only carries the AFTER row of lever 17's table. The before row cannot be
+`smolrp-cross-engine.log` only carries the AFTER row of the cross-engine table. The before row cannot be
 regenerated without reverting the fix, which is the honest state of it: revert
 `src/arch/llama.ts`'s `reorderQK` call sites and re-run the same script to reproduce it.

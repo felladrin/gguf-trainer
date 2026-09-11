@@ -644,7 +644,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * moves, so the [Hq,T,T] probability matrix is never materialized. The only
  * side product is the per-row logsumexp (O(Hq·T)), from which backward
  * recomputes any probability as exp(score − LSE). The final m/l equal the
- * two-pass CPU values mathematically; only summation-order float noise
+ * two-pass reference values mathematically; only summation-order float noise
  * differs. HD is baked per pipeline, so the private arrays are static.
  *
  * Deliberately NOT staged through workgroup memory: consecutive threads are
@@ -1050,7 +1050,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     for (var j = 0u; j < K; j++) {
       let q = TQ[t * K + j];
       // A row shorter than K pads with a zero-weight id. Skipping it keeps
-      // 0 * -inf from turning the row into NaN, and matches the CPU reference.
+      // 0 * -inf from turning the row into NaN, and matches the reference.
       if (q != 0.0) {
         acc = acc - q * (LOG[base + TID[t * K + j]] - m);
         mass = mass + q;

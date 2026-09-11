@@ -4,7 +4,7 @@
 // gradients back to its inputs. backward() runs a topological sort from a
 // scalar loss and calls each recorded closure once.
 //
-// This is the CPU reference backend. It implements exactly the ops a
+// This is the reference implementation. It implements exactly the ops a
 // Gemma3ForCausalLM forward pass needs, no more. A WebGPU backend (see
 // ../backend/webgpu.ts) is meant to implement the same op set with GPU
 // kernels behind the same Tensor interface.
@@ -96,8 +96,8 @@ export function backward(loss: Tensor, seed = 1) {
 // Backend dispatch. A GPU backend (../backend/webgpu.ts) can take over the op
 // set by registering itself here; the model and trainer keep calling the same
 // functions. The backend must implement ALL ops: mixing backends inside one
-// graph would make CPU ops read device-resident data that hasn't synced back.
-// With no backend registered (the default), the reference CPU code below runs.
+// graph would make host ops read device-resident data that hasn't synced back.
+// With no backend registered (the default), the reference code below runs.
 // ---------------------------------------------------------------------------
 
 export interface OpsBackend {
@@ -152,7 +152,7 @@ export interface OpsBackend {
 
 /**
  * Optional backend capability behind `checkpoint()`. Kept off `OpsBackend`,
- * which is the op set and must be implemented in full: the CPU reference needs
+ * which is the op set and must be implemented in full: the reference needs
  * none of this, because dropping the tape is enough for the garbage collector
  * to reclaim an intermediate. On a device backend it is not, since the buffers
  * are held by the backend rather than by the tensors.
@@ -734,7 +734,7 @@ export function attention(
  * checked, in one place ABOVE the backend dispatch, and the denominator both
  * implementations divide by rather than each counting their own (#93).
  *
- * The two implementations carried the shape guards verbatim and only the CPU one
+ * The two implementations carried the shape guards verbatim and only the reference one
  * carried the id check, which is the omission the below-dispatch style invites
  * and was #61: `teacherIds` reached the kernel unvalidated, so an id built
  * against a different vocab indexed whatever the bound buffer held.
@@ -744,11 +744,11 @@ export function attention(
  * `keptRowsInVocab` gives: `uploadU32` maps `-1` to `0xffffffff`, the marker the
  * kernels test for, while `-2` becomes a huge id and `-0.5` becomes 0. Skipping
  * the row on `< 0` would leave exactly the inputs this exists to catch
- * unchecked, with the CPU dropping the row and the GPU scoring it.
+ * unchecked, with the reference dropping the row and the GPU scoring it.
  *
  * Inside a kept row all k ids must be in range, including the slots a row
  * shorter than k pads at probability 0. Only the FORWARDS skip a pad, both on
- * `q == 0`; both backwards index by its id unconditionally. On the CPU that is a
+ * `q == 0`; both backwards index by its id unconditionally. In the reference that is a
  * no-op, `x -= 0` writing back what it read. On the GPU it is a non-atomic
  * read-modify-write (`DLOG[i] = DLOG[i] - scale * TQ[...]` in srcSoftCeBwdQ), so
  * an out-of-range pad id lands in another row and can lose that row's real
@@ -794,7 +794,7 @@ export function keptTeacherRows(
  * Every embedding id must be a row of the table.
  *
  * `weight.data[id * d + j]` with `id >= V` reads into the next row, or past the
- * array on the last one. Measured at V=4, d=3 with an id of `V + 2`: the CPU
+ * array on the last one. Measured at V=4, d=3 with an id of `V + 2`: the reference
  * returns `[NaN, NaN, NaN]`, which poisons the whole forward, and the GPU
  * returns `[0, 0, 0]`, because the bound buffer discards the read. Neither
  * stops, and the GPU's substituted zero row is the worse of the two, since the
@@ -807,7 +807,7 @@ export function keptTeacherRows(
  * `fusedCrossEntropy` does with its dimension, chunk and LoRA guards, and which
  * makes the omission the below-dispatch style invites unreachable: validate
  * under the dispatch and every implementation needs its own call, which is how
- * `softCrossEntropy` ended up checking its teacher ids on the CPU and not on
+ * `softCrossEntropy` ended up checking its teacher ids in the reference and not on
  * the GPU (#61).
  */
 export function assertIdsInTable(ids: number[], V: number, where: string): void {
@@ -855,12 +855,12 @@ export function assertMatrix(t: Tensor, name: string, where: string): void {
  * logits. Measured at T=3, V=6 with one kept row: both backends returned
  * 2.038443088531494, that row's logsumexp minus the following row's first logit
  * to f32. The last row is the only one where the two differ, and the GPU is the
- * worse of the pair there: the CPU reads past its array and gives NaN, while the
+ * worse of the pair there: the reference reads past its array and gives NaN, while the
  * GPU returns a finite, plausible number whose digits depend on pool state.
  *
  * Only `-1` is accepted as ignore, not every negative. `uploadU32` maps `-1` to
  * `0xffffffff`, the marker the kernels test for, but `-2` becomes `0xfffffffe`
- * (a huge target) and `-0.5` becomes `0`. The CPU would treat both as ignore
+ * (a huge target) and `-0.5` becomes `0`. The reference would treat both as ignore
  * while the GPU scored them, so the host count and the kernel would disagree.
  *
  * `targets.length` must equal `T`: the losses sum over `T` rows and divide by
@@ -931,7 +931,7 @@ export function crossEntropy(logits: Tensor, targets: number[]): Tensor {
       // prediction to -log(1e-12) = 27.63. Measured before the change: a gap of
       // 30 reported 27.54 against an exact 30, and a gap of 90 still reported
       // 27.63. The GPU kernel and `fusedCrossEntropy` were already computing it
-      // this way, so the CPU reference was the odd one out.
+      // this way, so the reference was the odd one out.
       total += Math.log(sum) + maxL - logits.data[b + targets[t]];
     }
   }
@@ -971,7 +971,7 @@ export function fusedCrossEntropy(
   targets: number[],
   chunk: number,
 ): Tensor {
-  // Validated ABOVE the backend dispatch, or these run on the CPU reference only
+  // Validated ABOVE the backend dispatch, or these run on the reference only
   // and every real run installs the GPU backend first.
   assertMatrix(hidden, "hidden", "fusedCrossEntropy");
   assertMatrix(w, "w", "fusedCrossEntropy");
@@ -991,7 +991,7 @@ export function fusedCrossEntropy(
         "path cannot apply. Put the readout in the aux param group, or use --loss-chunk 0.",
     );
   }
-  // Above the dispatch, and on the CPU side before the chunk loops rather than
+  // Above the dispatch, and on the reference side before the chunk loops rather than
   // after: an out-of-range target never falls inside any span, so `tgtLogit`
   // would stay 0 and the loss would be quietly wrong rather than NaN.
   const kept = keptRowsInVocab(targets, T, V, "fusedCrossEntropy");

@@ -3,8 +3,9 @@
 #
 #   bash scripts/cross-engine-check.sh out/some-base.gguf
 #
-# Every test suite in this repo is a self-consistency check: GPU against CPU,
-# analytic gradients against finite differences, export against re-import. A
+# Every test suite in this repo is a self-consistency check: the kernels against
+# the reference implementation, analytic gradients against finite differences,
+# export against re-import. A
 # forward pass that disagrees with llama.cpp passes all of them, because llama.cpp
 # is not one of the things they compare against. This is that missing comparison,
 # and it is the first thing to run when a downloaded checkpoint's loss looks wrong.
@@ -12,7 +13,7 @@
 # The probe is one sentence repeated 400 times. A model reading its own context
 # scores near zero on it; a model that is locally fluent but positionally broken
 # scores far above zero while still generating readable text, which is exactly the
-# failure that hid the `llama` RoPE row order (docs/optimization.md lever 17).
+# failure that hid the `llama` RoPE row order (docs/correctness.md).
 #
 # Requires llama-perplexity on PATH; override with LLAMA_PERPLEXITY=/path/to/it.
 set -euo pipefail
@@ -47,4 +48,4 @@ echo "Both should be near perplexity 1, and close to each other rather than equa
 echo "eval-loss scores every position in its window, llama-perplexity scores only the"
 echo "second half of each context, and the two tokenize the file differently. A ratio"
 echo "under about 1.5 is that. A ratio of 5 is a forward-pass disagreement, not a"
-echo "corpus problem: see docs/optimization.md lever 17."
+echo "corpus problem: see docs/correctness.md."
