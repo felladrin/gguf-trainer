@@ -77,8 +77,9 @@ const SCAN_CHUNK = 1 << 20;
  * Refuse a corpus that does not fit the checkpoint's vocab, at the point the
  * source opens rather than on whichever window happens to contain the id.
  *
- * The losses and the embedding refuse an out-of-range id themselves (levers 26,
- * 29 and 30), but they do it mid-run. `pretrain`'s trust gate only reads the
+ * The losses and the embedding refuse an out-of-range id themselves
+ * (docs/correctness.md, "Validate above the backend dispatch"), but they do it
+ * mid-run. `pretrain`'s trust gate only reads the
  * first 16 tokens, so a `.tokens` file built with the wrong tokenizer passes it
  * and the run can be tens of thousands of steps in before some later window
  * happens to hold a high id. Everything written up to that point trained on

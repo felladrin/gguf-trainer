@@ -1,7 +1,8 @@
-# Design notes & modern-technique roadmap
+# Design
 
-> Rationale and measurements behind the current design. Maintained: if something here contradicts
-> the code, the code is right and this is a bug.
+Why the engine is shaped the way it is: the decisions that are hard to reverse, each with the
+reasoning or the measurement behind it. If something here contradicts the code, the code is right
+and this is a bug.
 
 ## Why the "train directly in Q4_0" idea doesn't hold
 
@@ -24,12 +25,12 @@ hidden matmuls only**, and AdamW to embeddings, the output head, and all norms.
 Implemented: `src/train/muon.ts` (+ `adam.ts`). Both satisfy one `Optimizer` interface so the
 trainer is agnostic.
 
-## Techniques worth adopting (prioritized)
+## What is in, and why
 
-Sourced from the nanoGPT speedrun lineage and 2025 large-scale training reports. Ranked by payoff
-for a small from-scratch Gemma3 on a WebGPU budget.
+Drawn from the nanoGPT speedrun lineage and 2025 large-scale training reports, ranked by payoff for
+a small from-scratch model on a WebGPU budget.
 
-**Already in this repo (they're part of Gemma3):** QK-norm, dual local/global RoPE, GeGLU, GQA,
+**Inherited from Gemma3 itself:** QK-norm, dual local/global RoPE, GeGLU, GQA,
 RMSNorm + sandwich norms (post-attention / post-FFN), tied embeddings, and per-layer sliding-window
 attention.
 
@@ -57,7 +58,8 @@ attention.
    `setLrScale()` on both groups (Muon + aux AdamW) each step. `MuonGpu` holds `lr` in a 1-element
    device buffer that `setLrScale()` rewrites, no WGSL constant baked, so the apply pipelines are
    built once and the schedule costs a 4-byte upload per step. Gated by `wsdScheduleParity`
-   (GPU-buffer lr vs CPU) in `tests/gpu-parity.ts` and a shape self-check in `tests/gradcheck.ts`.
+   (GPU-buffer lr vs the reference) in `tests/gpu-parity.ts` and a shape self-check in
+   `tests/gradcheck.ts`.
    Its payoff is on long runs where constant lr plateaus; the 40-step demos leave it off (the
    cooldown only costs final loss when the model is still descending steeply).
 4. **MuonClip / QK-logit control**: done, adapted for QK-norm. `src/train/qk-clip.ts`
@@ -68,14 +70,14 @@ attention.
    the real lever (per-layer, since `qNorm`/`kNorm` are shared across a layer's heads). The proxy is
    the std of a QK-normed logit; measured (T=128) the observed causal max tracks ~3.3–4.4× it and is
    monotone, so bounding `s` bounds the max. Opt-in via `qkClipTau` on all three training loops;
-   host-side weight math, so CPU and GPU apply it identically. Gated by `qkClipTrajectoryParity` in
+   host-side weight math, so both paths apply it identically. Gated by `qkClipTrajectoryParity` in
    `tests/gpu-parity.ts` and a unit check in `tests/gradcheck.ts`. Off by default: QK-norm is the
    primary guard; this is the belt-and-suspenders for scaling up.
 5. **GPU-resident Muon + flash attention**: done. Muon now runs entirely on the GPU (~3 ms/step at
-   725K params vs 1276 ms CPU; ~2 ms at 5M params vs ~10 s). Causal attention uses a hybrid
+   725K params, against 1276 ms on the reference implementation; ~2 ms at 5M params against ~10 s).
+   Causal attention uses a hybrid
    dispatch: materialized `[Hq,T,T]` path below T=2048 (faster there due to higher thread
    parallelism), online-softmax flash path at T≥2048 (O(Hq·T) memory, no single-buffer ceiling).
-   Full numbers in `notes/journal.md`.
 6. **Data quality > everything at small scale**: a curated corpus beats architecture tweaks for
    models in the 1–50M range. Concretely:
    [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) (short synthetic stories,
@@ -139,7 +141,7 @@ at the sizes we train: f16 accelerates the GEMM (~9% of runtime), but attention 
 the end-to-end change was unmeasurable (0.28 f32 vs 0.27 f16 st/s on the 31M pretrain). (2) It
 **overflows**: casting each operand to `f16(v)` sends any value past f16's 65504 ceiling to
 `inf`→NaN, and the real 20k-step run died at step 2400 at every LR once trained activations grew
-large. The trap was that the init-time CPU-f32/GPU-f16 parity probe agreed to ~1e-6 (9.6941 vs
+large. The trap was that the init-time f32-reference/f16-GPU parity probe agreed to ~1e-6 (9.6941 vs
 9.6941), but that only tests the _untrained_ model, whose activations are small; f16 looked
 loss-free and wasn't. This is exactly the failure bf16's wider exponent range would have avoided,
 and exactly why f16 needs loss-scaling/clamping that f32 does not. Since f16 bought no speed here,
@@ -149,15 +151,14 @@ flag.
 
 ## WebGPU backend bring-up
 
-**Done (items 1–5)**: the CPU op set (`src/model/autograd.ts`) is implemented as WGSL compute
+**Done (items 1-5)**: the reference op set (`src/model/autograd.ts`) is implemented as WGSL compute
 shaders behind the same `Tensor` interface in `src/backend/webgpu.ts`, forward and backward, in the
 planned order:
 
 1. `matmul`/`linear` (tiled GEMM): throughput-critical, built first. ✓ Later register-tiled (4×4
    micro-tile per thread, unrolled to stay in registers; 1.9–3.3× end-to-end). An f16-operand
    variant was added and then removed (no speedup at our sizes + overflow; see "Precision" above).
-   Kernel sources now live in `src/backend/wgsl.ts`; see the performance-work section in
-   `notes/journal.md`.
+   Kernel sources live in `src/backend/wgsl.ts`; [performance.md](performance.md) has the numbers.
 2. elementwise `add`, `mul`, `silu`. ✓
 3. `rmsnorm`, `rmsnorm_heads` (QK-norm): workgroup reductions. ✓
 4. `rope`, causal `attention`, `cross_entropy`. ✓ Attention uses a hybrid dispatch: materialized
@@ -166,14 +167,14 @@ planned order:
 5. GPU-resident optimizers (`src/backend/muon-gpu.ts` + `adamw-gpu.ts`). ✓ Newton–Schulz runs
    entirely on the GPU via the existing tiled GEMM; momentum buffers and weights are
    device-resident. ~3 ms/step at 725K params and ~2 ms/step at 5M params, vs 1276 ms / ~10 s on
-   CPU. The aux group (embeddings, head, norms) is device-resident too: AdamW with its global
+   the reference. The aux group (embeddings, head, norms) is device-resident too: AdamW with its global
    grad-norm clip runs as GPU dispatches, so after warm-up only the loss scalars are read back
    (per-step readback fell from ~145 KiB to 8 bytes at tinyConfig; the embedding grad dominated and
-   grows with vocab·hidden). Measured on M1 Max; full numbers in `notes/journal.md`.
+   grows with vocab·hidden). Measured on M1 Max.
 
-**Validation gate (in place):** `tests/gradcheck.ts` finite-difference-checks every CPU op;
-`tests/gpu-parity.ts` checks every kernel's forward and gradient against the CPU backend. Both ran
-green before the backend was swapped in.
+**Validation gate:** `tests/gradcheck.ts` finite-difference-checks every op against the reference
+implementation; `tests/gpu-parity.ts` checks every kernel's forward and gradient against it. Both
+ran green before the backend was swapped in. [correctness.md](correctness.md) has the rest.
 
 ## WebGPU memory budget (what the "4 GB" limit really is)
 

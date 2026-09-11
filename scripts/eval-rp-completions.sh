@@ -22,8 +22,8 @@
 #   LLAMA_COMPLETION=/path/to/llama-completion
 # Tunables: N_PREDICT (tokens, default 80), SEED (default 42), NGL (layers to
 # offload, default 0). NGL is exposed because CPU and full GPU offload do not
-# always produce the same completion for the same seed; see lever 14 in
-# docs/optimization.md. Record which one a result came from.
+# always produce the same completion for the same seed; see docs/evaluation.md.
+# Record which one a result came from.
 set -euo pipefail
 
 MODEL="${1:-}"

@@ -3,7 +3,7 @@
 #
 #   bash scripts/train-smolrp.sh
 #
-# Corpus: scripts/build-rp-chats.ts -> chat-corpus (see docs/optimization.md).
+# Corpus: scripts/build-rp-chats.ts -> chat-corpus (see docs/evaluation.md).
 #
 # WHY these knobs:
 #
@@ -19,9 +19,9 @@
 #   no --reclaim     the GPU is free for this run; --reclaim costs 23% throughput
 #                    and buys peak memory this shape does not need.
 #   --keep-checkpoints  the run leaves a series to rank on held-out loss. Never
-#                    pick on training loss (docs/optimization.md lever 12), and
-#                    score the WHOLE series rather than trusting a slope through
-#                    it (lever 16b).
+#                    pick on training loss, and score the WHOLE series rather
+#                    than trusting a slope through it. Both in
+#                    docs/evaluation.md, "Picking a checkpoint".
 #
 # The architecture flags are `inspect --model out/smollm2-heretic.f32.gguf` verbatim.
 # They are not optional: without them the config is built from defaults and the
