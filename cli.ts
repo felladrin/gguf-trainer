@@ -59,19 +59,11 @@ const GROUP: Record<string, string> = {
 
 function fail(message: string, code: number): never {
   console.error(`error: ${message}`);
-  // deno-lint-ignore no-explicit-any
-  const proc = (globalThis as any).process;
-  if (proc?.exit) proc.exit(code);
-  // deno-lint-ignore no-explicit-any
-  (globalThis as any).Deno?.exit(code);
-  throw new Error(message);
+  Deno.exit(code);
 }
 
 if (import.meta.main) {
-  // deno-lint-ignore no-explicit-any
-  const argv: string[] = (globalThis as any).Deno?.args ??
-    // deno-lint-ignore no-explicit-any
-    (globalThis as any).process?.argv?.slice(2) ?? [];
+  const argv = Deno.args;
   const [name, ...rest] = argv;
 
   if (!name || name === "help" || name === "--help" || name === "-h") {

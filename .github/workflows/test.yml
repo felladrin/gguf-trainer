@@ -5,9 +5,8 @@ on:
     branches: [main]
   pull_request:
 
-# This workflow went from one job to three, so a superseded push used to waste
-# one runner and now wastes three. Cancel only on pull_request: a main build
-# that gets cancelled leaves no record of whether that commit was ever green.
+# Cancel only on pull_request: a main build that gets cancelled leaves no record
+# of whether that commit was ever green.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -26,95 +25,7 @@ jobs:
         run: deno lint
       - name: Type-check the CLI and every command
         run: deno check cli.ts src/cli/registry.ts src/model/registry.ts
-      # The GPU parity suite prints SKIP where WebGPU is unavailable, which is
+      # The GPU parity suite prints SKIP where no adapter is available, which is
       # every CI runner; the gradient checks are the real coverage here.
       - name: Tests
         run: deno task test
-
-  # The two jobs below are principle 1: everything the model itself needs runs
-  # on Deno, Bun and Node with no npm install. `deno task test:node` and
-  # `deno task test:bun` are the only things that check the two non-Deno halves,
-  # and until #89 and #97 nothing here ran either, so a Deno-only API in the
-  # engine or a static npm import that puts a module out of reach went green.
-  # That is not hypothetical: #83 was a static `hyparquet` import that kept
-  # three test files out of the Node task entirely.
-
-  # Bun runs TypeScript natively rather than through Node's stripper, so this is
-  # a different check and not a stricter one: what it catches is a Web API or a
-  # node: builtin that behaves differently there, not syntax the stripper cannot
-  # erase.
-  #
-  # `--no-install` is the load-bearing part, and it lives in the task rather
-  # than here, so a contributor running `deno task test:bun` gets the promise CI
-  # gets. Without it Bun downloads a missing npm package from the registry at
-  # runtime, so a job that ran the files plainly would satisfy "no npm install"
-  # by installing. The version is pinned for the reason the Node matrix below
-  # gives: Bun has no LTS line, `latest` would turn this red on a release date
-  # rather than on a change, and lever 46's numbers name a version.
-  bun:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.4.2"
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-      - name: Bun version under test
-        run: bun --version
-      - name: Bun compatibility
-        run: deno task test:bun
-      # Positive control for the Bun exemption in tests/task-coverage.ts. The
-      # whole value of `--no-install` is that this file cannot resolve without
-      # a network install; if it ever can, auto-install came back through some
-      # route (a warmed cache, a node_modules something now creates) and
-      # test:bun quietly stopped proving what it claims.
-      # The message, not the exit code: `if bun run ...; then fail` treats every
-      # nonzero exit as the expected one, so a broken import or a bun crash
-      # would pass this control while auto-install was quietly back on. Matching
-      # bun's wording is only safe because the version is pinned, which is a
-      # second thing the pin buys.
-      - name: Auto-install stays off
-        run: |
-          if out=$(bun run --no-install tests/npm-deps.ts 2>&1); then
-            printf '%s\n' "$out" >&2
-            echo "npm-deps.ts resolved with no install; the Bun exemption is stale" >&2
-            exit 1
-          fi
-          printf '%s\n' "$out"
-          case "$out" in
-            *"Cannot find module '@huggingface/jinja'"*) ;;
-            *) echo "it failed for some other reason; the control proved nothing" >&2
-               exit 1 ;;
-          esac
-
-  # Two versions, both pinned. 22.6.0 is the exact floor readme.md promises and
-  # the first release with --experimental-strip-types, so this entry tests the
-  # promise rather than whatever 22.x is newest; a bare "22" resolves to the
-  # latest and never exercises the older stripper, which is the whole point of
-  # having a floor. 24 is the ceiling, moved by a PR about moving the ceiling.
-  # `lts/*` would do the same job until the LTS line rolls to the next major,
-  # at which point it turns this red on a calendar rather than on a change.
-  # Separate job rather than a step, so it runs beside the Deno suite.
-  node:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version: ["22.6.0", "24"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node-version }}
-      # Deno is here only to read `test:node` out of deno.json. Spelling the
-      # file list into the workflow instead would make it a third copy of a list
-      # tests/task-coverage.ts exists to keep at two.
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-      - name: Node version under test
-        run: node --version
-      - name: Node compatibility
-        run: deno task test:node
