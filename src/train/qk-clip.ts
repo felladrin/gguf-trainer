@@ -22,7 +22,7 @@
 // the projection-weight version is a no-op, and reading the true per-step max
 // would mean instrumenting the (parity-delicate) attention kernels on both
 // backends. The norm-based control is data-independent, host-side, identical on
-// CPU and GPU, and off by default: Gemma3's QK-norm is already the primary
+// both paths, and off by default: Gemma3's QK-norm is already the primary
 // explosion guard; this is the belt-and-suspenders for scaling up.
 
 import type { LanguageModel } from "../model/arch.ts";

@@ -17,8 +17,8 @@
 // --shots defaults to 0; the Open LLM Leaderboard uses 25 for ARC and 10 for
 // HellaSwag, so compare like with like before reading anything into a gap.
 //
-// Full runs want the GPU and take a while (thousands of forwards); run them when
-// the trainer is idle. A small --limit on --cpu is enough to smoke the pipeline.
+// A full run takes thousands of forwards, so run it when the trainer is idle; a
+// small --limit is enough to smoke the pipeline.
 
 import { readFileBytes } from "../io.ts";
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
@@ -30,7 +30,7 @@ import {
 } from "../train/loss.ts";
 import type { LanguageModel } from "../model/arch.ts";
 import type { BPETokenizer } from "../tokenizer/bpe.ts";
-import { initWebGPU, noGpuNote } from "../backend/webgpu.ts";
+import { requireGPU } from "../backend/webgpu.ts";
 import type { WebGPUBackend } from "../backend/webgpu.ts";
 import { fetchParquetUrls } from "../data/hf.ts";
 import { parseDataFile, type Row } from "../data/parse.ts";
@@ -296,11 +296,11 @@ export function choiceWindowError(nCtx: number, nChoice: number, maxSeq: number)
 }
 
 /** Summed negative log-likelihood of `choiceText` given `ctxText`, scored over
- * ONLY the choice tokens. Runs on GPU if `gpu` is installed. */
+ * ONLY the choice tokens. */
 async function choiceNLL(
   model: LanguageModel,
   tok: BPETokenizer,
-  gpu: WebGPUBackend | null,
+  gpu: WebGPUBackend,
   ctxText: string,
   choiceText: string,
   lossChunk: number,
@@ -333,7 +333,7 @@ async function choiceNLL(
   // so multiplying by the kept count still recovers the summed NLL whichever
   // path it took.
   const loss = sequenceLoss(model, inputs, targets, lossChunk);
-  if (gpu) await gpu.sync([loss]);
+  await gpu.sync([loss]);
   return loss.data[0] * nChoice;
 }
 
@@ -355,7 +355,6 @@ async function run(v: Values) {
   const taskName = v.str("task");
   const limit = v.num("limit");
   const shots = v.num("shots");
-  const useCpu = v.bool("cpu");
 
   console.log(`=== eval-choice: ${taskName} on ${modelPath.split("/").pop()} ===`);
   const lossChunk = v.num("loss-chunk");
@@ -369,16 +368,10 @@ async function run(v: Values) {
   const badForModel = lossChunkModelError(lossChunk, cfg.vocabSize, cfg.arch, model);
   if (badForModel) die(badForModel);
 
-  let gpu: WebGPUBackend | null = null;
-  if (!useCpu) {
-    gpu = await initWebGPU();
-    if (!gpu) console.log(noGpuNote());
-    else {
-      console.log(`WebGPU adapter: ${gpu.adapterName}`);
-      gpu.install();
-      gpu.uploadParams(model.params());
-    }
-  }
+  const gpu = await requireGPU("eval-choice");
+  console.log(`WebGPU adapter: ${gpu.adapterName}`);
+  gpu.install();
+  gpu.uploadParams(model.params());
 
   try {
     if (taskName === "ppl") {
@@ -469,7 +462,7 @@ async function run(v: Values) {
         `(${((Date.now() - t0) / 1000).toFixed(0)}s)`,
     );
   } finally {
-    if (gpu) gpu.uninstall();
+    gpu.uninstall();
   }
 }
 
@@ -525,9 +518,8 @@ comparable to that board.`,
       default: 0,
       placeholder: "N",
       describe:
-        "stream the readout and the loss in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way to score a large-vocab model at long context (0 = dense). Pointless with --cpu, where there is no binding limit and the chunked path costs an extra pass over the readout",
+        "stream the readout and the loss in vocab chunks of N instead of materializing [seq-len, vocab] logits: the way to score a large-vocab model at long context (0 = dense)",
     },
-    { name: "cpu", type: "boolean", describe: "force the CPU forward pass instead of WebGPU" },
   ],
   run: run,
 };

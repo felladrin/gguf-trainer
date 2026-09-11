@@ -1,15 +1,15 @@
-// GPU-vs-CPU parity: the validation gate for the WebGPU backend.
+// Kernel parity: the validation gate for the WebGPU backend.
 //
-// For every op, in the bring-up order from docs/notes/journal.md: run the CPU
-// reference forward + backward, then the identical call routed through the
-// WebGPU backend, and compare outputs and input gradients element-wise. The
-// CPU side is already finite-difference-validated by tests/gradcheck.ts, so
-// agreement here transfers that trust to the kernels. Additionally: a
+// For every op: run the reference forward + backward from src/model/autograd.ts,
+// then the identical call routed through the WebGPU backend, and compare outputs
+// and input gradients element-wise. The reference is already
+// finite-difference-validated by tests/gradcheck.ts, so agreement here transfers
+// that trust to the kernels. Additionally: a
 // finite-difference check run directly against the GPU matmul (the harness
 // composes on-device), a two-micro-batch gradient accumulation check, and a
 // whole-model forward/backward parity check.
 //
-// Run:  deno run tests/gpu-parity.ts     (Node/Bun have no WebGPU: prints SKIP)
+// Run:  deno run tests/gpu-parity.ts     (prints SKIP where there is no adapter)
 
 import {
   add,
@@ -43,7 +43,7 @@ import { trainLM } from "../src/train/trainer.ts";
 import { wsdSchedule } from "../src/train/schedule.ts";
 import { qkLogitScale } from "../src/train/qk-clip.ts";
 import { AdamW } from "../src/train/adam.ts";
-import { initWebGPU, WebGPUBackend, webgpuRuntime } from "../src/backend/webgpu.ts";
+import { initWebGPU, WebGPUBackend } from "../src/backend/webgpu.ts";
 import { MAX_WG } from "../src/backend/wgsl.ts";
 import { MuonGpu, newtonSchulzGpu } from "../src/backend/muon-gpu.ts";
 import { AdamWGpu } from "../src/backend/adamw-gpu.ts";
@@ -78,7 +78,7 @@ function compare(
       worst = i;
     }
     if (abs > tol.atol + tol.rtol * Math.max(Math.abs(got[i]), Math.abs(want[i]))) {
-      console.log(`    MISMATCH ${label}[${i}]: gpu=${got[i]} cpu=${want[i]}`);
+      console.log(`    MISMATCH ${label}[${i}]: gpu=${got[i]} ref=${want[i]}`);
       return false;
     }
   }
@@ -86,23 +86,23 @@ function compare(
   return true;
 }
 
-/** CPU reference pass, then the same call on the GPU, then element compare. */
+/** Reference pass, then the same call on the GPU, then element compare. */
 async function opCase(
   gpu: WebGPUBackend,
   name: string,
   inputs: Tensor[],
   fwd: () => Tensor,
 ) {
-  // CPU reference.
+  // Reference.
   for (const t of inputs) t.zeroGrad();
-  const cpuOut = fwd();
+  const refOut = fwd();
   const rngR = mulberry32(0xbeef);
-  const r = new Float32Array(cpuOut.data.length);
-  for (let i = 0; i < r.length; i++) r[i] = cpuOut.data.length === 1 ? 1 : rngR() * 2 - 1;
-  cpuOut.grad.set(r);
-  cpuOut._backward();
-  const cpuData = cpuOut.data.slice();
-  const cpuGrads = inputs.map((t) => t.grad.slice());
+  const r = new Float32Array(refOut.data.length);
+  for (let i = 0; i < r.length; i++) r[i] = refOut.data.length === 1 ? 1 : rngR() * 2 - 1;
+  refOut.grad.set(r);
+  refOut._backward();
+  const refData = refOut.data.slice();
+  const refGrads = inputs.map((t) => t.grad.slice());
 
   // GPU, identical call routed through the backend.
   for (const t of inputs) t.zeroGrad();
@@ -114,9 +114,9 @@ async function opCase(
     gpu.seedGradFromHost(gpuOut);
     gpuOut._backward();
     await gpu.sync([gpuOut]);
-    ok = compare(`${name}.out`, gpuOut.data, cpuData, FWD) && ok;
+    ok = compare(`${name}.out`, gpuOut.data, refData, FWD) && ok;
     for (let k = 0; k < inputs.length; k++) {
-      ok = compare(`${name}.dInput${k}`, inputs[k].grad, cpuGrads[k], BWD) && ok;
+      ok = compare(`${name}.dInput${k}`, inputs[k].grad, refGrads[k], BWD) && ok;
     }
   } finally {
     gpu.uninstall();
@@ -157,7 +157,7 @@ async function profilerSmoke(gpu: WebGPUBackend) {
 
 /**
  * Fused readout + chunked cross-entropy, against the dense path it replaces
- * (`crossEntropy(linear(...))`) rather than against its own CPU twin: the whole
+ * (`crossEntropy(linear(...))`) rather than against its own reference twin: the whole
  * point of the op is that the two agree, and the dense side is already
  * finite-difference-validated. Widths cover a ragged final chunk, an exact
  * split and a single chunk wider than the vocab; the offset GEMM variants are
@@ -180,8 +180,8 @@ async function fusedCeParity(gpu: WebGPUBackend) {
       return { h: randTensor([T, H], r), w: randTensor([V, H], r) };
     };
     const c = mk();
-    const cpuLoss = crossEntropy(linear(c.h, c.w), targets);
-    backward(cpuLoss, 1);
+    const refLoss = crossEntropy(linear(c.h, c.w), targets);
+    backward(refLoss, 1);
 
     const g = mk();
     gpu.install();
@@ -190,9 +190,9 @@ async function fusedCeParity(gpu: WebGPUBackend) {
       const loss = fusedCrossEntropy(g.h, g.w, targets, chunk);
       backward(loss, 1);
       await gpu.sync([loss]);
-      const dl = Math.abs(loss.data[0] - cpuLoss.data[0]);
-      if (dl > 1e-3 + 1e-3 * Math.abs(cpuLoss.data[0])) {
-        console.log(`    MISMATCH fusedCE loss: gpu=${loss.data[0]} cpu=${cpuLoss.data[0]}`);
+      const dl = Math.abs(loss.data[0] - refLoss.data[0]);
+      if (dl > 1e-3 + 1e-3 * Math.abs(refLoss.data[0])) {
+        console.log(`    MISMATCH fusedCE loss: gpu=${loss.data[0]} ref=${refLoss.data[0]}`);
         ok = false;
       }
       ok = compare(`fusedCE.dHidden(chunk=${chunk})`, g.h.grad, c.h.grad, BWD) && ok;
@@ -328,7 +328,7 @@ function microConfig(): Gemma3Config {
  * Gemma3 whole-model parity: exercises the arch's distinctive path (sqrt(hidden)
  * embed scale, sandwich norms, GeGLU, per-layer SWA + local/global RoPE). The
  * config mixes SWA layers (0,1,3) with a global layer (2) and T > slidingWindow
- * so the window genuinely restricts, matching the CPU windowed reference.
+ * so the window genuinely restricts, matching the windowed reference.
  */
 async function gemma3ModelParity(gpu: WebGPUBackend) {
   const cfg: Gemma3Config = {
@@ -356,12 +356,12 @@ async function gemma3ModelParity(gpu: WebGPUBackend) {
   const params = model.params();
 
   for (const p of params) p.zeroGrad();
-  const cpuLogits = model.forward(ids);
-  const cpuLoss = crossEntropy(cpuLogits, targets);
-  backward(cpuLoss, 1);
-  const cpuLogitsData = cpuLogits.data.slice();
-  const cpuLossVal = cpuLoss.data[0];
-  const cpuGrads = params.map((p) => p.grad.slice());
+  const refLogits = model.forward(ids);
+  const refLoss = crossEntropy(refLogits, targets);
+  backward(refLoss, 1);
+  const refLogitsData = refLogits.data.slice();
+  const refLossVal = refLoss.data[0];
+  const refGrads = params.map((p) => p.grad.slice());
 
   for (const p of params) p.zeroGrad();
   gpu.install();
@@ -371,14 +371,14 @@ async function gemma3ModelParity(gpu: WebGPUBackend) {
     const loss = crossEntropy(logits, targets);
     backward(loss, 1);
     await gpu.sync([logits, loss]);
-    ok = compare("gemma3.logits", logits.data, cpuLogitsData, { atol: 5e-4, rtol: 1e-2 }) && ok;
-    const lossAbs = Math.abs(loss.data[0] - cpuLossVal);
-    if (lossAbs > 1e-3 + 1e-3 * Math.abs(cpuLossVal)) {
-      console.log(`    MISMATCH loss: gpu=${loss.data[0]} cpu=${cpuLossVal}`);
+    ok = compare("gemma3.logits", logits.data, refLogitsData, { atol: 5e-4, rtol: 1e-2 }) && ok;
+    const lossAbs = Math.abs(loss.data[0] - refLossVal);
+    if (lossAbs > 1e-3 + 1e-3 * Math.abs(refLossVal)) {
+      console.log(`    MISMATCH loss: gpu=${loss.data[0]} ref=${refLossVal}`);
       ok = false;
     }
     for (let i = 0; i < params.length; i++) {
-      ok = compare(`gemma3.dParam${i}`, params[i].grad, cpuGrads[i], BWD) && ok;
+      ok = compare(`gemma3.dParam${i}`, params[i].grad, refGrads[i], BWD) && ok;
     }
   } finally {
     gpu.uninstall();
@@ -391,7 +391,7 @@ async function gemma3ModelParity(gpu: WebGPUBackend) {
   );
 }
 
-/** Two micro-batches accumulated before one sync must match CPU accumulation. */
+/** Two micro-batches accumulated before one sync must match reference accumulation. */
 async function accumulationParity(gpu: WebGPUBackend) {
   const cfg = microConfig();
   const model = new Gemma3Model(cfg, mulberry32(5));
@@ -408,7 +408,7 @@ async function accumulationParity(gpu: WebGPUBackend) {
   for (const p of params) p.zeroGrad();
   backward(crossEntropy(model.forward(b0.ids), b0.targets), 0.5);
   backward(crossEntropy(model.forward(b1.ids), b1.targets), 0.5);
-  const cpuGrads = params.map((p) => p.grad.slice());
+  const refGrads = params.map((p) => p.grad.slice());
 
   for (const p of params) p.zeroGrad();
   gpu.install();
@@ -418,7 +418,7 @@ async function accumulationParity(gpu: WebGPUBackend) {
     backward(crossEntropy(model.forward(b1.ids), b1.targets), 0.5);
     await gpu.sync();
     for (let i = 0; i < params.length; i++) {
-      ok = compare(`accum.dParam${i}`, params[i].grad, cpuGrads[i], BWD) && ok;
+      ok = compare(`accum.dParam${i}`, params[i].grad, refGrads[i], BWD) && ok;
     }
   } finally {
     gpu.uninstall();
@@ -575,7 +575,7 @@ async function reclaimTransientsParity(gpu: WebGPUBackend) {
  * a real gate for it. It is not a gate for workgroup storage, which wgpu does
  * not validate: tests/kernel-limits.ts covers that from the source instead.
  *
- * CPU comparison is far too slow at these shapes, so assert completion with no
+ * A reference comparison is far too slow at these shapes, so assert completion with no
  * device/validation error and finite, non-zero outputs and input gradients.
  */
 async function specDefaultLimitsCheck(T: number, hd: number, why: string) {
@@ -644,14 +644,10 @@ async function specDefaultLimitsCheck(T: number, hd: number, why: string) {
 async function main() {
   const gpu = await initWebGPU();
   if (!gpu) {
-    console.log(
-      webgpuRuntime() === "no-runtime"
-        ? "SKIP: no WebGPU in this runtime. Run under Deno (or provide navigator.gpu)."
-        : "SKIP: WebGPU is present but no GPU adapter was found, so there is nothing to compare.",
-    );
+    console.log("SKIP: no GPU adapter found, so there is nothing to compare against.");
     return;
   }
-  console.log(`=== GPU-vs-CPU parity checks (adapter: ${gpu.adapterName}) ===\n`);
+  console.log(`=== Kernel parity checks (adapter: ${gpu.adapterName}) ===\n`);
   const rng = mulberry32(1234);
 
   // 1. matmul / linear: including a multi-tile case with non-multiple-of-16 dims.
@@ -770,8 +766,7 @@ async function main() {
     await opCase(gpu, "crossEntropy", [logits], () => crossEntropy(logits, targets));
   }
   {
-    // A target ~90 logits behind the maximum. This is the shape lever 23 says the
-    // suite was blind to: the CPU used to clamp such a row at -log(1e-12) = 27.63
+    // A target ~90 logits behind the maximum, the shape the suite was blind to: the reference used to clamp such a row at -log(1e-12) = 27.63
     // while the GPU computed it exactly, and every existing case produces losses
     // of 2 to 10, nowhere near the clamp. Both sides now agree at the true value.
     // This pins MAGNITUDE, not precision: `compare`'s budget at a loss of 76.5 is
@@ -797,7 +792,7 @@ async function main() {
     // infinity semantics on the device. The limit that follows is worth stating:
     // for a finite pad the skip is behaviour-preserving, so removing it does NOT
     // fail this case. What this pins is that the two implementations agree on a
-    // padded row at all; the skip's actual purpose is pinned on the CPU side, in
+    // padded row at all; the skip's actual purpose is pinned on the reference side, in
     // `softCE skips a zero pad` in tests/gradcheck.ts.
     const V = 5, K = 3;
     const logits = randTensor([2, V], mulberry32(77));
@@ -812,7 +807,7 @@ async function main() {
   }
   {
     // Ignore-index (-1) = assistant-only loss masking: masked rows contribute
-    // no loss and no gradient; the mean is over kept rows. GPU must match CPU.
+    // no loss and no gradient; the mean is over kept rows. GPU must match it.
     const T = 8, V = 17;
     const logits = randTensor([T, V], rng);
     const targets = [-1, 3, -1, 11, 0, -1, 16, 5];
@@ -907,7 +902,7 @@ async function main() {
 
   //    (e) Sliding-window attention (Gemma3 SWA layers): each query t attends
   //        keys [t-W+1, t]. Window chosen < T (and not tile-aligned) so it
-  //        genuinely restricts. Both paths must match the CPU windowed ref.
+  //        genuinely restricts. Both paths must match the windowed ref.
   const windowCases: [number, number, number, number, number, string][] = [
     [193, 4, 2, 24, 48, "T=193, hd=24, group=2, W=48"],
     [130, 3, 3, 6, 40, "T=130, hd=6, group=1, W=40"],
@@ -944,7 +939,7 @@ async function main() {
 
   // 7. GPU-resident Muon optimizer (src/backend/muon-gpu.ts): Newton–Schulz
   //    kernel parity, momentum-buffer persistence across steps, and the
-  //    whole-trajectory parity against the CPU Muon.
+  //    whole-trajectory parity against the reference Muon.
   await newtonSchulzParity(gpu);
   await muonMomentumPersistence(gpu);
   await adamwGpuParity(gpu);
@@ -958,24 +953,18 @@ async function main() {
   console.log(
     failures === 0 ? "\n=== all parity checks passed ===" : `\n=== ${failures} FAILURES ===`,
   );
-  if (failures > 0) {
-    // deno-lint-ignore no-explicit-any
-    const proc = (globalThis as any).process;
-    if (proc?.exit) proc.exit(1);
-  }
+  if (failures > 0) Deno.exit(1);
 }
 
 main().catch((e) => {
   console.error("PARITY FAILED:", e);
-  // deno-lint-ignore no-explicit-any
-  const proc = (globalThis as any).process;
-  if (proc?.exit) proc.exit(1);
+  Deno.exit(1);
 });
 
 // --- GPU-resident Muon cases (called at the end of main; declarations hoist) -----
 
 /**
- * GPU vs CPU newtonSchulz() on random matrices covering m<n, m>n (transpose
+ * GPU vs reference newtonSchulz() on random matrices covering m<n, m>n (transpose
  * path), m=n, and non-multiple-of-16 dims (GEMM edge tiles). Tolerance: BWD.
  * Five quintic iterations chain ~15 order-dependent f32 reductions: deeper
  * than any single backward kernel, but NS is contractive toward the
@@ -998,7 +987,7 @@ async function newtonSchulzParity(gpu: WebGPUBackend) {
 }
 
 /**
- * Two consecutive optimizer steps with different grads must match the CPU
+ * Two consecutive optimizer steps with different grads must match the reference
  * two-step result: catches momentum buffers that are zeroed, recycled, or
  * left dirty between steps (a fresh buf in step 2 shifts the result far
  * beyond tolerance). BWD tolerance for the same reasons as newtonSchulzParity
@@ -1019,11 +1008,11 @@ async function muonMomentumPersistence(gpu: WebGPUBackend) {
   const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 1e-3 } };
 
   const pc = new Tensor(base.slice(), shape, true);
-  const cpuOpt = new Muon([pc], [], hyper);
+  const refOpt = new Muon([pc], [], hyper);
   pc.grad.set(g1);
-  cpuOpt.step();
+  refOpt.step();
   pc.grad.set(g2);
-  cpuOpt.step();
+  refOpt.step();
 
   const pg = new Tensor(base.slice(), shape, true);
   const gpuOpt = new MuonGpu(gpu, [pg], [], hyper);
@@ -1043,13 +1032,13 @@ async function muonMomentumPersistence(gpu: WebGPUBackend) {
 }
 
 /**
- * GPU AdamW (adamw-gpu.ts) vs CPU AdamW over 3 steps on a 2-D param and a 1-D
+ * GPU AdamW (adamw-gpu.ts) vs the reference AdamW over 3 steps on a 2-D param and a 1-D
  * param, with grads sized so the global grad-norm clip TRIGGERS on step 1
  * (norm > clip, scale < 1) and relaxes below clip by step 3: exercising both
  * branches of the on-device reduction plus moment persistence and bias
  * correction. Moments live in device state buffers; grads are seeded per step
  * (seedGradFromHost stands in for a backward, overwriting the device grad).
- * BWD tolerance: the clip reduction sums in tree order vs the CPU's sequential
+ * BWD tolerance: the clip reduction sums in tree order vs the reference's sequential
  * order, and 3 Adam steps compound that, but it stays well under 1e-3.
  */
 async function adamwGpuParity(gpu: WebGPUBackend) {
@@ -1074,12 +1063,12 @@ async function adamwGpuParity(gpu: WebGPUBackend) {
     })
   );
 
-  // CPU reference.
-  const cpuParams = shapes.map((s, i) => new Tensor(bases[i].slice(), s, true));
-  const cpuOpt = new AdamW(cpuParams, opts);
+  // Reference.
+  const refParams = shapes.map((s, i) => new Tensor(bases[i].slice(), s, true));
+  const refOpt = new AdamW(refParams, opts);
   for (let step = 0; step < gradScale.length; step++) {
-    for (let i = 0; i < cpuParams.length; i++) cpuParams[i].grad.set(grads[step][i]);
-    cpuOpt.step();
+    for (let i = 0; i < refParams.length; i++) refParams[i].grad.set(grads[step][i]);
+    refOpt.step();
   }
 
   // GPU.
@@ -1096,16 +1085,16 @@ async function adamwGpuParity(gpu: WebGPUBackend) {
   await gpuOpt.syncWeightsToHost();
 
   let ok = true;
-  for (let i = 0; i < cpuParams.length; i++) {
-    ok = compare(`adamwGpu.p${i}`, gpuParams[i].data, cpuParams[i].data, BWD) && ok;
+  for (let i = 0; i < refParams.length; i++) {
+    ok = compare(`adamwGpu.p${i}`, gpuParams[i].data, refParams[i].data, BWD) && ok;
   }
   if (!ok) failures++;
-  console.log(`  ${ok ? "ok " : "FAIL"} GPU AdamW vs CPU (3 steps, grad-norm clip triggers)`);
+  console.log(`  ${ok ? "ok " : "FAIL"} GPU AdamW vs reference (3 steps, grad-norm clip triggers)`);
 }
 
 /**
  * The trajectory gate: same seeds, same batches (trainLM and trainLMGpuResident
- * make identical rng calls), 4 full optimizer steps: CPU Muon trajectory vs
+ * make identical rng calls), 4 full optimizer steps: reference Muon trajectory vs
  * the GPU-resident optimizer. Losses per step and every final weight tensor
  * must agree. Tolerances: each step feeds fwd/bwd f32 divergence (~BWD-sized)
  * through Newton–Schulz into the weights, compounding per step; measured over
@@ -1119,9 +1108,9 @@ async function muonTrajectoryParity(gpu: WebGPUBackend) {
   const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
   const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
 
-  const cpuModel = new Gemma3Model(cfg, mulberry32(5));
-  const cg = cpuModel.paramGroups();
-  const cpuHist = trainLM(cpuModel, {
+  const refModel = new Gemma3Model(cfg, mulberry32(5));
+  const cg = refModel.paramGroups();
+  const refHist = trainLM(refModel, {
     tokens,
     seqLen,
     steps,
@@ -1144,28 +1133,28 @@ async function muonTrajectoryParity(gpu: WebGPUBackend) {
   });
 
   let ok = true;
-  if (gpuHist.length !== cpuHist.length) {
-    console.log(`    history length ${gpuHist.length} != ${cpuHist.length}`);
+  if (gpuHist.length !== refHist.length) {
+    console.log(`    history length ${gpuHist.length} != ${refHist.length}`);
     ok = false;
   }
-  for (let i = 0; i < Math.min(cpuHist.length, gpuHist.length); i++) {
-    const dl = Math.abs(gpuHist[i].loss - cpuHist[i].loss);
-    if (dl > 1e-3 + 1e-3 * Math.abs(cpuHist[i].loss)) {
+  for (let i = 0; i < Math.min(refHist.length, gpuHist.length); i++) {
+    const dl = Math.abs(gpuHist[i].loss - refHist[i].loss);
+    if (dl > 1e-3 + 1e-3 * Math.abs(refHist[i].loss)) {
       console.log(
-        `    MISMATCH loss@step${cpuHist[i].step}: gpu=${gpuHist[i].loss} cpu=${cpuHist[i].loss}`,
+        `    MISMATCH loss@step${refHist[i].step}: gpu=${gpuHist[i].loss} ref=${refHist[i].loss}`,
       );
       ok = false;
     }
   }
-  const cpuParams = cpuModel.params();
+  const refParams = refModel.params();
   const gpuParams = gpuModel.params();
-  for (let i = 0; i < cpuParams.length; i++) {
-    ok = compare(`muonTraj.param${i}`, gpuParams[i].data, cpuParams[i].data, BWD) && ok;
+  for (let i = 0; i < refParams.length; i++) {
+    ok = compare(`muonTraj.param${i}`, gpuParams[i].data, refParams[i].data, BWD) && ok;
   }
   if (!ok) failures++;
   console.log(
     `  ${ok ? "ok " : "FAIL"} Muon GPU training trajectory (${steps} steps, ` +
-      `${cpuParams.length} weight tensors)`,
+      `${refParams.length} weight tensors)`,
   );
 }
 
@@ -1173,7 +1162,7 @@ async function muonTrajectoryParity(gpu: WebGPUBackend) {
  * Same as muonTrajectoryParity but with a WSD schedule driving a DISTINCT lr
  * every step (warmup 2 → cooldown 2, floor 0.1: multipliers 0.5, 1, 0.55, 0.1).
  * This is the gate for the dynamic-lr path: MuonGpu now reads lr from a device
- * buffer that setLrScale() rewrites each step, and the CPU Muon scales its base
+ * buffer that setLrScale() rewrites each step, and the reference Muon scales its base
  * lr in host arrays: the two must still track to BWD tolerance. A regression
  * where the GPU lr write is mis-ordered relative to the apply dispatch, or the
  * buffer isn't actually read, shows up here as trajectory divergence.
@@ -1186,9 +1175,9 @@ async function wsdScheduleParity(gpu: WebGPUBackend) {
   const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
   const schedule = wsdSchedule({ warmupSteps: 2, stableSteps: 0, cooldownSteps: 2, minScale: 0.1 });
 
-  const cpuModel = new Gemma3Model(cfg, mulberry32(5));
-  const cg = cpuModel.paramGroups();
-  const cpuHist = trainLM(cpuModel, {
+  const refModel = new Gemma3Model(cfg, mulberry32(5));
+  const cg = refModel.paramGroups();
+  const refHist = trainLM(refModel, {
     tokens,
     seqLen,
     steps,
@@ -1213,27 +1202,29 @@ async function wsdScheduleParity(gpu: WebGPUBackend) {
   });
 
   let ok = true;
-  for (let i = 0; i < Math.min(cpuHist.length, gpuHist.length); i++) {
-    const dl = Math.abs(gpuHist[i].loss - cpuHist[i].loss);
-    if (dl > 1e-3 + 1e-3 * Math.abs(cpuHist[i].loss)) {
+  for (let i = 0; i < Math.min(refHist.length, gpuHist.length); i++) {
+    const dl = Math.abs(gpuHist[i].loss - refHist[i].loss);
+    if (dl > 1e-3 + 1e-3 * Math.abs(refHist[i].loss)) {
       console.log(
-        `    MISMATCH loss@step${cpuHist[i].step}: gpu=${gpuHist[i].loss} cpu=${cpuHist[i].loss}`,
+        `    MISMATCH loss@step${refHist[i].step}: gpu=${gpuHist[i].loss} ref=${refHist[i].loss}`,
       );
       ok = false;
     }
   }
-  const cpuParams = cpuModel.params();
+  const refParams = refModel.params();
   const gpuParams = gpuModel.params();
-  for (let i = 0; i < cpuParams.length; i++) {
-    ok = compare(`wsd.param${i}`, gpuParams[i].data, cpuParams[i].data, BWD) && ok;
+  for (let i = 0; i < refParams.length; i++) {
+    ok = compare(`wsd.param${i}`, gpuParams[i].data, refParams[i].data, BWD) && ok;
   }
   if (!ok) failures++;
-  console.log(`  ${ok ? "ok " : "FAIL"} WSD-scheduled Muon trajectory (GPU lr buffer vs CPU)`);
+  console.log(
+    `  ${ok ? "ok " : "FAIL"} WSD-scheduled Muon trajectory (GPU lr buffer vs reference)`,
+  );
 }
 
 /**
  * MuonClip / QK-logit clip active during training: the clip is host-side weight
- * math on the aux qNorm/kNorm, so CPU trainLM and GPU trainLMGpuResident must
+ * math on the aux qNorm/kNorm, so the reference trainLM and GPU trainLMGpuResident must
  * apply it identically and stay on the same trajectory. tau=0.5 triggers from
  * init (qNorm=kNorm=ones gives proxy 1.0), so every step clips on both paths;
  * a path that skipped or misordered the clip would diverge. Also asserts the
@@ -1246,9 +1237,9 @@ async function qkClipTrajectoryParity(gpu: WebGPUBackend) {
   const tokens = Array.from({ length: 160 }, () => Math.floor(rngTok() * cfg.vocabSize));
   const hyper = { lr: 0.02, momentum: 0.95, aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 } };
 
-  const cpuModel = new Gemma3Model(cfg, mulberry32(5));
-  const cg = cpuModel.paramGroups();
-  const cpuHist = trainLM(cpuModel, {
+  const refModel = new Gemma3Model(cfg, mulberry32(5));
+  const cg = refModel.paramGroups();
+  const refHist = trainLM(refModel, {
     tokens,
     seqLen,
     steps,
@@ -1273,19 +1264,19 @@ async function qkClipTrajectoryParity(gpu: WebGPUBackend) {
   });
 
   let ok = true;
-  for (let i = 0; i < Math.min(cpuHist.length, gpuHist.length); i++) {
-    const dl = Math.abs(gpuHist[i].loss - cpuHist[i].loss);
-    if (dl > 1e-3 + 1e-3 * Math.abs(cpuHist[i].loss)) {
+  for (let i = 0; i < Math.min(refHist.length, gpuHist.length); i++) {
+    const dl = Math.abs(gpuHist[i].loss - refHist[i].loss);
+    if (dl > 1e-3 + 1e-3 * Math.abs(refHist[i].loss)) {
       console.log(
-        `    MISMATCH loss@step${cpuHist[i].step}: gpu=${gpuHist[i].loss} cpu=${cpuHist[i].loss}`,
+        `    MISMATCH loss@step${refHist[i].step}: gpu=${gpuHist[i].loss} ref=${refHist[i].loss}`,
       );
       ok = false;
     }
   }
-  const cpuParams = cpuModel.params();
+  const refParams = refModel.params();
   const gpuParams = gpuModel.params();
-  for (let i = 0; i < cpuParams.length; i++) {
-    ok = compare(`qkClip.param${i}`, gpuParams[i].data, cpuParams[i].data, BWD) && ok;
+  for (let i = 0; i < refParams.length; i++) {
+    ok = compare(`qkClip.param${i}`, gpuParams[i].data, refParams[i].data, BWD) && ok;
   }
   // The clip must actually have bounded the logit scale on the trained model.
   for (const L of gpuModel.layers) {
@@ -1293,13 +1284,13 @@ async function qkClipTrajectoryParity(gpu: WebGPUBackend) {
   }
   if (!ok) failures++;
   console.log(
-    `  ${ok ? "ok " : "FAIL"} MuonClip trajectory parity + logit-scale bounded (GPU vs CPU)`,
+    `  ${ok ? "ok " : "FAIL"} MuonClip trajectory parity + logit-scale bounded (GPU vs reference)`,
   );
 }
 
 /**
- * Activation recomputation on the device, over a whole model, against the CPU
- * reference WITHOUT it. Two things this reaches that the CPU gradcheck cannot:
+ * Activation recomputation on the device, over a whole model, against the same
+ * model WITHOUT it. Two things this reaches that the gradcheck cannot:
  * the region free-list actually handing a released buffer to a later makeOut,
  * and the device-side gradient seed that carries the accumulated gradient into
  * the replayed subgraph. Run for all three architectures, since each wraps its
@@ -1312,10 +1303,10 @@ async function recomputeModelParity(gpu: WebGPUBackend) {
     const cfg = arch.tinyConfig(23) as any;
     const ids = [3, 9, 1, 14, 7, 2], targets = [9, 1, 14, 7, 2, 5];
 
-    const cpu = arch.build(cfg, mulberry32(5));
-    const cpuLoss = crossEntropy(cpu.forward(ids), targets);
-    backward(cpuLoss, 1);
-    const cpuGrads = cpu.params().map((p) => p.grad.slice());
+    const ref = arch.build(cfg, mulberry32(5));
+    const refLoss = crossEntropy(ref.forward(ids), targets);
+    backward(refLoss, 1);
+    const refGrads = ref.params().map((p) => p.grad.slice());
 
     const model = arch.build(cfg, mulberry32(5));
     gpu.install();
@@ -1325,14 +1316,14 @@ async function recomputeModelParity(gpu: WebGPUBackend) {
       const loss = crossEntropy(model.forward(ids), targets);
       backward(loss, 1);
       await gpu.sync([loss]);
-      const dl = Math.abs(loss.data[0] - cpuLoss.data[0]);
-      if (dl > 1e-3 + 1e-3 * Math.abs(cpuLoss.data[0])) {
-        console.log(`    MISMATCH ${name} recompute loss: ${loss.data[0]} vs ${cpuLoss.data[0]}`);
+      const dl = Math.abs(loss.data[0] - refLoss.data[0]);
+      if (dl > 1e-3 + 1e-3 * Math.abs(refLoss.data[0])) {
+        console.log(`    MISMATCH ${name} recompute loss: ${loss.data[0]} vs ${refLoss.data[0]}`);
         ok = false;
       }
       const ps = model.params();
       for (let i = 0; i < ps.length; i++) {
-        ok = compare(`recompute.${name}.dParam${i}`, ps[i].grad, cpuGrads[i], BWD) && ok;
+        ok = compare(`recompute.${name}.dParam${i}`, ps[i].grad, refGrads[i], BWD) && ok;
       }
     } finally {
       setCheckpointing(false);
@@ -1542,7 +1533,7 @@ async function generateFreezeGate() {
   // A canary, not a guard. No read of requiresGrad feeds an output value: each
   // is entryFor's buffer choice, sync()'s staging decision, or a gate on a dW
   // accumulation (read in the closure on the GPU path, captured as wantsDW at
-  // forward time on the CPU one). So no regression in the freeze can move the
+  // forward time on the reference one). So no regression in the freeze can move the
   // text and this cannot be mutation-proved. It is here for a future forward
   // read of the flag.
   const same = hot.ids === cold.ids;
@@ -1747,10 +1738,10 @@ async function residentReadbackGate() {
  * The clear queue. `sync()` re-arms `gradNeedsClear` for every touched external,
  * and `entryFor` then queues that buffer for a `clearBuffer` on the next window.
  * A frozen external shares one 256-byte stub that nothing ever writes, so every
- * one of those clears was a no-op. Lever 32 has since taken the eval case away
- * entirely, a forward-only window issuing no clears at all; what is left is a
- * step that runs a backward with frozen weights, i.e. LoRA and finetune, which
- * is the shape below.
+ * one of those clears was a no-op. The eval case went away entirely once a
+ * forward-only window stopped issuing clears at all; what is left is a step that
+ * runs a backward with frozen weights, i.e. LoRA and finetune, which is the
+ * shape below.
  *
  * Waste has no symptom in a number, so the only way to see it is to count. The
  * second window is what matters: on the first, a frozen parameter is not queued
@@ -1773,10 +1764,9 @@ async function frozenClearGate() {
       // forward skipped would move the count for a reason unrelated to freezing.
       const window = async () => {
         const loss = sequenceLoss(m, ids.slice(0, -1), ids.slice(1), 0);
-        // With a backward, since lever 32: a forward-only window issues no
-        // clears at all, so a parameter's is only observable in a window that
-        // runs one. That is LoRA and finetune, which is where lever 28 still
-        // pays.
+        // With a backward: a forward-only window issues no clears at all, so a
+        // parameter's is only observable in a window that runs one. That is
+        // LoRA and finetune, which is where this still pays.
         backward(loss, 1);
         await gpu.sync([loss]);
         return loss.data[0];
@@ -2038,8 +2028,8 @@ async function clearRearmPredicateGate() {
 }
 
 /**
- * LoRA end to end on the device, over a whole model, against the CPU reference
- * running the same adapters. Reaches three things the CPU gradcheck cannot: the
+ * LoRA end to end on the device, over a whole model, against the reference
+ * running the same adapters. Reaches three things the gradcheck cannot: the
  * adapted `linear` composing correctly through every architecture's projections,
  * the frozen-base path where the backend skips the dW gemm and binds a shared
  * stub for the gradient, and merge/unmerge round-tripping f32 weights.
@@ -2051,13 +2041,13 @@ async function loraModelParity(gpu: WebGPUBackend) {
     const cfg = arch.tinyConfig(23) as any;
     const ids = [3, 9, 1, 14, 7, 2], targets = [9, 1, 14, 7, 2, 5];
 
-    const cpu = arch.build(cfg, mulberry32(5));
-    const hc = applyLora(cpu, 4, 8, mulberry32(99));
+    const ref = arch.build(cfg, mulberry32(5));
+    const hc = applyLora(ref, 4, 8, mulberry32(99));
     // Move B off zero, or every adapter contributes nothing and this proves little.
     for (const t of hc.groups.aux) for (let i = 0; i < t.data.length; i++) t.data[i] += 0.05;
-    const cpuLoss = crossEntropy(cpu.forward(ids), targets);
-    backward(cpuLoss, 1);
-    const cpuGrads = hc.groups.aux.map((p) => p.grad.slice());
+    const refLoss = crossEntropy(ref.forward(ids), targets);
+    backward(refLoss, 1);
+    const refGrads = hc.groups.aux.map((p) => p.grad.slice());
     clearLora();
 
     const model = arch.build(cfg, mulberry32(5));
@@ -2067,7 +2057,7 @@ async function loraModelParity(gpu: WebGPUBackend) {
     // With recompute on, which is the combination the measured table uses and
     // which nothing else covers: the replay rebuilds the adapter subgraph inside
     // each block, so a double-counted adapter gradient would show up here as a
-    // 2x against the CPU reference rather than as a plausible learning rate.
+    // 2x against the reference rather than as a plausible learning rate.
     setCheckpointing(true);
     const regionsBefore = gpu.regionCount();
     let ok = true;
@@ -2075,13 +2065,13 @@ async function loraModelParity(gpu: WebGPUBackend) {
       const loss = crossEntropy(model.forward(ids), targets);
       backward(loss, 1);
       await gpu.sync([loss]);
-      const dl = Math.abs(loss.data[0] - cpuLoss.data[0]);
-      if (dl > 1e-3 + 1e-3 * Math.abs(cpuLoss.data[0])) {
-        console.log(`    MISMATCH ${name} lora loss: ${loss.data[0]} vs ${cpuLoss.data[0]}`);
+      const dl = Math.abs(loss.data[0] - refLoss.data[0]);
+      if (dl > 1e-3 + 1e-3 * Math.abs(refLoss.data[0])) {
+        console.log(`    MISMATCH ${name} lora loss: ${loss.data[0]} vs ${refLoss.data[0]}`);
         ok = false;
       }
-      for (let i = 0; i < cpuGrads.length; i++) {
-        ok = compare(`lora.${name}.dAdapter${i}`, h.groups.aux[i].grad, cpuGrads[i], BWD) && ok;
+      for (let i = 0; i < refGrads.length; i++) {
+        ok = compare(`lora.${name}.dAdapter${i}`, h.groups.aux[i].grad, refGrads[i], BWD) && ok;
       }
       // "+ recompute" in the label has to be a claim, not a word: an arch that
       // stopped calling checkpoint() would otherwise keep this green.
@@ -2141,7 +2131,7 @@ async function loraModelParity(gpu: WebGPUBackend) {
 
     if (!ok) failures++;
     console.log(
-      `  ${ok ? "ok " : "FAIL"} ${name} lora + recompute vs CPU (${h.adapted} adapters, ` +
+      `  ${ok ? "ok " : "FAIL"} ${name} lora + recompute vs reference (${h.adapted} adapters, ` +
         `stub ${stubDirty}, merge drift ${drift.toExponential(1)})`,
     );
   }
@@ -2187,20 +2177,19 @@ async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
  *
  * Every refusal arm here pins placement. Each guard sits ABOVE the backend
  * dispatch, so no backend can skip it, and moving any of them below leaves the
- * CPU cases in gradcheck passing while this fails. The two losses arrived last:
- * they validated below the dispatch until lever 40, with each implementation
+ * reference cases in gradcheck passing while this fails. The two losses arrived last:
+ * they validated below the dispatch until recently, with each implementation
  * carrying its own call, and these arms proved the device ones were still
  * there. Now there are no device-side calls left to prove, and they pin what
  * the other three pin. For those two the move is no longer expressible, since
  * the dispatch reads the count the validator returns; the mutation that
- * reproduces it is a bare counting loop in the validator's place, which lever
- * 40 spells out.
+ * reproduces it is a bare counting loop in the validator's place.
  *
- * Three arms are not about ids at all, and arrived with lever 42. `linear` is
+ * Three arms are not about ids at all. `linear` is
  * the same placement check for a shape rather than an index, and the last of
  * that shape in the op set. `fusedDim` and `fusedChunk` pin the two wrapper
- * guards whose GPU duplicates that lever deleted, which is what makes deleting
- * them safe rather than merely tidy.
+ * guards whose GPU-side duplicates were deleted once the wrapper was proven to
+ * run first, which is what makes deleting them safe rather than merely tidy.
  *
  * The `scores` conjunct is not one of them. It is the control: a guard that
  * refused everything would pass all eight refusal arms, and reading `loss.data`
@@ -2208,7 +2197,7 @@ async function aliasedBinaryOpParity(gpu: WebGPUBackend) {
  *
  * No kernel could catch the loss cases, wherever the check is called from: the
  * logits buffer is bound whole, so `LOG[t * V + tgt]` with `tgt >= V` is an
- * in-bounds read of the next row, measured returning exactly the CPU's wrong
+ * in-bounds read of the next row, measured returning exactly the reference's wrong
  * value.
  */
 async function targetRangeGate(gpu: WebGPUBackend) {
@@ -2258,10 +2247,10 @@ async function targetRangeGate(gpu: WebGPUBackend) {
       /^crossEntropy: logits must be 2-D/,
     );
     // linear's contracted-dimension check, hoisted above the dispatch in #91.
-    // It was the last guard in autograd.ts that lived in the CPU body, covered
+    // It was the last guard in autograd.ts that lived in the reference body, covered
     // on the GPU path only because webgpu.ts repeated it with the same message.
     // Put it back below `if (opsBackend)` and this arm turns false while every
-    // CPU caller keeps passing, which is what the duplicate was hiding.
+    // reference caller keeps passing, which is what the duplicate was hiding.
     const badW = randTensor([V, H + 1], mulberry32(41));
     const linearDim = refused(() => linear(hid, badW), /^linear dim mismatch: x is \[/);
     // fusedCrossEntropy's own dim and chunk guards. The wrapper has checked both
@@ -2319,7 +2308,7 @@ async function targetRangeGate(gpu: WebGPUBackend) {
  *   - The pool does not grow across the second chain. Delete the release loop
  *     in sync() and the second chain allocates instead of reusing, so this
  *     fires. It is what proves the reuse under test happens at all.
- *   - The first chain's gradients still match the CPU after that reuse. No
+ *   - The first chain's gradients still match the reference after that reuse. No
  *     mutation inside the repo forces this one: it fails only if a later submit
  *     is allowed to overtake an earlier one, which is the assumption being
  *     leaned on rather than a line anyone here can break.
@@ -2360,7 +2349,7 @@ async function recycleReuseGate(gpu: WebGPUBackend) {
 
   for (const t of [x, w1, w2]) t.zeroGrad();
   backward(chain(), 1);
-  const cpuGrads = [x, w1, w2].map((t) => t.grad.slice());
+  const refGrads = [x, w1, w2].map((t) => t.grad.slice());
 
   for (const t of [x, w1, w2]) t.zeroGrad();
   // Without this the bare sync() is not empty: every touched external with a
@@ -2390,7 +2379,7 @@ async function recycleReuseGate(gpu: WebGPUBackend) {
     const names = ["x", "w1", "w2"];
     for (const [i, t] of [x, w1, w2].entries()) {
       const got = await gpu.readStateBuffer(gpu.buffersFor(t).grad, t.size);
-      ok = compare(`recycleReuse.d${names[i]}`, got, cpuGrads[i], BWD) && ok;
+      ok = compare(`recycleReuse.d${names[i]}`, got, refGrads[i], BWD) && ok;
     }
   } finally {
     gpu.uninstall();
@@ -2410,7 +2399,7 @@ async function recycleReuseGate(gpu: WebGPUBackend) {
  * side, that path reports NaN while the other reports 0, and neither throws.
  *
  * `tests/gradcheck.ts` drives `every row ignored` through the two hard-target
- * losses, but only on the CPU, since it runs with no backend installed. The
+ * losses, but only on the reference, since it runs with no backend installed. The
  * device copies of the clamp had nothing driving them, and `softCrossEntropy`
  * had nothing on either side. A masked batch is not exotic: assistant-only loss
  * masking produces one whenever a window lands entirely inside a prompt.
@@ -2423,9 +2412,9 @@ async function recycleReuseGate(gpu: WebGPUBackend) {
  *
  * Delete any one of the six clamps and the matching arm fails. On this adapter
  * the device three turn NaN. WGSL does not promise that `0.0 / 0.0` is NaN,
- * and the check is `got !== 0` and `cpu !== 0` independently rather than a
+ * and the check is `got !== 0` and `ref !== 0` independently rather than a
  * comparison, so an adapter that yields 0 there would make those three
- * mutations invisible and the CPU oracle could not rescue them, being 0 too.
+ * mutations invisible and the reference oracle could not rescue them, being 0 too.
  */
 async function allIgnoredGate(gpu: WebGPUBackend) {
   const T = 3, H = 4, V = 6, K = 2;
@@ -2436,7 +2425,7 @@ async function allIgnoredGate(gpu: WebGPUBackend) {
   // are in-range by choice rather than by contract, since keptTeacherRows does
   // not look at slots >= 1 of an ignored row.
   // The probabilities are NONZERO on purpose: with zeros, both bodies would
-  // return 0 for a second reason (`q === 0` skips the term on the CPU, `q != 0.0`
+  // return 0 for a second reason (`q === 0` skips the term on the reference, `q != 0.0`
   // in the kernel), and the row skip this arm is about would stop being
   // load-bearing.
   const teacherIds = [-1, 0, -1, 0, -1, 0];
@@ -2451,7 +2440,7 @@ async function allIgnoredGate(gpu: WebGPUBackend) {
   const scoredTargets = [0, V - 1, 1];
   const scoredIds = [0, 1, 2, 3, 4, 5];
 
-  const cpu = [
+  const ref = [
     crossEntropy(linear(hid, w), ignored).data[0],
     fusedCrossEntropy(hid, w, ignored, 2).data[0],
     softCrossEntropy(linear(hid, w), teacherIds, teacherQ, K).data[0],
@@ -2482,22 +2471,22 @@ async function allIgnoredGate(gpu: WebGPUBackend) {
     const names = ["dense", "fused", "softCE"];
     const got = out.map((t) => t.data[0]);
     for (let i = 3; i < got.length; i++) {
-      // The control: a scored batch must be nonzero and must match the CPU.
-      if (!(Math.abs(got[i]) > 1e-6) || Math.abs(got[i] - cpu[i]) > 1e-4) {
-        console.log(`    MISMATCH allIgnored.scored.${names[i - 3]}: gpu=${got[i]} cpu=${cpu[i]}`);
+      // The control: a scored batch must be nonzero and must match the reference.
+      if (!(Math.abs(got[i]) > 1e-6) || Math.abs(got[i] - ref[i]) > 1e-4) {
+        console.log(`    MISMATCH allIgnored.scored.${names[i - 3]}: gpu=${got[i]} ref=${ref[i]}`);
         ok = false;
       }
     }
     for (let i = 0; i < 3; i++) {
       // `!== 0` rather than a tolerance, doing two jobs. Exact zero is guaranteed
       // here rather than hoped for: every kernel writes 0 for an ignored row and
-      // the CPU totals are sums over no terms, so nothing accumulates and there
+      // the reference totals are sums over no terms, so nothing accumulates and there
       // is no float noise to absorb. And `NaN !== 0` is TRUE, so this catches a
       // dropped clamp on either side without a separate finiteness test. Written
       // the other way round, `Math.abs(got[i]) > 0` is FALSE for NaN, which is
       // the trap the first draft fell into by comparing against a NaN oracle.
-      if (got[i] !== 0 || cpu[i] !== 0) {
-        console.log(`    MISMATCH allIgnored.${names[i]}: gpu=${got[i]} cpu=${cpu[i]}`);
+      if (got[i] !== 0 || ref[i] !== 0) {
+        console.log(`    MISMATCH allIgnored.${names[i]}: gpu=${got[i]} ref=${ref[i]}`);
         ok = false;
       }
     }

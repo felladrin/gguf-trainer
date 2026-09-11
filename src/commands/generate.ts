@@ -9,7 +9,7 @@ import { loadModelFromGGUF } from "../export/load-gguf.ts";
 import { readFileBytes } from "../io.ts";
 import { greedyComplete } from "../eval/generate.ts";
 import { freezeForScoring } from "../train/loss.ts";
-import { initWebGPU, noGpuNote } from "../backend/webgpu.ts";
+import { requireGPU } from "../backend/webgpu.ts";
 import type { Command, Values } from "../cli/args.ts";
 import { UsageError } from "../cli/args.ts";
 
@@ -29,15 +29,9 @@ async function run(v: Values) {
   // helper, whether or not it would happen to be safe for today's callers.
   freezeForScoring(model);
 
-  const useCpu = v.bool("cpu");
-  const gpu = useCpu ? null : await initWebGPU();
-  // stderr: --completion-only exists so stdout is the completion and nothing
-  // else, and a note on that stream would end up in whatever consumes it.
-  if (!gpu && !useCpu) console.error(noGpuNote());
-  if (gpu) {
-    gpu.install();
-    gpu.uploadParams(model.params());
-  }
+  const gpu = await requireGPU("generate");
+  gpu.install();
+  gpu.uploadParams(model.params());
   try {
     const promptIds = tokenizer.encode(prompt);
     const stop = [tokenizer.eosId];
@@ -45,7 +39,7 @@ async function run(v: Values) {
     const completion = tokenizer.decode(ids.slice(promptIds.length));
     console.log(v.bool("completion-only") ? completion : prompt + completion);
   } finally {
-    if (gpu) gpu.uninstall();
+    gpu.uninstall();
   }
 }
 
@@ -61,7 +55,7 @@ first sentence or two; for readable output, export the model and run llama.cpp w
 repetition penalty.`,
   examples: [
     'generate --model model.gguf --prompt "Once upon a time, there was a little"',
-    'generate --model model.gguf --prompt "The capital of France is" --max-tokens 40 --cpu',
+    'generate --model model.gguf --prompt "The capital of France is" --max-tokens 40',
   ],
   flags: [
     {
@@ -89,7 +83,6 @@ repetition penalty.`,
       type: "boolean",
       describe: "print only the generated text, without the prompt",
     },
-    { name: "cpu", type: "boolean", describe: "force the CPU forward pass instead of WebGPU" },
   ],
   run: run,
 };

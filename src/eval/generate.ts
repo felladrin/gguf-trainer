@@ -8,7 +8,8 @@
 // path. Real generation is done by exporting to GGUF and running llama.cpp.
 //
 // The backend must already be installed (gpu.install) with params uploaded
-// (gpu.uploadParams) before calling; pass gpu=null to run on the CPU backend.
+// (gpu.uploadParams) before calling. `gpu` is nullable for the reference path
+// the test suite scores against, where no backend is registered at all.
 
 import type { LanguageModel } from "../model/arch.ts";
 import type { WebGPUBackend } from "../backend/webgpu.ts";

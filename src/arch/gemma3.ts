@@ -265,7 +265,7 @@ export function gemma3Config(
   };
 }
 
-/** A deliberately tiny config, so the CPU backend trains it in seconds. */
+/** A deliberately tiny config, so a test trains it in seconds. */
 export function tinyGemma3Config(vocabSize: number): Gemma3Config {
   return gemma3Config(vocabSize, 128, 4, 128, 32, 64);
 }

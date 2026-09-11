@@ -1,5 +1,6 @@
-// Finite-difference gradient check for the CPU autograd ops: the validation
-// gate described in docs/notes/journal.md and .github/contributing.md.
+// Finite-difference gradient check for every autograd op, against the reference
+// implementation the GPU kernels are held to. The gate .github/contributing.md
+// asks every new op to clear.
 //
 // For every op: build small random inputs, take loss = sum(r ⊙ f(x)) with fixed
 // random weights r, backprop the analytic gradient, then perturb each input
@@ -9,8 +10,6 @@
 // proves the harness actually rejects bad gradients.
 //
 // Run:  deno run tests/gradcheck.ts
-//       node --experimental-strip-types tests/gradcheck.ts
-//       bun tests/gradcheck.ts
 
 import {
   add,
@@ -169,7 +168,7 @@ function fdCheck(name: string, inputs: Tensor[], fwd: () => Tensor, o: CheckOpts
 }
 
 async function main() {
-  console.log("=== finite-difference gradient checks (CPU reference ops) ===\n");
+  console.log("=== finite-difference gradient checks (reference ops) ===\n");
   const rng = mulberry32(1234);
 
   {
@@ -232,8 +231,8 @@ async function main() {
   }
   {
     // Sliding-window attention (Gemma3 SWA layers): window < T so it genuinely
-    // restricts each query's key range. Validates the windowed CPU backward
-    // against finite differences (gpu_parity checks GPU-vs-CPU separately).
+    // restricts each query's key range. Validates the windowed reference backward
+    // against finite differences (gpu_parity checks GPU-vs-reference separately).
     const T = 6, Hq = 4, Hkv = 2, hd = 6, W = 3;
     const q = randTensor([T, Hq * hd], rng);
     const k = randTensor([T, Hkv * hd], rng);
@@ -302,10 +301,10 @@ async function main() {
   }
   {
     // The loss must stay exact when the target is far behind the maximum. Both
-    // CPU losses used to read a normalized probability back and add 1e-12 to it,
+    // The reference losses used to read a normalized probability back and add 1e-12 to it,
     // which clamped every worse prediction at -log(1e-12) = 27.63: a 30-logit
     // gap reported 27.54 and a 90-logit gap still reported 27.63. Both GPU
-    // kernels already used the logsumexp form, so this was a silent CPU/GPU
+    // kernels already used the logsumexp form, so this was a silent reference/GPU
     // divergence that only appeared once a model was badly wrong.
     // The target logit is -3, not 0: with a zero target the `- z_target` term
     // contributes nothing and deleting it entirely would still pass. The soft
@@ -463,7 +462,7 @@ async function main() {
     );
   }
   {
-    // Teacher ids outside the vocab. The CPU checked these inside its per-row
+    // Teacher ids outside the vocab. The reference checked these inside its per-row
     // loop and the GPU did not check them at all, which is #61 and the omission
     // a below-dispatch guard invites. Hoisting it also let both copies of the
     // shape guards go: they were duplicated verbatim in the two backends.
@@ -515,7 +514,7 @@ async function main() {
         refuses([0, V, 0, 1, 2, 3], /at slot 1 of row 0/, k, [0.6, 0.0, 0.7, 0.3, 0.5, 0.5]),
       ],
       // -1 is the marker, not "any negative": uploadU32 turns -2 into a huge id
-      // the GPU scores while the CPU drops the row.
+      // the GPU scores while the reference drops the row.
       ["a -2 in the first slot", refuses([-2, 1, 0, 1, 2, 3], /at slot 0 of row 0/)],
       ["a -0.5 in the first slot", refuses([-0.5, 1, 0, 1, 2, 3], /at slot 0 of row 0/)],
       // The ignore marker is the FIRST id of a row, and the rest of that row is
@@ -556,7 +555,7 @@ async function main() {
     // check below, and it fires first when a corpus and a checkpoint disagree
     // about the vocab, because the inputs go through the table before the
     // targets reach the loss. Measured before the guard, at V=4, d=3 with an id
-    // of V+2: [NaN, NaN, NaN] on the CPU, [0, 0, 0] on the GPU, neither of which
+    // of V+2: [NaN, NaN, NaN] on the reference, [0, 0, 0] on the GPU, neither of which
     // stops. There is no ignore marker here, unlike a target: every position of
     // a batch is a real token, so a negative is refused too.
     const V = 6, d = 4;
@@ -585,11 +584,11 @@ async function main() {
     const cases: [string, boolean][] = [
       // The position is asserted on one case, and one bad id sits FIRST. Without
       // either, a loop starting at t = 1 or reporting t + 1 passes everything,
-      // and lever 29's "position 20 against position 19" argument rests on that
-      // number.
+      // and the "position 20 against position 19" argument in
+      // docs/correctness.md rests on that number.
       // Anchored on the label too: "embedding:" against "crossEntropy:" is how a
-      // reader tells which of the two guards fired, and lever 29's ordering
-      // argument is quoted from those prefixes.
+      // reader tells which of the two guards fired, and the ordering argument
+      // in docs/correctness.md is quoted from those prefixes.
       [
         "id == V",
         refuses([0, V, 1], /^embedding: id 6 at position 1 is not an integer in \[0,6\)/),
@@ -669,7 +668,7 @@ async function main() {
       ["target on the last row", refuses([0, 1, V], range)],
       ["a non-integer target", refuses([0, 1.5, 1], range)],
       // -1 is the only ignore marker: uploadU32 turns -2 into 0xfffffffe, a
-      // huge target the kernel scores while the CPU would skip the row.
+      // huge target the kernel scores while the reference would skip the row.
       ["a -2 ignore marker", refuses([0, -2, 1], range)],
       ["more targets than rows", refuses([0, 1, 2, 3], /4 targets for 3 logit rows/)],
       ["V-1 still scores", accepts([0, V - 1, 1])],
@@ -729,7 +728,7 @@ async function main() {
     // source. That is the right shape, and it costs the weak cross-check the old
     // arrangement had: two independently written counts compared through a
     // parity case are unlikely to be identically wrong, while one count feeding
-    // both scales the CPU and GPU losses together and the parity cases stay
+    // both scales the reference and GPU losses together and the parity cases stay
     // green. Every other softCE test is blind to it: the parity cases share the
     // count, the finite-difference check scales with it, and the two single-row
     // cases have T === kept.
@@ -1032,8 +1031,8 @@ async function main() {
     console.log(`  ${ok ? "ok " : "FAIL"} backward(seed) scales leaf grads linearly`);
   }
 
-  // WSD schedule shape (pure, runtime-agnostic): warmup ramp, stable plateau,
-  // linear cooldown to the floor. Guards the phase boundaries that the GPU/CPU
+  // WSD schedule shape (pure host math, no backend): warmup ramp, stable plateau,
+  // linear cooldown to the floor. Guards the phase boundaries that the GPU/reference
   // trajectory parity in gpu-parity.ts then exercises end-to-end.
   {
     const s = wsdSchedule({ warmupSteps: 4, stableSteps: 3, cooldownSteps: 4, minScale: 0.1 });
@@ -1052,7 +1051,7 @@ async function main() {
     console.log(`  ${ok ? "ok " : "FAIL"} WSD schedule shape (warmup/stable/cooldown)`);
   }
 
-  // MuonClip / QK-logit clip (pure, runtime-agnostic): capping the per-layer
+  // MuonClip / QK-logit clip (pure host math, no backend): capping the per-layer
   // logit-scale proxy at tau by rescaling qNorm/kNorm. Verifies the proxy math,
   // that clipping lands exactly on tau, symmetric q/k scaling, and no-op below.
   {
@@ -1374,7 +1373,7 @@ async function main() {
     if (ratio(stdRms) < 2) ok = false;
 
     // Post-step boundedness at constant lr with muP init (no width-driven
-    // blow-up). Two widths (4x apart) keep the CPU cost low; the init sweep
+    // blow-up). Two widths (4x apart) keep the reference cost low; the init sweep
     // above is the primary gate.
     const rngTok = mulberry32(9);
     const tokens = Array.from({ length: 400 }, () => Math.floor(rngTok() * vocab));
@@ -1461,16 +1460,10 @@ async function main() {
   console.log(
     failures === 0 ? "\n=== all gradient checks passed ===" : `\n=== ${failures} FAILURES ===`,
   );
-  if (failures > 0) {
-    // deno-lint-ignore no-explicit-any
-    const proc = (globalThis as any).process;
-    if (proc?.exit) proc.exit(1);
-  }
+  if (failures > 0) Deno.exit(1);
 }
 
 main().catch((e) => {
   console.error("GRADCHECK FAILED:", e);
-  // deno-lint-ignore no-explicit-any
-  const proc = (globalThis as any).process;
-  if (proc?.exit) proc.exit(1);
+  Deno.exit(1);
 });

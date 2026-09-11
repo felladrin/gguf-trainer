@@ -1,10 +1,10 @@
-// WebGPU backend: the CPU op set from ../model/autograd.ts as WGSL compute
+// WebGPU backend: the reference op set from ../model/autograd.ts as WGSL compute
 // shaders, forward AND backward, behind the same Tensor interface.
 //
 // How it plugs in: WebGPUBackend implements OpsBackend and registers itself via
 // setOpsBackend() (install()/uninstall()). ../model/gemma3.ts and the autograd
 // backward() walk run unchanged: op calls route here, return ordinary Tensor
-// objects, and _backward closures encode GPU dispatches instead of CPU loops.
+// objects, and _backward closures encode GPU dispatches instead of host loops.
 //
 // Execution model: ops record dispatches into a shared command encoder and
 // return immediately; tensor data lives in GPU buffers tracked in a side
@@ -23,7 +23,7 @@
 // transpose flavors for linear; vocab-row scan for embedding; key-axis
 // reductions for attention). Accumulation across graph fan-out and across
 // batch micro-steps happens by `+=` into a gradient buffer that is zeroed
-// once per step, matching the CPU semantics.
+// once per step, matching the reference semantics.
 
 import { setOpsBackend, Tensor } from "../model/autograd.ts";
 import type { OpsBackend } from "../model/autograd.ts";
@@ -352,7 +352,7 @@ export class WebGPUBackend implements OpsBackend {
    * to imply: the loss backwards write their seed into an eo.grad that comes
    * from here under --recompute (measured, see endRegion), so one writeBuffer
    * site does depend on a submit having happened, and ensureBackwardBegun is
-   * what supplies it. See endRegion and lever 20.
+   * what supplies it. See endRegion.
    */
   private regionFree: { buf: GpuBuffer; size: number }[] = [];
   private regionsOpened = 0;
@@ -591,7 +591,7 @@ export class WebGPUBackend implements OpsBackend {
    * beside it untouched (pendingClears is already empty at a micro-batch
    * boundary: ensureBackwardBegun flushed it, which also leaves
    * pendingGraphClears false, and droppedClearsForGraph would already have
-   * thrown), so the deferred grad-clear timing and CPU/GPU parity are
+   * thrown), so the deferred grad-clear timing and kernel parity are
    * unchanged. The onSubmittedWorkDone below is NOT what makes releasing these
    * safe; sync() releases the same buffers with no fence at all, on the queue
    * ordering argument written out there, and this drain rests on it too. It is
@@ -692,12 +692,13 @@ export class WebGPUBackend implements OpsBackend {
    * is that a submit has happened since the buffer's last reader was recorded.
    * That is a property of today's callers rather than something enforced:
    * record a dispatch reading t.grad and then call seedGradFromHost(t) in the
-   * same backward, and the early return means no submit intervenes. (This comment used to claim no regionFree buffer reaches a writeBuffer
-   * at all; lever 20 carries why that was wrong, and lever 41 the ordering
-   * argument underneath.) What submit() does is hand the
-   * recorded work to the GPU at every layer boundary instead of accumulating a
-   * whole micro-batch into one pass, and that overlap is what lever 20 credits
-   * for the throughput. Remove it and every test still passes while the headline
+   * same backward, and the early return means no submit intervenes. (This
+   * comment used to claim no regionFree buffer reaches a writeBuffer at all,
+   * which is false: the loss backwards write their seed into an eo.grad that
+   * makeOut does draw from regionFree.) What submit() does is hand the recorded
+   * work to the GPU at every layer boundary instead of accumulating a whole
+   * micro-batch into one pass, and that overlap is what docs/performance.md
+   * credits for the throughput. Remove it and every test still passes while the headline
    * number quietly goes away.
    *
    * Released grad buffers are purged from pendingClears: a buffer handed on as
@@ -1208,7 +1209,7 @@ export class WebGPUBackend implements OpsBackend {
    * Targets are validated by the wrapper in autograd.ts, above the dispatch,
    * which hands down the kept-row count. This used to call keptRowsInVocab
    * itself, one of the two guards that lived under a dispatch and so had to be
-   * repeated per implementation; see lever 40.
+   * repeated per implementation.
    */
   fusedCrossEntropy(
     hidden: Tensor,
@@ -1281,7 +1282,7 @@ export class WebGPUBackend implements OpsBackend {
    *
    * No kernel could make this check, wherever it is called from. The logits
    * buffer is bound whole, so LOG[t * V + tgt] with tgt >= V is an in-bounds
-   * read of the next row, measured identical to the CPU's wrong value rather
+   * read of the next row, measured identical to the reference's wrong value rather
    * than trapping.
    *
    * Validating in the wrapper also made a claim true that the old comment here
@@ -1804,59 +1805,27 @@ export class WebGPUBackend implements OpsBackend {
 }
 
 /**
- * Whether this RUNTIME exposes WebGPU at all, which is the first of the two
- * reasons `initWebGPU` returns null and the only one a caller can tell apart
- * afterwards. Deno does; Node and Bun do not.
- *
- * Exported for the caller that got null and has to say which exit was taken:
- * if this says "ok" and `initWebGPU` still returned null, the machine has no
- * usable adapter.
- *
- * `initWebGPU` does NOT call this. It used to, as a first-line guard, and the
- * guard turned out to be unobservable once the adapter request was wrapped:
- * measured across six shapes of broken navigator, from undefined through a
- * `requestAdapter` that throws synchronously, removing it changed nothing. Dead
- * code that reads like a safeguard is worse than neither, so it went.
+ * The device, or a clear stop. Every command that computes needs one: there is
+ * no CPU execution path, so a null adapter is the end of the road rather than a
+ * slower route to the same answer.
  */
-export function webgpuRuntime(): "ok" | "no-runtime" {
-  // deno-lint-ignore no-explicit-any
-  const nav: any = (globalThis as any).navigator;
-  return nav?.gpu ? "ok" : "no-runtime";
+export async function requireGPU(purpose: string): Promise<WebGPUBackend> {
+  const gpu = await initWebGPU();
+  if (!gpu) throw new Error(`no GPU adapter found, and ${purpose} needs one`);
+  return gpu;
 }
 
 /**
- * Why there is no GPU, for a command that falls back rather than dying. The
- * distinction matters to the reader: one is fixed by changing runtime, the
- * other is a property of the machine.
- */
-export function noGpuNote(): string {
-  return webgpuRuntime() === "no-runtime"
-    ? "(no WebGPU in this runtime; falling back to CPU forward)"
-    : "(no GPU adapter found; falling back to CPU forward)";
-}
-
-/**
- * Probe for a WebGPU device. Returns null for TWO different reasons, and a
- * caller that reports only one of them misdirects the other's user:
- *
- *   - the runtime has no WebGPU at all (Node and Bun today), which
- *     `webgpuRuntime()` reports, and which is fixed by running under Deno or
- *     providing a navigator.gpu polyfill;
- *   - the runtime has WebGPU but the machine has no usable adapter, which is
- *     what a null means when `webgpuRuntime()` still says "ok".
- *
- * Commands that fall back use `noGpuNote()` for the wording; the two that need
- * a device name the cause themselves.
+ * Probe for a WebGPU device, null when the machine has no usable adapter.
+ * `requireGPU` is what commands call; this stays exported for the parity suite,
+ * which skips rather than fails where there is no device.
  */
 export async function initWebGPU(): Promise<WebGPUBackend | null> {
   // deno-lint-ignore no-explicit-any
   const nav: any = (globalThis as any).navigator;
-  // The whole probe, not just the adapter's null: this is the ONLY exit for a
-  // runtime without WebGPU too, since `nav.gpu` is then undefined and the call
-  // throws in here. try/catch rather than `.catch` because a partial
-  // navigator.gpu polyfill, which the docblock advertises as supported, can
-  // reject, throw synchronously, be absent, or return a non-promise, and only
-  // the first of those is a rejection. All four reach the "no adapter" message
+  // try/catch rather than `.catch`: a partial navigator.gpu polyfill can reject,
+  // throw synchronously, be absent, or return a non-promise, and only the first
+  // of those is a rejection. All four have to reach the "no adapter" message
   // rather than a stack trace.
   // deno-lint-ignore no-explicit-any
   let adapter: any = null;

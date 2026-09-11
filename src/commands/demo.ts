@@ -3,10 +3,9 @@
 //
 // Run:  deno run -A cli.ts demo
 //
-// Deno only, unlike the test suite: the CLI's command registry pulls in the two
-// npm dependencies (hyparquet, @huggingface/jinja) that only Deno's import map
-// resolves. The engine itself stays runtime-agnostic; `deno task test:node` is
-// what proves that.
+// It trains through trainLMGpuResident and MuonGpu, which is the path pretrain
+// and finetune take, so a pass means the WebGPU training path works on this
+// machine and not just the file formats around it.
 
 import type { Command, Values } from "../cli/args.ts";
 import { readGGUF } from "../gguf/gguf.ts";
@@ -16,8 +15,11 @@ import { mulberry32 } from "../model/autograd.ts";
 import { gemma3, tinyGemma3Config } from "../arch/gemma3.ts";
 import type { LanguageModel } from "../model/arch.ts";
 import { BPETokenizer } from "../tokenizer/bpe.ts";
-import { Muon } from "../train/muon.ts";
-import { trainLM } from "../train/trainer.ts";
+import { MuonGpu } from "../backend/muon-gpu.ts";
+import { trainLMGpuResident } from "../backend/train-gpu.ts";
+import { requireGPU, type WebGPUBackend } from "../backend/webgpu.ts";
+import { greedyComplete } from "../eval/generate.ts";
+import { freezeForScoring } from "../train/loss.ts";
 import { loadModelFromGGUF } from "../export/load-gguf.ts";
 
 // A small, repetitive corpus so a tiny model shows clear learning fast.
@@ -28,27 +30,34 @@ a bird sang in the tree. the cat looked at the bird. the bird flew away.
 the dog ran after the ball. the cat sat on the mat and slept in the sun.
 `.trim().repeat(12);
 
-function argmax(row: Float32Array): number {
-  let best = 0;
-  for (let i = 1; i < row.length; i++) if (row[i] > row[best]) best = i;
-  return best;
-}
-
-function generate(model: LanguageModel, tok: BPETokenizer, prompt: string, n: number): string {
-  const ids = tok.encode(prompt);
-  for (let i = 0; i < n; i++) {
-    const ctx = ids.slice(-model.cfg.maxSeq);
-    const logits = model.forward(ctx);
-    const V = model.cfg.vocabSize;
-    const base = (ctx.length - 1) * V;
-    const last = logits.data.subarray(base, base + V);
-    ids.push(argmax(last));
+/** Greedy completion on the device, installing the backend around the call:
+ * both samples run outside the training loop, which uninstalls on exit. */
+async function sample(
+  gpu: WebGPUBackend,
+  model: LanguageModel,
+  tok: BPETokenizer,
+  prompt: string,
+  n: number,
+): Promise<string> {
+  // Nothing here runs backward, and an unfrozen parameter is a gradient buffer
+  // staged back to the host on every one of greedyComplete's per-token syncs.
+  // The trained model reaches this already exempt (MuonGpu keeps its gradients
+  // on the device), the one rebuilt from the GGUF does not.
+  freezeForScoring(model);
+  gpu.install();
+  gpu.uploadParams(model.params());
+  try {
+    return tok.decode(await greedyComplete(model, gpu, tok.encode(prompt), n));
+  } finally {
+    gpu.uninstall();
   }
-  return tok.decode(ids);
 }
 
 async function run(v: Values) {
   console.log("=== Felladrin's GGUF Trainer +∞ :: train-from-scratch -> GGUF ===\n");
+
+  const gpu = await requireGPU("demo");
+  console.log(`WebGPU adapter: ${gpu.adapterName}\n`);
 
   // 1. Train a byte-level BPE tokenizer on the corpus.
   const tok = new BPETokenizer();
@@ -59,8 +68,8 @@ async function run(v: Values) {
   console.log(`Tokenizer round-trip: "${rt}"`);
   if (rt !== "the cat sat on the mat.") throw new Error("Tokenizer round-trip failed");
 
-  // 2. Build a tiny Gemma3 model. (Smaller than tinyGemma3Config so the demo
-  //    finishes in a few seconds on a CPU; scale up on the WebGPU backend.)
+  // 2. Build a tiny Gemma3 model, smaller than tinyGemma3Config so the whole
+  //    check stays under a minute.
   const cfg = {
     ...tinyGemma3Config(tok.vocabSize),
     hiddenSize: 96,
@@ -80,7 +89,7 @@ async function run(v: Values) {
   // 3. Train with Muon (hidden matmuls) + AdamW (embeddings/head/norms).
   const groups = model.paramGroups();
   console.log(`Muon on ${groups.muon.length} matrices; AdamW on ${groups.aux.length} tensors\n`);
-  const opt = new Muon(groups.muon, groups.aux, {
+  const opt = new MuonGpu(gpu, groups.muon, groups.aux, {
     lr: 0.02,
     momentum: 0.95,
     aux: { lr: 3e-3, weightDecay: 0.0, clip: 1.0 },
@@ -90,7 +99,7 @@ async function run(v: Values) {
   let firstLoss = 0;
   let lastLoss = 0;
   const t0 = Date.now();
-  trainLM(model, {
+  await trainLMGpuResident(model, gpu, {
     tokens,
     seqLen: 32,
     steps: 40,
@@ -110,8 +119,10 @@ async function run(v: Values) {
   );
   if (!(lastLoss < firstLoss)) throw new Error("Loss did not decrease");
 
-  // 4. Sample greedily to show the model learned the corpus.
-  console.log(`\nGreedy sample: "${generate(model, tok, "the cat", 20)}"`);
+  // 4. Sample greedily to show the model learned the corpus. Kept for the
+  //    comparison in step 6.
+  const trained = await sample(gpu, model, tok, "the cat", 20);
+  console.log(`\nGreedy sample: "${trained}"`);
 
   // 5. Export GGUF in F16 and Q8_0. Write to disk.
   // Artifacts go to a working directory, never into the source tree.
@@ -128,12 +139,53 @@ async function run(v: Values) {
   }
 
   // 6. Resume from the F16 checkpoint: rebuild model + tokenizer straight from
-  //    the GGUF and confirm greedy sampling reproduces the pre-export output.
+  //    the GGUF, check every weight survived the round trip, and sample again.
   const resumed = loadModelFromGGUF(f16Bytes!);
-  const sample = generate(resumed.model, resumed.tokenizer, "the cat", 20);
-  console.log(`\nResumed from GGUF -> greedy sample: "${sample}"`);
+  assertRoundTrip(model.params(), resumed.model.params());
+  const text = await sample(gpu, resumed.model, resumed.tokenizer, "the cat", 20);
+  console.log(`\nResumed from GGUF -> greedy sample: "${text}"`);
+  if (text !== trained) {
+    console.log(
+      "  note: the two samples differ. The weights round-tripped inside f16's tolerance " +
+        "(checked above), so this is f16 rounding moving an argmax on a near-tie, not a " +
+        "loader defect.",
+    );
+  }
 
   console.log("\n=== all checks passed ===");
+}
+
+/**
+ * Every weight came back from the f16 GGUF as the same weight, within what f16
+ * can represent. This is the assertion the resumed sample used to carry, moved
+ * to where it is deterministic: comparing the two greedy strings tests argmax
+ * margins as much as it tests the loader, and an f16 round trip is allowed to
+ * flip a near-tie on one machine and not on another.
+ */
+function assertRoundTrip(before: { data: Float32Array }[], after: { data: Float32Array }[]) {
+  if (after.length !== before.length) {
+    throw new Error(`resumed model has ${after.length} params, exported from ${before.length}`);
+  }
+  for (let i = 0; i < before.length; i++) {
+    const a = before[i].data, b = after[i].data;
+    if (a.length !== b.length) {
+      throw new Error(`param ${i}: exported ${a.length} values, loaded ${b.length}`);
+    }
+    for (let j = 0; j < a.length; j++) {
+      // f16 carries 11 significant bits, so a round trip moves a normal value by
+      // at most 2^-11 of its magnitude; subnormals bottom out at 2^-24. The
+      // negated form is load-bearing: `Math.abs(NaN - a) > tol` is false, so
+      // `>` would wave a NaN weight straight through, which is the failure
+      // docs/correctness.md names under "Prove a test can fail".
+      if (!(Math.abs(b[j] - a[j]) <= Math.abs(a[j]) / 2048 + 6e-8)) {
+        throw new Error(`param ${i}[${j}] loaded as ${b[j]}, exported from ${a[j]}`);
+      }
+    }
+  }
+  // "within tolerance" rather than "from f16": the norms are stored f32 by
+  // addVector and only the matrices are quantized, so the bound is loose for
+  // about half of them.
+  console.log(`\nRound trip: all ${before.length} tensors reloaded within tolerance ✓`);
 }
 
 function verify(bytes: Uint8Array, cfg: ReturnType<typeof tinyGemma3Config>, quant: string) {
@@ -177,9 +229,9 @@ function typeName(t: number): string {
 export const demoCommand: Command = {
   name: "demo",
   summary: "Train a tiny model on a toy corpus end to end. The install check.",
-  details: `Runs the whole pipeline in under a minute on CPU: trains a small Gemma3 on a toy
-corpus, exports it at f16, q8_0 and q4_0, re-parses each file and verifies the structure.
-No downloads, no GPU, no arguments.
+  details: `Runs the whole pipeline in under a minute: trains a small Gemma3 on a toy corpus,
+exports it at f16, q8_0 and q4_0, re-parses each file and verifies the structure. No
+downloads and no arguments, but it does need the GPU, since that is what it is checking.
 
 If this passes, the engine works and any later failure is about data, flags or hardware.`,
   examples: ["demo", "demo --out-dir /tmp/gguf-check"],

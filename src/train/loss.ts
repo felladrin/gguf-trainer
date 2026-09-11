@@ -1,7 +1,7 @@
 // One sequence to one scalar loss, choosing between the dense and the chunked
 // readout, plus everything `--loss-chunk` has to be validated for.
 //
-// Kept in one place so the three training loops (CPU reference, the two
+// Kept in one place so the three training loops (the reference loop, the two
 // GPU-resident ones) cannot drift on which path they take, and so the four
 // commands that accept the flag cannot drift on how they check it. The checks
 // live here rather than in src/cli/ because both encode facts about
