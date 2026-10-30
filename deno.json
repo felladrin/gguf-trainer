@@ -1,6 +1,6 @@
 {
   "imports": {
-    "@huggingface/jinja": "npm:@huggingface/jinja@0.5.10",
+    "@huggingface/jinja": "npm:@huggingface/jinja@0.5.11",
     "hyparquet": "npm:hyparquet@1.31.5"
   },
   "tasks": {
