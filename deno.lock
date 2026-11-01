@@ -2,20 +2,20 @@
   "version": "5",
   "specifiers": {
     "npm:@huggingface/jinja@0.5.11": "0.5.11",
-    "npm:hyparquet@1.31.5": "1.31.5"
+    "npm:hyparquet@1.32.0": "1.32.0"
   },
   "npm": {
     "@huggingface/jinja@0.5.11": {
       "integrity": "sha512-YzEzwM5oQf4r0vs7ifWQ+yuVR1YkAHrjERQ+a8WRsStHHp4NRBg+NesjiFc+X2AFUpRvvrIeHDS1xFy9jY/IjQ=="
     },
-    "hyparquet@1.31.5": {
-      "integrity": "sha512-KPVfaxW8xOiO2/4fjeiBfFNEXhGVw9tfcb9ha2iNZdJ3J/yBjEwIeAnTyyuhllFFTb9YO9wg0DfRAOnm6KCvBg=="
+    "hyparquet@1.32.0": {
+      "integrity": "sha512-SpkvdfgQjcdCJA+MTzo0WSreLLy/aLRYs3xetk1SsuFvq8vF+J/97OaRnZhf+p5Nx3J27i9FhSC0bJ5eQZG/7Q=="
     }
   },
   "workspace": {
     "dependencies": [
       "npm:@huggingface/jinja@0.5.11",
-      "npm:hyparquet@1.31.5"
+      "npm:hyparquet@1.32.0"
     ]
   }
 }
