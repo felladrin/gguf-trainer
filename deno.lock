@@ -1,12 +1,12 @@
 {
   "version": "5",
   "specifiers": {
-    "npm:@huggingface/jinja@0.5.12": "0.5.12",
+    "npm:@huggingface/jinja@0.5.13": "0.5.13",
     "npm:hyparquet@1.33.0": "1.33.0"
   },
   "npm": {
-    "@huggingface/jinja@0.5.12": {
-      "integrity": "sha512-o0aIdtHrSBmNgUC3zVHSRBReUZO87679tK9sQztp683pu6cbidcWnHivJYChYf/aDpGdlwxbTfs4pRQ1MhBGkQ=="
+    "@huggingface/jinja@0.5.13": {
+      "integrity": "sha512-jM17MqFily1iyT/1LD3r5w8/CZiyapVB0+7vOw48PfVtzyKsXStmHE4jVTyDAD05Tqv3un1xrS9ILUU1ugQAYQ=="
     },
     "hyparquet@1.33.0": {
       "integrity": "sha512-8EKLe73vRIMEKVEOe5y+kIzFxo6AvbLvd5ukd7P+yv3RvG0+TZM4qO8imbqxU6zds5pV+OeWRTMwy95mhHUheg=="
@@ -14,7 +14,7 @@
   },
   "workspace": {
     "dependencies": [
-      "npm:@huggingface/jinja@0.5.12",
+      "npm:@huggingface/jinja@0.5.13",
       "npm:hyparquet@1.33.0"
     ]
   }
